@@ -2,16 +2,14 @@ import { createHeaders, CSV_FILE, prepareRows, readCheckpoint, readExistingCsv, 
 import fs from "fs";
 import { createObjectCsvWriter } from "csv-writer"
 import { CsvWriter } from "csv-writer/src/lib/csv-writer";
-import { ObjectMap } from "csv-writer/src/lib/lang/object";
 import { GameweekData } from "./types";
-
-const { getTotalPlayers, getPlayerHistory } = require("./fetch");
+import { getPlayerHistory, getTotalPlayers } from "./fetch";
 
 let csvWriter: CsvWriter<GameweekData> | null = null;
 
 
 // Main function to process all players and save to CSV
-const processAllPlayers = async () => {
+export const processAllPlayers = async () => {
   const totalPlayers = await getTotalPlayers();
   console.log(`Total Players: ${totalPlayers}`);
 

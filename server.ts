@@ -1,28 +1,23 @@
-const express = require("express");
-const { createClient } = require("@clickhouse/client");
-// const axios = require("axios");
-const { processAllPlayers } = require("./playersProcessor");
+import express, { Request, Response } from "express";
+import { createClient } from "@clickhouse/client";
+import { processAllPlayers } from "./playersProcessor";
 
 const app = express();
 const PORT = 3000;
 
 const clickhouse = createClient({
-  url: "http://localhost:8123", 
-  username: "default", 
-  password: "", 
-  database: "default", 
+  url: "http://localhost:8123",
+  username: "default",
+  password: "",
+  database: "default",
 });
 
-
-
-app.get("/api/fpl-data", async (req, res) => {
+app.get("/api/fpl-data", async (req: Request, res: Response) => {
   try {
     console.log("PROCESSING PLAYERS!");
-    processAllPlayers().catch((error) => {
-      console.error("Error processing players:", error.message);
-    });
-    res.status(200);
-  } catch (error) {
+    await processAllPlayers(); // Ensure you `await` this async call.
+    res.status(200).json({ message: "Players processed successfully!" });
+  } catch (error: unknown) {
     console.error("Error querying ClickHouse:", error);
     res.status(500).json({ error: "Failed to fetch data." });
   }
