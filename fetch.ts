@@ -1,12 +1,12 @@
-const axios = require("axios");
+import axios from "axios";
 
-async function getTotalPlayers() {
+export const getTotalPlayers = async () => {
   const response = await axios.get("https://fantasy.premierleague.com/api/bootstrap-static/");
   // return response.data.total_players;
   return 500;
 }
 
-async function getPlayerHistory(playerId) {
+export const getPlayerHistory = async (playerId: string | number) => {
   try {
     const response = await axios.get(`https://fantasy.premierleague.com/api/entry/${playerId}/history/`);
     return response.data.current;
@@ -15,5 +15,3 @@ async function getPlayerHistory(playerId) {
     return null;
   }
 }
-  
-module.exports = { getTotalPlayers, getPlayerHistory }

@@ -1,12 +1,17 @@
-const fs = require("fs");
-const { getTotalPlayers, getPlayerHistory } = require("./fetch");
-const createCsvWriter = require("csv-writer").createObjectCsvWriter;
+import { createHeaders, CSV_FILE, prepareRows, readCheckpoint, readExistingCsv, writeCheckpoint } from "./csv.helpers";
+import fs from "fs";
+import { createObjectCsvWriter } from "csv-writer"
+import { CsvWriter } from "csv-writer/src/lib/csv-writer";
+import { ObjectMap } from "csv-writer/src/lib/lang/object";
+import { GameweekData } from "./types";
 
-const { prepareRows, createHeaders, readCheckpoint, readExistingCsv, CSV_FILE, writeCheckpoint } = require("./csv.helpers");
+const { getTotalPlayers, getPlayerHistory } = require("./fetch");
+
+let csvWriter: CsvWriter<GameweekData> | null = null;
 
 
 // Main function to process all players and save to CSV
-async function processAllPlayers() {
+const processAllPlayers = async () => {
   const totalPlayers = await getTotalPlayers();
   console.log(`Total Players: ${totalPlayers}`);
 
@@ -14,17 +19,16 @@ async function processAllPlayers() {
   const existingData = await readExistingCsv();
 
   let headersDefined = false;
-  let csvWriter = null;
   const batchSize = 100;
   const lastProcessedId = readCheckpoint();
   const allPlayers = Array.from({ length: totalPlayers }, (_, i) => i + 1);
-  const remainingPlayers = allPlayers.filter((id) => id > lastProcessedId);
+  const remainingPlayers = allPlayers.filter((id) => id > lastProcessedId)
 
   console.log(`Resuming from Player ID: ${lastProcessedId + 1}`);
 
   for (let i = 0; i < remainingPlayers.length; i += batchSize) {
     const batch = remainingPlayers.slice(i, i + batchSize);
-    const records = [];
+    const records: GameweekData[] = [];
 
     const shouldStop = await Promise.all(
       batch.map(async (playerId) => {
@@ -42,13 +46,14 @@ async function processAllPlayers() {
         // Dynamically set headers if not already defined
         if (!headersDefined) {
           const headers = createHeaders(gameweeks[0]);
-          csvWriter = createCsvWriter({
+          csvWriter = createObjectCsvWriter({
             path: CSV_FILE,
             header: headers,
             append: fs.existsSync(CSV_FILE), // Append if the file exists
           });
           headersDefined = true;
         }
+
 
         // Prepare rows for the player
         const rows = prepareRows(playerId, gameweeks);
@@ -71,6 +76,7 @@ async function processAllPlayers() {
 
         return false;
       })
+
     );
 
     // Check if we need to stop processing further players

@@ -1,10 +1,11 @@
-const fs = require("fs");
-const csv = require("csv-parser");
-const path = require("path");
+import fs from "fs";
+import csv from "csv-parser";
+import path from "path";
+import { GameweekData } from "./types";
 
 const FILES_FOLDER = path.join(__dirname, "files");
-const CSV_FILE = path.join(FILES_FOLDER, "fpl_players_gameweek_data.csv");
-const CHECKPOINT_FILE = path.join(FILES_FOLDER, "checkpoint.txt");
+export const CSV_FILE = path.join(FILES_FOLDER, "fpl_players_gameweek_data.csv");
+export const CHECKPOINT_FILE = path.join(FILES_FOLDER, "checkpoint.txt");
 
 if (!fs.existsSync(FILES_FOLDER)) {
   fs.mkdirSync(FILES_FOLDER, { recursive: true });
@@ -12,7 +13,7 @@ if (!fs.existsSync(FILES_FOLDER)) {
 }
 
 // Read the last checkpoint (last processed player ID)
-const readCheckpoint = () => {
+export const readCheckpoint = () => {
   if (fs.existsSync(CHECKPOINT_FILE)) {
     const lastProcessed = fs.readFileSync(CHECKPOINT_FILE, "utf8");
     return parseInt(lastProcessed, 10) || 0;
@@ -21,12 +22,12 @@ const readCheckpoint = () => {
 };
   
 // Write the checkpoint (last processed player ID)
-const writeCheckpoint = (playerId) => {
+export const writeCheckpoint = (playerId) => {
   fs.writeFileSync(CHECKPOINT_FILE, playerId.toString(), "utf8");
 };
 
 // Dynamically create headers from the API response
-const createHeaders = (sampleGameweek) =>  {
+export const createHeaders = (sampleGameweek) =>  {
   const headers = [{ id: "Player_ID", title: "Player_ID" }];
   Object.keys(sampleGameweek).forEach((key) => {
     headers.push({ id: key, title: key });
@@ -35,18 +36,18 @@ const createHeaders = (sampleGameweek) =>  {
 };
 
 // Prepare rows dynamically based on the API response
-const prepareRows = (playerId, gameweeks) => gameweeks.map((gameweek) => ({
+export const prepareRows = (playerId, gameweeks): GameweekData[] => gameweeks.map((gameweek) => ({
   Player_ID: playerId,
-  ...gameweek, // Spread all keys from the gameweek JSON into the row
+  ...gameweek,
 }));
 
 
 // Read existing data from the CSV file
-const readExistingCsv = () => 
+export const readExistingCsv = (): Promise<Record<string, GameweekData[]>> => 
   new Promise((resolve, reject) => {
     const data = {};
     if (!fs.existsSync(CSV_FILE)) {
-      return resolve(data); // Return empty if file doesn't exist
+      return resolve(data);
     }
 
     fs.createReadStream(CSV_FILE)
@@ -58,8 +59,4 @@ const readExistingCsv = () =>
       })
       .on("end", () => resolve(data))
       .on("error", (error) => reject(error));
-  });
-
-  
-
-module.exports = {readCheckpoint, writeCheckpoint, createHeaders, prepareRows, readExistingCsv, CSV_FILE};
+});
