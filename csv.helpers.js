@@ -1,8 +1,15 @@
 const fs = require("fs");
 const csv = require("csv-parser");
+const path = require("path");
 
-const CHECKPOINT_FILE = "checkpoint.txt";
-const CSV_FILE = "fpl_players_gameweek_data.csv";
+const FILES_FOLDER = path.join(__dirname, "files");
+const CSV_FILE = path.join(FILES_FOLDER, "fpl_players_gameweek_data.csv");
+const CHECKPOINT_FILE = path.join(FILES_FOLDER, "checkpoint.txt");
+
+if (!fs.existsSync(FILES_FOLDER)) {
+  fs.mkdirSync(FILES_FOLDER, { recursive: true });
+  console.log(`Created folder: ${FILES_FOLDER}`);
+}
 
 // Read the last checkpoint (last processed player ID)
 const readCheckpoint = () => {
