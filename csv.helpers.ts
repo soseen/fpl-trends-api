@@ -6,6 +6,7 @@ import { GameweekData } from "./types";
 const FILES_FOLDER = path.join(__dirname, "files");
 export const CSV_FILE = path.join(FILES_FOLDER, "fpl_players_gameweek_data.csv");
 export const CHECKPOINT_FILE = path.join(FILES_FOLDER, "checkpoint.txt");
+export const LAST_GAMEWEEK_FILE = path.join(FILES_FOLDER, "lastGameweek.txt");
 
 if (!fs.existsSync(FILES_FOLDER)) {
   fs.mkdirSync(FILES_FOLDER, { recursive: true });

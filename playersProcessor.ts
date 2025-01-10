@@ -1,17 +1,31 @@
-import { createHeaders, CSV_FILE, prepareRows, readCheckpoint, readExistingCsv, writeCheckpoint } from "./csv.helpers";
+import { createHeaders, CSV_FILE, LAST_GAMEWEEK_FILE, prepareRows, readCheckpoint, readExistingCsv, writeCheckpoint } from "./csv.helpers";
 import fs from "fs";
 import { createObjectCsvWriter } from "csv-writer"
 import { CsvWriter } from "csv-writer/src/lib/csv-writer";
 import { GameweekData } from "./types";
-import { getPlayerHistory, getTotalPlayers } from "./fetch";
+import { getPlayerHistory, getBasicInfo } from "./fetch";
 
 let csvWriter: CsvWriter<GameweekData> | null = null;
 
 
 // Main function to process all players and save to CSV
 export const processAllPlayers = async () => {
-  const totalPlayers = await getTotalPlayers();
+  const {lastGameweek, totalPlayers} = await getBasicInfo();
   console.log(`Total Players: ${totalPlayers}`);
+  console.log ("LAST GAMEWEEK: ", lastGameweek);
+
+  const lastProcessedGameweek = fs.existsSync(LAST_GAMEWEEK_FILE)
+    ? parseInt(fs.readFileSync(LAST_GAMEWEEK_FILE, "utf8"), 10)
+    : 0;
+
+   const startFromScratch = lastGameweek !== lastProcessedGameweek;
+   if (startFromScratch) {
+     console.log("New gameweek detected. Starting from scratch...");
+     if (fs.existsSync(CSV_FILE)) {
+      fs.unlinkSync(CSV_FILE); // Remove the file if it exists
+    }
+     writeCheckpoint(0);
+   }
 
   // Read existing CSV data
   const existingData = await readExistingCsv();
@@ -47,7 +61,7 @@ export const processAllPlayers = async () => {
           csvWriter = createObjectCsvWriter({
             path: CSV_FILE,
             header: headers,
-            append: fs.existsSync(CSV_FILE), // Append if the file exists
+            append: fs.existsSync(CSV_FILE),
           });
           headersDefined = true;
         }
@@ -102,10 +116,12 @@ export const processAllPlayers = async () => {
     // Update the checkpoint after each batch
     const lastIdInBatch = batch[batch.length - 1];
     writeCheckpoint(lastIdInBatch);
+    fs.writeFileSync(LAST_GAMEWEEK_FILE, lastGameweek.toString(), "utf8");
 
     console.log(`Processed batch ${i + 1}-${i + batchSize}`);
   }
 
+  writeCheckpoint(0);
   console.log("Processing completed.");
 }
 
