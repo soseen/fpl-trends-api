@@ -3,10 +3,14 @@ import csv from "csv-parser";
 import path from "path";
 import { GameweekData } from "./types";
 
-const FILES_FOLDER = path.join(__dirname, "files");
+const FILES_FOLDER = path.join(__dirname, "data");
 export const CSV_FILE = path.join(FILES_FOLDER, "fpl_players_gameweek_data.csv");
 export const CHECKPOINT_FILE = path.join(FILES_FOLDER, "checkpoint.txt");
 export const LAST_GAMEWEEK_FILE = path.join(FILES_FOLDER, "lastGameweek.txt");
+export const BLACKLIST_FILE = path.join(FILES_FOLDER, "blacklist.csv");
+export const SAMPLE = path.join(FILES_FOLDER, "sample.csv");
+export const RAW_DATA_FILE = path.join(FILES_FOLDER, "raw_data.json");
+export const CLEANED_DATA_FILE = path.join(FILES_FOLDER, "cleaned_data.csv");
 
 if (!fs.existsSync(FILES_FOLDER)) {
   fs.mkdirSync(FILES_FOLDER, { recursive: true });

@@ -4,8 +4,8 @@ import { GameweekData } from "./types";
 export const getBasicInfo = async () => {
   const response = await axios.get("https://fantasy.premierleague.com/api/bootstrap-static/");
   const lastGameweek: number = parseInt(response.data?.events?.find(gw => !gw?.finished)?.id ?? 1) - 1;
-  // return response.data.total_players;
-  return {totalPlayers: 500, lastGameweek: lastGameweek};
+  const totalPlayers = response?.data?.total_players ?? 0;
+  return { totalPlayers, lastGameweek };
 }
 
 export const getPlayerHistory = async (playerId: number) => {

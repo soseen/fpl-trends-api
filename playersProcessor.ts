@@ -1,58 +1,75 @@
-import { createHeaders, CSV_FILE, LAST_GAMEWEEK_FILE, prepareRows, readCheckpoint, readExistingCsv, writeCheckpoint } from "./csv.helpers";
+import { createHeaders, CSV_FILE, LAST_GAMEWEEK_FILE, prepareRows, readCheckpoint, writeCheckpoint } from "./file.helpers";
 import fs from "fs";
 import { createObjectCsvWriter } from "csv-writer"
 import { CsvWriter } from "csv-writer/src/lib/csv-writer";
 import { GameweekData } from "./types";
 import { getPlayerHistory, getBasicInfo } from "./fetch";
+import { getSamplePlayers, readBlacklist, writeToBlacklist } from "./sampling";
 
 let csvWriter: CsvWriter<GameweekData> | null = null;
+const fetchAllPlayers = false; // Toggle to download all players or sample
 
 
-// Main function to process all players and save to CSV
+const BATCH_SIZE = 100;
+
+
 export const processAllPlayers = async () => {
-  const {lastGameweek, totalPlayers} = await getBasicInfo();
+  const { lastGameweek, totalPlayers } = await getBasicInfo();
   console.log(`Total Players: ${totalPlayers}`);
-  console.log ("LAST GAMEWEEK: ", lastGameweek);
+  console.log("LAST GAMEWEEK: ", lastGameweek);
 
   const lastProcessedGameweek = fs.existsSync(LAST_GAMEWEEK_FILE)
     ? parseInt(fs.readFileSync(LAST_GAMEWEEK_FILE, "utf8"), 10)
     : 0;
 
-   const startFromScratch = lastGameweek !== lastProcessedGameweek;
-   if (startFromScratch) {
-     console.log("New gameweek detected. Starting from scratch...");
-     if (fs.existsSync(CSV_FILE)) {
+  const startFromScratch = lastGameweek !== lastProcessedGameweek;
+  if (startFromScratch) {
+    console.log("New gameweek detected. Starting from scratch...");
+    if (fs.existsSync(CSV_FILE)) {
       fs.unlinkSync(CSV_FILE); // Remove the file if it exists
     }
-     writeCheckpoint(0);
-   }
+    writeCheckpoint(0);
+  }
 
-  // Read existing CSV data
-  const existingData = await readExistingCsv();
+  const blacklist = readBlacklist();
+  const playerIds: number[] = fetchAllPlayers
+    ? Array.from({ length: totalPlayers }, (_, i) => i + 1).filter((id) => !blacklist.has(id))
+    : getSamplePlayers(totalPlayers, blacklist);
+
+    console.log(playerIds);
 
   let headersDefined = false;
   const batchSize = 100;
   const lastProcessedId = readCheckpoint();
-  const allPlayers = Array.from({ length: totalPlayers }, (_, i) => i + 1);
-  const remainingPlayers = allPlayers.filter((id) => id > lastProcessedId)
+  const remainingPlayers = fetchAllPlayers ? playerIds.filter((id) => id > lastProcessedId) : playerIds;
 
-  console.log(`Resuming from Player ID: ${lastProcessedId + 1}`);
+  console.log(fetchAllPlayers ? `Resuming from Player ID: ${lastProcessedId + 1}...` : "Reading sample data...");
 
   for (let i = 0; i < remainingPlayers.length; i += batchSize) {
     const batch = remainingPlayers.slice(i, i + batchSize);
     const records: GameweekData[] = [];
 
-    const shouldStop = await Promise.all(
-      batch.map(async (playerId) => {
+    for (const playerId of batch) {
+      try {
         const gameweeks = await getPlayerHistory(playerId);
 
         if (gameweeks === null) {
-          return false; // Skip players whose API call fails
+          throw new Error(`Failed to fetch data for player ID ${playerId}`);
         }
 
-        if (gameweeks.length === 0) {
-          console.log(`Player ${playerId} has no gameweek history. Stopping the process.`);
-          return true; // Stop if the player has no history
+        // Blacklist logic
+        const isInactive =
+          gameweeks.length >= 6 && gameweeks.slice(-6).every((gw) => gw.event_transfers === 0);
+        const isDeleted = gameweeks.some((gw) => gw.overall_rank === 0);
+
+        if (isInactive) {
+          writeToBlacklist(playerId, "inactive");
+          continue;
+        }
+
+        if (isDeleted) {
+          writeToBlacklist(playerId, "deleted");
+          continue;
         }
 
         // Dynamically set headers if not already defined
@@ -66,50 +83,19 @@ export const processAllPlayers = async () => {
           headersDefined = true;
         }
 
-
         // Prepare rows for the player
         const rows = prepareRows(playerId, gameweeks);
-
-        // Check if this player's data needs to be updated
-        const existingPlayerData = existingData[playerId];
-        if (existingPlayerData) {
-          // Check if gameweek data has changed (e.g., new gameweek added)
-          const existingGameweeks = new Set(existingPlayerData.map((r) => r.event));
-          const newGameweeks = new Set(rows.map((r) => r.event));
-
-          // If there's no difference, skip updating this player
-          if ([...existingGameweeks].every((gw) => newGameweeks.has(gw))) {
-            return false;
-          }
-        }
-
-        // Add rows to the records (new or updated)
         records.push(...rows);
-
-        return false;
-      })
-
-    );
-
-    // Check if we need to stop processing further players
-    if (shouldStop.includes(true)) {
-      console.log("Encountered a player with no history. Stopping further processing.");
-      break;
+      } catch (error) {
+        console.error(`Error fetching data for player ID ${playerId}:`, (error as Error).message);
+        fs.writeFileSync(`error_${playerId}.log`, (error as Error).toString(), "utf8");
+        process.exit(1);
+      }
     }
 
     // Write the current batch to the CSV file
     if (csvWriter && records.length > 0) {
-      // Remove outdated data for players in this batch
-      const updatedPlayers = new Set(records.map((r) => r.Player_ID));
-      const updatedData = Object.values(existingData)
-        .flat()
-        .filter((row) => !updatedPlayers.has(row.Player_ID));
-
-      // Add the new data
-      updatedData.push(...records);
-
-      // Write all updated data back to the CSV
-      await csvWriter.writeRecords(updatedData);
+      await csvWriter.writeRecords(records);
       console.log(`Batch written to CSV: ${i + 1}-${i + batchSize}`);
     }
 
@@ -121,8 +107,16 @@ export const processAllPlayers = async () => {
     console.log(`Processed batch ${i + 1}-${i + batchSize}`);
   }
 
-  writeCheckpoint(0);
+  if (fetchAllPlayers) {
+    writeCheckpoint(0);
+  }
+
   console.log("Processing completed.");
-}
+};
+
 
 module.exports = { processAllPlayers };
+
+
+
+

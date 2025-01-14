@@ -3,3 +3,7 @@ export type GameweekData = {
     [key: string]: any;
 };
   
+export type Blacklist = {
+    ID: Number;
+    Reason: string;
+}
