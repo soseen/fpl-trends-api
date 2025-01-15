@@ -1,4 +1,3 @@
 {
-    "ignore": ["data/"]
+  "ignore": ["src/data/"]
 }
-  

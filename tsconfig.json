@@ -1,15 +1,24 @@
 {
   "compilerOptions": {
-    "target": "ESNext",
-    "module": "CommonJS",
-    "noImplicitAny": false,
-    "strict": true,
-    "esModuleInterop": true,
-    "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "outDir": "./dist",
-    "rootDir": "./src"
+    "target": "ESNext", // The version of JavaScript to emit
+    "module": "CommonJS", // Module system (use 'ESNext' for ESM)
+    "strict": true, // Enable all strict type-checking options
+    "esModuleInterop": true, // Enables interop between CommonJS and ESModules
+    "skipLibCheck": true, // Skip type checking of declaration files
+    "forceConsistentCasingInFileNames": true, // Enforce consistent casing in import paths
+    "outDir": "./dist", // Output directory for compiled files
+    "rootDir": "./src", // Specify the root directory for TypeScript files
+    "resolveJsonModule": true, // Allow importing JSON files
+    "moduleResolution": "node", // Use Node.js module resolution strategy
+    "allowSyntheticDefaultImports": true, // Allow default imports for modules without a default export
+    "declaration": true, // Generate .d.ts files for type definitions
+    "noImplicitAny": false, // Warn on variables with an implicit 'any' type
+    "strictNullChecks": true, // Enable strict null checks
+    "baseUrl": "./", // Base directory for resolving non-relative imports
+    "paths": {
+      "@/*": ["src/*"] // Alias for cleaner imports
+    }
   },
-  "include": ["src"],
-  "exclude": ["node_modules"]
+  "include": ["src"], // Include all files in the 'src' folder
+  "exclude": ["node_modules", "dist"] // Exclude these folders
 }

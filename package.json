@@ -2,11 +2,12 @@
   "name": "fpl-trends-api",
   "version": "1.0.0",
   "description": "API for the FPL Trends Application. Uses official FPL API.",
-  "main": "server.ts",
+  "main": "src/server.ts",
   "scripts": {
-    "start": "node server.ts",
-    "dev": "nodemon server.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node src/server.ts",
+    "dev": "nodemon src/server.ts",
+    "lint": "eslint . --ext .ts",
+    "lint:fix": "eslint . --ext .ts --fix"
   },
   "keywords": [],
   "author": "",
@@ -25,10 +26,13 @@
     "@types/node": "^22.10.5",
     "@typescript-eslint/eslint-plugin": "^8.19.1",
     "@typescript-eslint/parser": "^8.19.1",
-    "eslint": "^9.17.0",
+    "eslint": "^9.18.0",
+    "eslint-config-prettier": "^10.0.1",
     "eslint-plugin-node": "^11.1.0",
+    "eslint-plugin-prettier": "^5.2.1",
     "globals": "^15.14.0",
     "nodemon": "^3.1.9",
+    "prettier": "^3.4.2",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.3"
   }
