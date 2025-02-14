@@ -1,7 +1,7 @@
 import {
   CSV_FILE,
   LAST_GAMEWEEK_FILE,
-  RAW_ALL_DATA_FILE,
+  RAW_PLAYERS_ALL_FILE,
   readCheckpoint,
   writeCheckpoint,
 } from "./file.helpers";
@@ -40,8 +40,8 @@ export const fetchAllRawData = async () => {
 
   const lastProcessedId = readCheckpoint();
   const remainingPlayers = playerIds.filter((id) => id > lastProcessedId);
-  const rawData = fs.existsSync(RAW_ALL_DATA_FILE)
-    ? JSON.parse(fs.readFileSync(RAW_ALL_DATA_FILE, "utf8"))
+  const rawData = fs.existsSync(RAW_PLAYERS_ALL_FILE)
+    ? JSON.parse(fs.readFileSync(RAW_PLAYERS_ALL_FILE, "utf8"))
     : {};
 
   console.log(`Resuming from Player ID: ${lastProcessedId + 1}...`);
@@ -65,7 +65,7 @@ export const fetchAllRawData = async () => {
       );
 
       // Save the raw data file after processing each batch
-      fs.writeFileSync(RAW_ALL_DATA_FILE, JSON.stringify(rawData, null, 2));
+      fs.writeFileSync(RAW_PLAYERS_ALL_FILE, JSON.stringify(rawData, null, 2));
       console.log(
         `Batch ${i + 1} - ${i + BATCH_SIZE + 1} saved to raw data file.`,
       );

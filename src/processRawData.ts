@@ -4,16 +4,16 @@ import { createObjectCsvWriter } from "csv-writer";
 import {
   BLACKLIST_FILE,
   CLEANED_DATA_FILE,
-  RAW_DATA_FILE,
+  RAW_PLAYERS_SAMPLE_FILE,
 } from "./file.helpers";
 export const processRawData = async () => {
-  if (!fs.existsSync(RAW_DATA_FILE)) {
+  if (!fs.existsSync(RAW_PLAYERS_SAMPLE_FILE)) {
     console.error("Raw data file not found. Run fetchAndSaveRawData() first.");
     return;
   }
 
   const rawData: Record<string, PlayerHistory> = JSON.parse(
-    fs.readFileSync(RAW_DATA_FILE, "utf8"),
+    fs.readFileSync(RAW_PLAYERS_SAMPLE_FILE, "utf8"),
   );
   const blacklistedPlayers: Blacklist[] = [];
   const cleanedData: GameweekData[] = [];
@@ -29,15 +29,25 @@ export const processRawData = async () => {
     const isInactive =
       gameweeks.length >= 6 &&
       gameweeks.slice(-6).every((gw) => gw.event_transfers === 0);
-    const isDeleted = gameweeks.some((gw) => gw.overall_rank === 0);
 
     if (isInactive) {
       blacklistedPlayers.push({ ID: Number(playerId), Reason: "inactive" });
       continue; // Skip this player
     }
 
-    if (isDeleted) {
-      blacklistedPlayers.push({ ID: Number(playerId), Reason: "deleted" });
+    const { isDeleted, isTransferManiac } = gameweeks.reduce(
+      (acc, gw) => ({
+        isDeleted: acc.isDeleted || gw.overall_rank === 0,
+        isTransferManiac: acc.isTransferManiac || gw.event_transfers_cost >= 20,
+      }),
+      { isDeleted: false, isTransferManiac: false },
+    );
+
+    if (isDeleted || isTransferManiac) {
+      blacklistedPlayers.push({
+        ID: Number(playerId),
+        Reason: isDeleted ? "deleted" : "transfer maniac",
+      });
       continue; // Skip this player
     }
 
@@ -51,18 +61,18 @@ export const processRawData = async () => {
     path: CLEANED_DATA_FILE,
     header: [
       { id: "Player_ID", title: "Player_ID" },
-      { id: "event", title: "Gameweek" },
-      { id: "points", title: "Points" },
-      { id: "total_points", title: "Total Points" },
-      { id: "rank", title: "Rank" },
-      { id: "rank_sort", title: "Rank Sort" },
-      { id: "overall_rank", title: "Overall Rank" },
-      { id: "percentile_rank", title: "Percentile Rank" },
-      { id: "bank", title: "Bank" },
-      { id: "value", title: "Value" },
-      { id: "event_transfers", title: "Event Transfers" },
-      { id: "event_transfers_cost", title: "Event Transfers Cost" },
-      { id: "points_on_bench", title: "Points on Bench" },
+      { id: "event", title: "event" },
+      { id: "points", title: "points" },
+      { id: "total_points", title: "total_points" },
+      { id: "rank", title: "rank" },
+      { id: "rank_sort", title: "rank_sort" },
+      { id: "overall_rank", title: "overall_rank" },
+      { id: "percentile_rank", title: "percentile_rank" },
+      { id: "bank", title: "bank" },
+      { id: "value", title: "value" },
+      { id: "event_transfers", title: "event_transfers" },
+      { id: "event_transfers_cost", title: "event_transfers_cost" },
+      { id: "points_on_bench", title: "points_on_bench" },
     ],
   });
 
@@ -76,6 +86,7 @@ export const processRawData = async () => {
       { id: "ID", title: "ID" },
       { id: "Reason", title: "Reason" },
     ],
+    append: fs.existsSync(BLACKLIST_FILE),
   });
 
   await blacklistCsvWriter.writeRecords(blacklistedPlayers);

@@ -3,29 +3,38 @@
   "version": "1.0.0",
   "description": "API for the FPL Trends Application. Uses official FPL API.",
   "main": "src/server.ts",
+  "type": "module",
   "scripts": {
-    "start": "node src/server.ts",
-    "dev": "nodemon src/server.ts",
+    "start": "tsx src/server.ts",
+    "dev": "nodemon",
     "lint": "eslint . --ext .ts",
-    "lint:fix": "eslint . --ext .ts --fix"
+    "lint:fix": "eslint . --ext .ts --fix",
+    "populate": "npx tsx src/database/populateDatabase.ts"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "dependencies": {
     "@clickhouse/client": "^1.10.0",
+    "@prisma/client": "^6.2.1",
     "axios": "^1.7.9",
+    "cors": "^2.8.5",
     "csv-parser": "^3.1.0",
     "csv-writer": "^1.6.0",
-    "express": "^4.21.2"
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "pg": "^8.13.1"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",
     "@eslint/js": "^9.17.0",
+    "@types/cors": "^2.8.17",
     "@types/express": "^5.0.0",
-    "@types/node": "^22.10.5",
+    "@types/node": "^22.10.6",
+    "@types/pg": "^8.11.10",
     "@typescript-eslint/eslint-plugin": "^8.19.1",
     "@typescript-eslint/parser": "^8.19.1",
+    "esbuild": "^0.24.2",
     "eslint": "^9.18.0",
     "eslint-config-prettier": "^10.0.1",
     "eslint-plugin-node": "^11.1.0",
@@ -33,7 +42,9 @@
     "globals": "^15.14.0",
     "nodemon": "^3.1.9",
     "prettier": "^3.4.2",
+    "prisma": "^6.2.1",
     "ts-node": "^10.9.2",
+    "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }
 }

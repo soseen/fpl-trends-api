@@ -1,3 +1,6 @@
 {
-  "ignore": ["src/data/"]
+  "watch": ["src"],
+  "ext": "ts",
+  "ignore": ["node_modules", "src/data"],
+  "exec": "tsx src/server.ts"
 }

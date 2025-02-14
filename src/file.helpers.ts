@@ -1,7 +1,10 @@
 import fs from "fs";
-import csv from "csv-parser";
+import { fileURLToPath } from "url";
 import path from "path";
-import { GameweekData } from "./types";
+
+// Manual implementation of __dirname for ES Modules
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const FILES_FOLDER = path.join(__dirname, "data");
 export const CSV_FILE = path.join(
@@ -12,16 +15,29 @@ export const CHECKPOINT_FILE = path.join(FILES_FOLDER, "checkpoint.txt");
 export const LAST_GAMEWEEK_FILE = path.join(FILES_FOLDER, "lastGameweek.txt");
 export const BLACKLIST_FILE = path.join(FILES_FOLDER, "blacklist.csv");
 export const SAMPLE = path.join(FILES_FOLDER, "sample.csv");
-export const RAW_DATA_FILE = path.join(FILES_FOLDER, "raw_data.json");
-export const RAW_ALL_DATA_FILE = path.join(FILES_FOLDER, "raw_all_data.json");
-export const CLEANED_DATA_FILE = path.join(FILES_FOLDER, "cleaned_data.csv");
+export const RAW_PLAYERS_SAMPLE_FILE = path.join(
+  FILES_FOLDER,
+  "raw_players_sample.json",
+);
+export const RAW_PLAYERS_ALL_FILE = path.join(
+  FILES_FOLDER,
+  "raw_players_all.json",
+);
+export const CLEANED_DATA_FILE = path.join(FILES_FOLDER, "cleaned_players.csv");
+export const RAW_BOOTSTRAP_STATIC_FILE = path.join(
+  FILES_FOLDER,
+  "raw_bootstrap_static.json",
+);
+export const RAW_FOOTBALLERS_FILE = path.join(
+  FILES_FOLDER,
+  "raw_footballers.json",
+);
 
 if (!fs.existsSync(FILES_FOLDER)) {
   fs.mkdirSync(FILES_FOLDER, { recursive: true });
   console.log(`Created folder: ${FILES_FOLDER}`);
 }
 
-// Read the last checkpoint (last processed player ID)
 export const readCheckpoint = () => {
   if (fs.existsSync(CHECKPOINT_FILE)) {
     const lastProcessed = fs.readFileSync(CHECKPOINT_FILE, "utf8");
@@ -30,28 +46,6 @@ export const readCheckpoint = () => {
   return 0;
 };
 
-// Write the checkpoint (last processed player ID)
 export const writeCheckpoint = (playerId: number) => {
   fs.writeFileSync(CHECKPOINT_FILE, playerId.toString(), "utf8");
 };
-
-// Dynamically create headers from the API response
-export const createHeaders = (
-  sampleGameweek: Omit<GameweekData, "Player_ID">,
-) => {
-  const headers = [{ id: "Player_ID", title: "Player_ID" }];
-  Object.keys(sampleGameweek).forEach((key) => {
-    headers.push({ id: key, title: key });
-  });
-  return headers;
-};
-
-// Prepare rows dynamically based on the API response
-export const prepareRows = (
-  playerId: number,
-  gameweeks: Omit<GameweekData, "Player_ID">[],
-): GameweekData[] =>
-  gameweeks.map((gameweek) => ({
-    Player_ID: playerId.toString(),
-    ...gameweek,
-  }));

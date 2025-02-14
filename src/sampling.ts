@@ -6,6 +6,7 @@ import { BLACKLIST_FILE, SAMPLE } from "./file.helpers";
 export const getSamplePlayers = (
   totalPlayers: number,
   blacklist: Set<number>,
+  sampleSize: number,
 ): number[] => {
   const maxSampleId = Math.floor(totalPlayers * 0.6); // Top limit of eligible IDs (60% of totalPlayers)
   const top30PercentStart = Math.floor(totalPlayers * 0.3); // Start of the top 30% of IDs
@@ -38,8 +39,8 @@ export const getSamplePlayers = (
   const shuffledRemaining = shuffleArray(remainingPlayers);
 
   // Select random samples
-  const sampleTop30 = shuffledTop30.slice(0, 5000); // 50k from top 30%
-  const sampleRemaining = shuffledRemaining.slice(0, 5000); // 50k from below 60%
+  const sampleTop30 = shuffledTop30.slice(0, sampleSize / 2); // half from top 30%
+  const sampleRemaining = shuffledRemaining.slice(0, sampleSize / 2); // half from 30 - 60 %
 
   const sampledIds = [...sampleTop30, ...sampleRemaining];
 
@@ -65,16 +66,4 @@ export const readBlacklist = (): Set<number> => {
     .split("\n")
     .map((line) => parseInt(line.split(",")[0], 10));
   return new Set(blacklist);
-};
-
-export const writeToBlacklist = (playerId: number, reason: string) => {
-  const blacklistWriter = createObjectCsvWriter({
-    path: BLACKLIST_FILE,
-    header: [
-      { id: "ID", title: "ID" },
-      { id: "Reason", title: "Reason" },
-    ],
-    append: fs.existsSync(BLACKLIST_FILE),
-  });
-  blacklistWriter.writeRecords([{ ID: playerId, Reason: reason }]);
 };

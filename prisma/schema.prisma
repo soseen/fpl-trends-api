@@ -1,0 +1,233 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model fixtures {
+  id                     Int                   @id @default(autoincrement())
+  code                   Int?                  @unique
+  team_h                 Int?
+  team_h_score           Int?
+  team_a                 Int?
+  team_a_score           Int?
+  event                  Int?
+  finished               Boolean?
+  minutes                Int?
+  provisional_start_time Boolean?
+  kickoff_time           DateTime?             @db.Timestamp(6)
+  event_name             String?               @db.VarChar(255)
+  is_home                Boolean?
+  difficulty             Int?
+  footballer_fixtures    footballer_fixtures[]
+}
+
+model footballer_fixtures {
+  id            Int         @id @default(autoincrement())
+  footballer_id Int
+  fixture_id    Int
+  fixtures      fixtures    @relation(fields: [fixture_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  footballers   footballers @relation(fields: [footballer_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+
+  @@unique([footballer_id, fixture_id])
+}
+
+model footballers {
+  id                                   Int                   @id @unique
+  team_id                              Int?
+  web_name                             String?               @db.VarChar(255)
+  code                                 Int?                  @unique
+  first_name                           String?               @db.VarChar(255)
+  second_name                          String?               @db.VarChar(255)
+  team_code                            Int?
+  now_cost                             Int?
+  selected_by_percent                  String?               @db.VarChar(10)
+  goals_scored                         Int?
+  assists                              Int?
+  bonus                                Int?
+  bps                                  Int?
+  total_points                         Int?
+  status                               String?               @db.VarChar(10)
+  news                                 String?
+  expected_goals                       String?               @db.VarChar(10)
+  expected_assists                     String?               @db.VarChar(10)
+  expected_goal_involvements           String?               @db.VarChar(10)
+  expected_goals_conceded              String?               @db.VarChar(10)
+  expected_goals_per_90                Float?
+  expected_assists_per_90              Float?
+  expected_goal_involvements_per_90    Float?
+  expected_goals_conceded_per_90       Float?
+  goals_conceded_per_90                Float?
+  element_type                         Int?
+  can_transact                         Boolean?
+  can_select                           Boolean?
+  chance_of_playing_next_round         Int?
+  chance_of_playing_this_round         Int?
+  cost_change_event                    Int?
+  cost_change_event_fall               Int?
+  cost_change_start                    Int?
+  cost_change_start_fall               Int?
+  dreamteam_count                      Int?
+  ep_next                              String?               @db.VarChar(10)
+  ep_this                              String?               @db.VarChar(10)
+  event_points                         Int?
+  form                                 String?               @db.VarChar(10)
+  in_dreamteam                         Boolean?
+  news_added                           DateTime?             @db.Timestamp(6)
+  photo                                String?               @db.VarChar(255)
+  points_per_game                      String?               @db.VarChar(10)
+  removed                              Boolean?
+  special                              Boolean?
+  squad_number                         Int?
+  team                                 Int?
+  transfers_in                         Int?
+  transfers_in_event                   Int?
+  transfers_out                        Int?
+  transfers_out_event                  Int?
+  value_form                           String?               @db.VarChar(10)
+  value_season                         String?               @db.VarChar(10)
+  region                               Int?
+  team_join_date                       DateTime?             @db.Date
+  minutes                              Int?
+  clean_sheets                         Int?
+  goals_conceded                       Int?
+  own_goals                            Int?
+  penalties_saved                      Int?
+  penalties_missed                     Int?
+  yellow_cards                         Int?
+  red_cards                            Int?
+  saves                                Int?
+  influence                            String?               @db.VarChar(10)
+  creativity                           String?               @db.VarChar(10)
+  threat                               String?               @db.VarChar(10)
+  ict_index                            String?               @db.VarChar(10)
+  starts                               Int?
+  influence_rank                       Int?
+  influence_rank_type                  Int?
+  creativity_rank                      Int?
+  creativity_rank_type                 Int?
+  threat_rank                          Int?
+  threat_rank_type                     Int?
+  ict_index_rank                       Int?
+  ict_index_rank_type                  Int?
+  corners_and_indirect_freekicks_order Int?
+  corners_and_indirect_freekicks_text  String?
+  direct_freekicks_order               Int?
+  direct_freekicks_text                String?
+  penalties_order                      Int?
+  penalties_text                       String?
+  saves_per_90                         Float?
+  now_cost_rank                        Int?
+  now_cost_rank_type                   Int?
+  form_rank                            Int?
+  form_rank_type                       Int?
+  points_per_game_rank                 Int?
+  points_per_game_rank_type            Int?
+  selected_rank                        Int?
+  selected_rank_type                   Int?
+  starts_per_90                        Float?
+  clean_sheets_per_90                  Float?
+  footballer_fixtures                  footballer_fixtures[]
+  teams                                teams?                @relation(fields: [team_id], references: [id], onUpdate: NoAction, map: "fk_team")
+  history                              history[]
+}
+
+model history {
+  opponent_team              Int
+  total_points               Int
+  was_home                   Boolean
+  kickoff_time               DateTime
+  team_h_score               Int?
+  team_a_score               Int?
+  round                      Int
+  modified                   Boolean
+  minutes                    Int
+  goals_scored               Int
+  assists                    Int
+  clean_sheets               Int
+  goals_conceded             Int
+  own_goals                  Int
+  penalties_saved            Int
+  penalties_missed           Int
+  yellow_cards               Int
+  red_cards                  Int
+  saves                      Int
+  bonus                      Int
+  bps                        Int
+  influence                  String
+  creativity                 String
+  threat                     String
+  ict_index                  String
+  starts                     Int
+  expected_goals             String
+  expected_assists           String
+  expected_goal_involvements String
+  expected_goals_conceded    String
+  value                      Int
+  transfers_balance          Int
+  selected                   Int
+  transfers_in               Int
+  transfers_out              Int
+  fixture_id                 Int
+  footballer_id              Int
+  footballer                 footballers @relation(fields: [footballer_id], references: [id], onDelete: Cascade)
+
+  @@id([footballer_id, fixture_id])
+}
+
+model teams {
+  id                    Int           @id @default(autoincrement())
+  code                  Int?          @unique
+  name                  String?       @db.VarChar(255)
+  short_name            String?       @db.VarChar(10)
+  strength              Int?
+  strength_overall_home Int?
+  strength_overall_away Int?
+  strength_attack_home  Int?
+  strength_attack_away  Int?
+  strength_defence_home Int?
+  strength_defence_away Int?
+  played                Int?
+  points                Int?
+  position              Int?
+  win                   Int?
+  draw                  Int?
+  loss                  Int?
+  form                  String?       @db.VarChar(10)
+  team_division         Int?
+  unavailable           Boolean?
+  pulse_id              Int?          @unique
+  footballers           footballers[]
+}
+
+model events {
+  id                             Int       @id @unique
+  name                           String    @db.VarChar(255)
+  average_entry_score            Int
+  finished                       Boolean
+  data_checked                   Boolean
+  highest_scoring_entry          Int?
+  deadline_time_epoch            Int
+  deadline_time_game_offset      Int
+  highest_score                  Int
+  is_previous                    Boolean
+  is_current                     Boolean
+  is_next                        Boolean
+  cup_leagues_created            Boolean
+  h2h_ko_matches_created         Boolean
+  can_enter                      Boolean
+  can_manage                     Boolean
+  released                       Boolean
+  ranked_count                   Int
+  most_selected                  Int
+  most_transferred_in            Int
+  top_element                    Int
+  transfers_made                 Int
+  most_captained                 Int
+  most_vice_captained            Int
+
+  @@map("events")
+}
