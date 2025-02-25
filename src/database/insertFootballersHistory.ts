@@ -10,8 +10,7 @@ export const insertFootballersHistory = async () => {
     )
       ? JSON.parse(fs.readFileSync(RAW_FOOTBALLERS_FILE, "utf8"))
       : {};
-
-    // 1️⃣ Fetch all existing footballer IDs from the database
+    
     const existingFootballers = await prisma.footballers.findMany({
       select: { id: true },
     });

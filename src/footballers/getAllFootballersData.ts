@@ -9,10 +9,12 @@ export const getFootballersWithHistoryAndFixtures = async () => {
     },
   });
 
-  console.log(footballers);
-
   return footballers.map((footballer) => ({
     ...footballer,
-    footballer_fixtures: footballer.footballer_fixtures.map((f) => f.fixtures),
+    footballer_fixtures: footballer.footballer_fixtures.map((f) => ({
+      ...f.fixtures,
+      is_home: f.is_home,
+      difficulty: f.difficulty,
+    })),
   }));
 };

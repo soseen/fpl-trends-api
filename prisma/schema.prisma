@@ -20,17 +20,18 @@ model fixtures {
   provisional_start_time Boolean?
   kickoff_time           DateTime?             @db.Timestamp(6)
   event_name             String?               @db.VarChar(255)
-  is_home                Boolean?
-  difficulty             Int?
   footballer_fixtures    footballer_fixtures[]
 }
 
 model footballer_fixtures {
-  id            Int         @id @default(autoincrement())
+  id            Int      @id @default(autoincrement())
   footballer_id Int
   fixture_id    Int
-  fixtures      fixtures    @relation(fields: [fixture_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
-  footballers   footballers @relation(fields: [footballer_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  is_home       Boolean?
+  difficulty    Int?
+
+  fixtures    fixtures    @relation(fields: [fixture_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
+  footballers footballers @relation(fields: [footballer_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([footballer_id, fixture_id])
 }
@@ -204,30 +205,30 @@ model teams {
 }
 
 model events {
-  id                             Int       @id @unique
-  name                           String    @db.VarChar(255)
-  average_entry_score            Int
-  finished                       Boolean
-  data_checked                   Boolean
-  highest_scoring_entry          Int?
-  deadline_time_epoch            Int
-  deadline_time_game_offset      Int
-  highest_score                  Int
-  is_previous                    Boolean
-  is_current                     Boolean
-  is_next                        Boolean
-  cup_leagues_created            Boolean
-  h2h_ko_matches_created         Boolean
-  can_enter                      Boolean
-  can_manage                     Boolean
-  released                       Boolean
-  ranked_count                   Int
-  most_selected                  Int
-  most_transferred_in            Int
-  top_element                    Int
-  transfers_made                 Int
-  most_captained                 Int
-  most_vice_captained            Int
+  id                        Int     @id @unique
+  name                      String  @db.VarChar(255)
+  average_entry_score       Int
+  finished                  Boolean
+  data_checked              Boolean
+  highest_scoring_entry     Int?
+  deadline_time_epoch       Int
+  deadline_time_game_offset Int
+  highest_score             Int
+  is_previous               Boolean
+  is_current                Boolean
+  is_next                   Boolean
+  cup_leagues_created       Boolean
+  h2h_ko_matches_created    Boolean
+  can_enter                 Boolean
+  can_manage                Boolean
+  released                  Boolean
+  ranked_count              Int
+  most_selected             Int
+  most_transferred_in       Int
+  top_element               Int
+  transfers_made            Int
+  most_captained            Int
+  most_vice_captained       Int
 
   @@map("events")
 }
