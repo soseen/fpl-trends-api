@@ -25,42 +25,6 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-app.get("/api/fetch-sample", async (req: Request, res: Response) => {
-  try {
-    await processRawData();
-    res.status(200).json({ message: "Players processed successfully!" });
-  } catch (error: unknown) {
-    console.error("Error querying ClickHouse:", error);
-    res.status(500).json({ error: "Failed to fetch data." });
-  }
-});
-
-app.get("/api/fetch-all", async (req: Request, res: Response) => {
-  try {
-    console.log("Fetching Raw Data for all the users...!");
-    await fetchAllRawData();
-    console.log("Processing Data...!");
-    await processRawData();
-    res.status(200).json({ message: "Players processed successfully!" });
-  } catch (error: unknown) {
-    console.error("Error querying ClickHouse:", error);
-    res.status(500).json({ error: "Failed to fetch data." });
-  }
-});
-
-app.get("/api/fetch-footballers", async (req: Request, res: Response) => {
-  try {
-    console.log("Fetching Bootstrap Static...!");
-    await fetchBootstrapStatic();
-    console.log("Fetching Footballers...!");
-    await fetchFootballers();
-    res.status(200).json({ message: "Footballers processed successfully!" });
-  } catch (error: unknown) {
-    console.error("Error querying ClickHouse:", error);
-    res.status(500).json({ error: "Failed to fetch data." });
-  }
-});
-
 app.get("/api/footballersData", async (req: Request, res: Response) => {
   try {
     const footballers = await getFootballersWithHistoryAndFixtures();
