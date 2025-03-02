@@ -5,7 +5,7 @@
   "main": "src/server.ts",
   "type": "module",
   "scripts": {
-    "start": "tsx src/server.ts",
+    "start": "node src/server.ts",
     "dev": "nodemon",
     "lint": "eslint . --ext .ts",
     "lint:fix": "eslint . --ext .ts --fix",
@@ -46,7 +46,6 @@
     "prettier": "^3.4.2",
     "prisma": "^6.2.1",
     "ts-node": "^10.9.2",
-    "tsx": "^4.19.2",
     "typescript": "^5.7.3"
   }
 }
