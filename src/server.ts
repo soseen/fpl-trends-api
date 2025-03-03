@@ -4,9 +4,15 @@ import { getFootballersWithHistoryAndFixtures } from "./footballers/getAllFootba
 import { getTeamsData } from "./teams/getTeamsData.js";
 import { getBasicInfo } from "./fetch.js";
 import { getEvents } from "./events/getEvents.js";
+import compression from "compression";
+import helmet from "helmet";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+app.use(helmet()); // Adds security headers
+app.use(compression()); // Compresses response data
+app.use(express.json()); // Parse JSON body
 
 const corsOptions = {
   origin:
@@ -85,6 +91,20 @@ app.get("/api/test", async (req: Request, res: Response) => {
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
+const server = app.listen(PORT, () => {
+  console.log(`🚀 Server is running on port ${PORT}`);
+});
+
+process.on("SIGTERM", () => {
+  console.log("Shutting down gracefully...");
+  server.close(() => {
+    console.log("Process terminated.");
+  });
+});
+
+process.on("SIGINT", () => {
+  console.log("Interrupted! Shutting down...");
+  server.close(() => {
+    console.log("Server stopped.");
+  });
 });
