@@ -1,4 +1,4 @@
-import { prisma } from "../database/client";
+import { prisma } from "../database/client.js";
 
 export const getTeamsData = async () => {
   const teams = await prisma.teams.findMany({
