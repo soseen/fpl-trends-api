@@ -5,7 +5,6 @@
   "main": "dist/server.js",
   "type": "module",
   "scripts": {
-    "prestart": "npm install --frozen-lockfile && npm run build",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "build": "tsc",
@@ -66,6 +65,6 @@
     "typescript-eslint": "^8.25.0"
   },
   "engines": {
-    "node": "20.x.x"
+    "node": "20.x"
   }
 }
