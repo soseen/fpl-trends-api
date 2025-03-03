@@ -1,7 +1,7 @@
 import fs from "fs";
-import { prisma } from "./client";
-import { RAW_FOOTBALLERS_FILE } from "../file.helpers";
-import { Footballer } from "../footballers/types";
+import { prisma } from "./client.js";
+import { RAW_FOOTBALLERS_FILE } from "../file.helpers.js";
+import { Footballer } from "../footballers/types.js";
 
 export const insertFootballersHistory = async () => {
   try {
@@ -10,14 +10,12 @@ export const insertFootballersHistory = async () => {
     )
       ? JSON.parse(fs.readFileSync(RAW_FOOTBALLERS_FILE, "utf8"))
       : {};
-    
+
     const existingFootballers = await prisma.footballers.findMany({
       select: { id: true },
     });
 
     const existingFootballerIds = new Set(existingFootballers.map((f) => f.id));
-
-    const historyRecords = [];
 
     for (const [footballerId, footballer] of Object.entries(rawData)) {
       const parsedFootballerId = parseInt(footballerId, 10);

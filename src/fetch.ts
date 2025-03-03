@@ -1,6 +1,6 @@
 import axios from "axios";
-import { GameweekData, PlayerHistory } from "./types";
-import { BootstrapStaticData } from "./bootstrapStatic/types";
+import { PlayerHistory } from "./types.js";
+import { BootstrapStaticData } from "./bootstrapStatic/types.js";
 
 export const getPlayerHistory = async (playerId: number) => {
   try {

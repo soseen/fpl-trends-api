@@ -1,8 +1,8 @@
 import fs from "fs";
-import { getPlayerHistory, getBasicInfo } from "./fetch";
-import { getSamplePlayers, readBlacklist } from "./sampling";
-import { LAST_GAMEWEEK_FILE, RAW_PLAYERS_SAMPLE_FILE } from "./file.helpers";
-import { delay } from "./utils";
+import { getPlayerHistory, getBasicInfo } from "./fetch.js";
+import { getSamplePlayers, readBlacklist } from "./sampling.js";
+import { LAST_GAMEWEEK_FILE, RAW_PLAYERS_SAMPLE_FILE } from "./file.helpers.js";
+import { delay } from "./utils.js";
 
 const BATCH_SIZE = 32;
 const DELAY_MS = 60;

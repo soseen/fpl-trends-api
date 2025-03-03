@@ -1,6 +1,6 @@
 import fs from "fs";
 import { createObjectCsvWriter } from "csv-writer";
-import { BLACKLIST_FILE, SAMPLE } from "./file.helpers";
+import { BLACKLIST_FILE, SAMPLE } from "./file.helpers.js";
 
 //Half of the sampled players should consist of the top 30% of IDs (the likelihood that a player is active is higher). The other half is the remaining players whose ID is not higher than 60% of Total Players.
 export const getSamplePlayers = (

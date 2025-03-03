@@ -1,4 +1,4 @@
-import { prisma } from "../database/client";
+import { prisma } from "../database/client.js";
 
 export const getFootballersWithHistoryAndFixtures = async () => {
   const footballers = await prisma.footballers.findMany({

@@ -3,10 +3,14 @@
     "module": "ESNext",
     "target": "ESNext",
     "moduleResolution": "node",
+    "outDir": "./dist",
+    "rootDir": "./src",
     "esModuleInterop": true,
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
-    "outDir": "./dist",
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "strict": true,
     "baseUrl": ".",
     "paths": {
       "@/*": ["./*"]

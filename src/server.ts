@@ -1,9 +1,9 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
-import { getFootballersWithHistoryAndFixtures } from "./footballers/getAllFootballersData";
-import { getTeamsData } from "./teams/getTeamsData";
-import { getBasicInfo } from "./fetch";
-import { getEvents } from "./events/getEvents";
+import { getFootballersWithHistoryAndFixtures } from "./footballers/getAllFootballersData.js";
+import { getTeamsData } from "./teams/getTeamsData.js";
+import { getBasicInfo } from "./fetch.js";
+import { getEvents } from "./events/getEvents.js";
 
 const app = express();
 const PORT = process.env.PORT || 3000;

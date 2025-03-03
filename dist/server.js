@@ -8,7 +8,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const corsOptions = {
     origin: process.env.NODE_ENV === "production"
-        ? "https://your-production-domain.com"
+        ? "https://fpltrends.app"
         : "http://localhost:5000",
     methods: ["GET", "POST"],
     allowedHeaders: ["Content-Type", "Authorization"],
@@ -21,7 +21,7 @@ app.get("/api/footballersData", async (req, res) => {
         res.status(200).json(footballers);
     }
     catch (error) {
-        console.error("Error querying ClickHouse:", error);
+        console.error("Encountered an error trying to execute a query function: ", error);
         res.status(500).json({ error: "Failed to fetch data." });
     }
 });
@@ -31,7 +31,7 @@ app.get("/api/teamsData", async (req, res) => {
         res.status(200).json(teams);
     }
     catch (error) {
-        console.error("Error querying ClickHouse:", error);
+        console.error("Encountered an error trying to execute a query function: ", error);
         res.status(500).json({ error: "Failed to fetch data." });
     }
 });
@@ -41,7 +41,7 @@ app.get("/api/totalPlayersCount", async (req, res) => {
         res.status(200).json(data.totalPlayers);
     }
     catch (error) {
-        console.error("Error querying ClickHouse:", error);
+        console.error("Encountered an error trying to execute a query function: ", error);
         res.status(500).json({ error: "Failed to fetch data." });
     }
 });
@@ -51,7 +51,17 @@ app.get("/api/eventsData", async (req, res) => {
         res.status(200).json(events);
     }
     catch (error) {
-        console.error("Error querying ClickHouse:", error);
+        console.error("Encountered an error trying to execute a query function: ", error);
+        res.status(500).json({ error: "Failed to fetch data." });
+    }
+});
+app.get("/api/test", async (req, res) => {
+    try {
+        const test = [{ id: 1, value: "test" }];
+        res.status(200).json(test);
+    }
+    catch (error) {
+        console.error("Encountered an error trying to execute a query function: ", error);
         res.status(500).json({ error: "Failed to fetch data." });
     }
 });

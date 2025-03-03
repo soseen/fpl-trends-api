@@ -4,12 +4,12 @@ import {
   RAW_PLAYERS_ALL_FILE,
   readCheckpoint,
   writeCheckpoint,
-} from "./file.helpers";
+} from "./file.helpers.js";
 import fs from "fs";
-import { GameweekData } from "./types";
-import { getPlayerHistory, getBasicInfo } from "./fetch";
-import { readBlacklist } from "./sampling";
-import { delay } from "./utils";
+import { GameweekData } from "./types.js";
+import { getPlayerHistory, getBasicInfo } from "./fetch.js";
+import { readBlacklist } from "./sampling.js";
+import { delay } from "./utils.js";
 
 const BATCH_SIZE = 20;
 const DELAY_MS = 50;

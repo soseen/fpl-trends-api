@@ -1,8 +1,7 @@
-import { PrismaClient } from "@prisma/client";
 import fs from "fs";
-import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers";
-import { BootstrapStaticData } from "../bootstrapStatic/types";
-import { prisma } from "./client";
+import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
+import { BootstrapStaticData } from "../bootstrapStatic/types.js";
+import { prisma } from "./client.js";
 
 export const insertTeams = async () => {
   try {

@@ -1,8 +1,8 @@
 import fs from "fs";
-import { Footballer } from "./types";
-import { getFootballer, getFootballersIds } from "./utils";
-import { RAW_FOOTBALLERS_FILE } from "../file.helpers";
-import { delay } from "../utils";
+import { Footballer } from "./types.js";
+import { getFootballer, getFootballersIds } from "./utils.js";
+import { RAW_FOOTBALLERS_FILE } from "../file.helpers.js";
+import { delay } from "../utils.js";
 
 const BATCH_SIZE = 32;
 const DELAY_MS = 60;

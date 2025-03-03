@@ -3,7 +3,7 @@ export type GameweekData = {
 } & GameweekEvent;
 
 export type Blacklist = {
-  ID: Number;
+  ID: number;
   Reason: string;
 };
 

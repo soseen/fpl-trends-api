@@ -1,11 +1,11 @@
-import { Blacklist, GameweekData, GameweekEvent, PlayerHistory } from "./types";
+import { Blacklist, GameweekData, PlayerHistory } from "./types.js";
 import fs from "fs";
 import { createObjectCsvWriter } from "csv-writer";
 import {
   BLACKLIST_FILE,
   CLEANED_DATA_FILE,
   RAW_PLAYERS_SAMPLE_FILE,
-} from "./file.helpers";
+} from "./file.helpers.js";
 export const processRawData = async () => {
   if (!fs.existsSync(RAW_PLAYERS_SAMPLE_FILE)) {
     console.error("Raw data file not found. Run fetchAndSaveRawData() first.");

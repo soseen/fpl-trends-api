@@ -1,10 +1,10 @@
-import { insertFootballersFixtures } from "./insertFootballersFixtures";
-import { insertFootballers } from "./insertFootballers";
-import { insertTeams } from "./insertTeams";
-import { insertFootballersHistory } from "./insertFootballersHistory";
-import { fetchBootstrapStatic } from "../bootstrapStatic/fetchBootstrapStatic";
-import { fetchFootballers } from "../footballers/fetchFootballers";
-import { insertEvents } from "../events/insertEvents";
+import { insertFootballersFixtures } from "./insertFootballersFixtures.js";
+import { insertFootballers } from "./insertFootballers.js";
+import { insertTeams } from "./insertTeams.js";
+import { insertFootballersHistory } from "./insertFootballersHistory.js";
+import { fetchBootstrapStatic } from "../bootstrapStatic/fetchBootstrapStatic.js";
+import { fetchFootballers } from "../footballers/fetchFootballers.js";
+import { insertEvents } from "../events/insertEvents.js";
 
 (async () => {
   try {

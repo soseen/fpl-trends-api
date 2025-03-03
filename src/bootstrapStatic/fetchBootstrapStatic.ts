@@ -1,6 +1,6 @@
 import fs from "fs";
-import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers";
-import { getBootstrapStaticData } from "./../fetch";
+import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
+import { getBootstrapStaticData } from "./../fetch.js";
 
 export const fetchBootstrapStatic = async () => {
   if (fs.existsSync(RAW_BOOTSTRAP_STATIC_FILE)) {
