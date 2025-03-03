@@ -11,7 +11,7 @@
     "lint": "eslint . --ext .ts",
     "lint:fix": "eslint . --ext .ts --fix",
     "populate": "cross-env NODE_ENV=development tsx src/database/populateDatabase.ts",
-    "migrate": "npm run prisma migrate deploy"
+    "migrate": "npx prisma migrate deploy"
   },
   "keywords": [],
   "author": "",
