@@ -91,6 +91,19 @@ app.get("/api/test", async (req: Request, res: Response) => {
   }
 });
 
+app.get("/api/test2", async (req: Request, res: Response) => {
+  try {
+    const test = [{ id: 1, value: "I love you <3" }];
+    res.status(200).json(test);
+  } catch (error: unknown) {
+    console.error(
+      "Encountered an error trying to execute a query function: ",
+      error,
+    );
+    res.status(500).json({ error: "Failed to fetch data." });
+  }
+});
+
 const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server is running on port ${PORT}`);
 });
