@@ -5,8 +5,7 @@
   "main": "dist/server.js",
   "type": "module",
   "scripts": {
-    "postinstall": "yarn install",
-    "prestart": "yarn build",
+    "prestart": "npm install --frozen-lockfile && npm run build",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
     "build": "tsc",
@@ -65,5 +64,10 @@
     "ts-node": "^10.9.2",
     "typescript": "^5.7.3",
     "typescript-eslint": "^8.25.0"
+  },
+  "engines": {
+    "node": "23.6.0",
+    "yarn": "1.22.19",
+    "npm": "8.17.0"
   }
 }
