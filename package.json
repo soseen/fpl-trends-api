@@ -7,10 +7,10 @@
   "scripts": {
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
-    "build": "tsc && npm run migrate",
+    "build": "tsc && npm run migrate && npm run populate",
     "lint": "eslint . --ext .ts",
     "lint:fix": "eslint . --ext .ts --fix",
-    "populate": "cross-env NODE_ENV=development tsx src/database/populateDatabase.ts",
+    "populate": "tsx src/database/populateDatabase.ts",
     "migrate": "npx prisma migrate deploy"
   },
   "keywords": [],
