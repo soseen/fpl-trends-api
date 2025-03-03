@@ -8,7 +8,7 @@ import compression from "compression";
 import helmet from "helmet";
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = parseInt(process.env.PORT ?? "5000") || 3000;
 
 app.use(helmet()); // Adds security headers
 app.use(compression()); // Compresses response data
@@ -91,7 +91,7 @@ app.get("/api/test", async (req: Request, res: Response) => {
   }
 });
 
-const server = app.listen(PORT, () => {
+const server = app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server is running on port ${PORT}`);
 });
 
