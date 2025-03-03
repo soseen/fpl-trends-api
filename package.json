@@ -8,7 +8,7 @@
     "prestart": "yarn build",
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
-    "build": "npx tsc",
+    "build": "tsc",
     "lint": "eslint . --ext .ts",
     "lint:fix": "eslint . --ext .ts --fix",
     "populate": "cross-env NODE_ENV=development tsx src/database/populateDatabase.ts",
