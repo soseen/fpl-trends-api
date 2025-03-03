@@ -7,7 +7,6 @@
     "allowSyntheticDefaultImports": true,
     "resolveJsonModule": true,
     "outDir": "./dist",
-    "strict": true,
     "baseUrl": ".",
     "paths": {
       "@/*": ["./*"]

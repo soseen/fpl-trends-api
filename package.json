@@ -2,11 +2,12 @@
   "name": "fpl-trends-api",
   "version": "1.0.0",
   "description": "API for the FPL Trends Application. Uses official FPL API.",
-  "main": "src/server.ts",
+  "main": "dist/server.js",
   "type": "module",
   "scripts": {
-    "start": "node src/server.ts",
-    "dev": "nodemon",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "build": "npx tsc && npm run start",
     "lint": "eslint . --ext .ts",
     "lint:fix": "eslint . --ext .ts --fix",
     "populate": "cross-env NODE_ENV=development tsx src/database/populateDatabase.ts",
@@ -24,7 +25,9 @@
     "csv-writer": "^1.6.0",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
-    "pg": "^8.13.1"
+    "pg": "^8.13.1",
+    "tsc": "^2.0.4",
+    "tsx": "^4.19.3"
   },
   "devDependencies": {
     "@eslint/eslintrc": "^3.2.0",
