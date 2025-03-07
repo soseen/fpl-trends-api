@@ -5,6 +5,7 @@ import { insertFootballersHistory } from "./insertFootballersHistory.js";
 import { fetchBootstrapStatic } from "../bootstrapStatic/fetchBootstrapStatic.js";
 import { fetchFootballers } from "../footballers/fetchFootballers.js";
 import { insertEvents } from "../events/insertEvents.js";
+import { insertTeamHistory } from "./insertTeamHistory.js";
 
 (async () => {
   try {
@@ -20,6 +21,8 @@ import { insertEvents } from "../events/insertEvents.js";
     await insertFootballers();
     console.log("Starting to populate fixtures...");
     await insertFootballersFixtures();
+    console.log("Starting to populate team history...");
+    await insertTeamHistory();
     console.log("Starting to populate history...");
     await insertFootballersHistory();
     console.log("Database populated successfully!");

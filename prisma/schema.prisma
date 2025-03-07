@@ -7,8 +7,12 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model fixtures {
-  id                     Int                   @id @default(autoincrement())
+model footballer_fixtures {
+  id            Int      @id @default(autoincrement())
+  footballer_id Int
+  fixture_id    Int
+  is_home       Boolean?
+  difficulty    Int?
   code                   Int?                  @unique
   team_h                 Int?
   team_h_score           Int?
@@ -20,17 +24,7 @@ model fixtures {
   provisional_start_time Boolean?
   kickoff_time           DateTime?             @db.Timestamp(6)
   event_name             String?               @db.VarChar(255)
-  footballer_fixtures    footballer_fixtures[]
-}
 
-model footballer_fixtures {
-  id            Int      @id @default(autoincrement())
-  footballer_id Int
-  fixture_id    Int
-  is_home       Boolean?
-  difficulty    Int?
-
-  fixtures    fixtures    @relation(fields: [fixture_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
   footballers footballers @relation(fields: [footballer_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
   @@unique([footballer_id, fixture_id])
@@ -202,6 +196,22 @@ model teams {
   unavailable           Boolean?
   pulse_id              Int?          @unique
   footballers           footballers[]
+
+  team_history          team_history[]
+}
+
+model team_history {
+  id             Int     @id @default(autoincrement())
+  team_id        Int
+  round          Int
+  teamXGC        Float
+  teamXGS        Float
+  goals          Int
+  goals_conceded Int
+
+  team           teams   @relation(fields: [team_id], references: [id], onDelete: Cascade)
+
+  @@unique([team_id, round])
 }
 
 model events {

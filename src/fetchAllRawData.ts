@@ -16,8 +16,6 @@ const DELAY_MS = 50;
 
 export const fetchAllRawData = async () => {
   const { lastGameweek, totalPlayers } = await getBasicInfo();
-  console.log(`Total Players: ${totalPlayers}`);
-  console.log("LAST GAMEWEEK: ", lastGameweek);
 
   const lastProcessedGameweek = fs.existsSync(LAST_GAMEWEEK_FILE)
     ? parseInt(fs.readFileSync(LAST_GAMEWEEK_FILE, "utf8"), 10)

@@ -21,9 +21,7 @@ export const insertFootballersFixtures = async () => {
       }
     }
 
-    const fixturesToInsert = Array.from(uniqueFixtures.values());
-
-    const existingFixtures = await prisma.fixtures.findMany({
+    const existingFixtures = await prisma.footballer_fixtures.findMany({
       select: { id: true },
     });
 
@@ -40,44 +38,10 @@ export const insertFootballersFixtures = async () => {
         where: { fixture_id: { in: fixtureIdsToDelete } },
       });
 
-      await prisma.fixtures.deleteMany({
+      await prisma.footballer_fixtures.deleteMany({
         where: { id: { in: fixtureIdsToDelete } },
       });
     }
-
-    await Promise.all(
-      fixturesToInsert.map(async (fixture) => {
-        await prisma.fixtures.upsert({
-          where: { id: fixture.id },
-          update: {
-            team_h: fixture.team_h,
-            team_h_score: fixture.team_h_score,
-            team_a: fixture.team_a,
-            team_a_score: fixture.team_a_score,
-            event: fixture.event,
-            finished: fixture.finished,
-            minutes: fixture.minutes,
-            provisional_start_time: fixture.provisional_start_time,
-            kickoff_time: new Date(fixture.kickoff_time),
-            event_name: fixture.event_name,
-          },
-          create: {
-            id: fixture.id,
-            code: fixture.code,
-            team_h: fixture.team_h,
-            team_h_score: fixture.team_h_score,
-            team_a: fixture.team_a,
-            team_a_score: fixture.team_a_score,
-            event: fixture.event,
-            finished: fixture.finished,
-            minutes: fixture.minutes,
-            provisional_start_time: fixture.provisional_start_time,
-            kickoff_time: new Date(fixture.kickoff_time),
-            event_name: fixture.event_name,
-          },
-        });
-      }),
-    );
 
     await Promise.all(
       Object.entries(rawData).flatMap(([footballerId, footballer]) =>
@@ -92,12 +56,32 @@ export const insertFootballersFixtures = async () => {
             update: {
               is_home: fixture.is_home,
               difficulty: fixture.difficulty,
+              team_h: fixture.team_h,
+              team_h_score: fixture.team_h_score,
+              team_a: fixture.team_a,
+              team_a_score: fixture.team_a_score,
+              event: fixture.event,
+              finished: fixture.finished,
+              minutes: fixture.minutes,
+              provisional_start_time: fixture.provisional_start_time,
+              kickoff_time: new Date(fixture.kickoff_time),
+              event_name: fixture.event_name,
             },
             create: {
               footballer_id: parseInt(footballerId),
               fixture_id: fixture.id,
               is_home: fixture.is_home,
               difficulty: fixture.difficulty,
+              team_h: fixture.team_h,
+              team_h_score: fixture.team_h_score,
+              team_a: fixture.team_a,
+              team_a_score: fixture.team_a_score,
+              event: fixture.event,
+              finished: fixture.finished,
+              minutes: fixture.minutes,
+              provisional_start_time: fixture.provisional_start_time,
+              kickoff_time: new Date(fixture.kickoff_time),
+              event_name: fixture.event_name,
             },
           });
         }),

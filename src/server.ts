@@ -8,12 +8,11 @@ import compression from "compression";
 import helmet from "helmet";
 
 const app = express();
-const PORT = parseInt(process.env.PORT ?? "5000") || 3000;
+const PORT = parseInt(process.env.PORT as string) || 3000;
 
-app.use(helmet()); // Adds security headers
-app.use(compression()); // Compresses response data
-app.use(express.json()); // Parse JSON body
-
+app.use(helmet());
+app.use(compression());
+app.use(express.json());
 const corsOptions = {
   origin:
     process.env.NODE_ENV === "production"
@@ -91,20 +90,22 @@ app.get("/api/test", async (req: Request, res: Response) => {
   }
 });
 
-const server = app.listen(PORT, "0.0.0.0", () => {
+const server = app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
 });
 
-process.on("SIGTERM", () => {
-  console.log("Shutting down gracefully...");
-  server.close(() => {
-    console.log("Process terminated.");
+if (process.env.NODE_ENV === "production") {
+  process.on("SIGTERM", () => {
+    console.log("Shutting down gracefully...");
+    server.close(() => {
+      console.log("Process terminated.");
+    });
   });
-});
 
-process.on("SIGINT", () => {
-  console.log("Interrupted! Shutting down...");
-  server.close(() => {
-    console.log("Server stopped.");
+  process.on("SIGINT", () => {
+    console.log("Interrupted! Shutting down...");
+    server.close(() => {
+      console.log("Server stopped.");
+    });
   });
-});
+}
