@@ -7,7 +7,7 @@ import { fetchFootballers } from "../footballers/fetchFootballers.js";
 import { insertEvents } from "../events/insertEvents.js";
 import { insertTeamHistory } from "./insertTeamHistory.js";
 
-(async () => {
+export const populateDatabase = async () => {
   try {
     console.log("Fetching Bootstrap Static...");
     await fetchBootstrapStatic();
@@ -25,9 +25,15 @@ import { insertTeamHistory } from "./insertTeamHistory.js";
     await insertTeamHistory();
     console.log("Starting to populate history...");
     await insertFootballersHistory();
-    console.log("Database populated successfully!");
+    console.log("✅ Database populated successfully!");
   } catch (error) {
-    console.error("Failed to populate the database:", error);
-    return false;
+    console.error("❌ Failed to populate the database:", error);
+    process.exit(1);
   }
-})();
+};
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  populateDatabase()
+    .then(() => process.exit(0))
+    .catch(() => process.exit(1));
+}

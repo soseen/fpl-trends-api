@@ -1,6 +1,6 @@
 import fs from "fs";
-import { BootstrapStaticData } from "../bootstrapStatic/types";
-import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers";
+import { BootstrapStaticData } from "../bootstrapStatic/types.js";
+import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
 import { prisma } from "../database/client.js";
 
 export const insertEvents = async () => {

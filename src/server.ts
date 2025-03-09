@@ -6,6 +6,7 @@ import { getBasicInfo } from "./fetch.js";
 import { getEvents } from "./events/getEvents.js";
 import compression from "compression";
 import helmet from "helmet";
+import { populateDatabase } from "./database/populateDatabase.js";
 
 const app = express();
 const PORT = parseInt(process.env.PORT as string) || 3000;
@@ -77,10 +78,10 @@ app.get("/api/eventsData", async (req: Request, res: Response) => {
   }
 });
 
-app.get("/api/test", async (req: Request, res: Response) => {
+app.get("/api/populate", async (req: Request, res: Response) => {
   try {
-    const test = [{ id: 1, value: "test" }];
-    res.status(200).json(test);
+    await populateDatabase();
+    res.status(200).json();
   } catch (error: unknown) {
     console.error(
       "Encountered an error trying to execute a query function: ",
