@@ -52,5 +52,3 @@ export const insertTeams = async () => {
     await prisma.$disconnect();
   }
 };
-
-insertTeams();

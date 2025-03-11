@@ -11,29 +11,36 @@ export const populateDatabase = async () => {
   try {
     console.log("Fetching Bootstrap Static...");
     await fetchBootstrapStatic();
+
     console.log("Fetching footballers...");
     await fetchFootballers();
+
     console.log("Starting to populate teams...");
     await insertTeams();
+
     console.log("Starting to populate events...");
     await insertEvents();
+
     console.log("Starting to populate footballers...");
     await insertFootballers();
+
     console.log("Starting to populate fixtures...");
     await insertFootballersFixtures();
+
     console.log("Starting to populate team history...");
     await insertTeamHistory();
-    console.log("Starting to populate history...");
+
+    console.log("Starting to populate footballers history...");
     await insertFootballersHistory();
+
     console.log("✅ Database populated successfully!");
   } catch (error) {
     console.error("❌ Failed to populate the database:", error);
     process.exit(1);
   }
 };
-
-if (import.meta.url === `file://${process.argv[1]}`) {
-  populateDatabase()
-    .then(() => process.exit(0))
-    .catch(() => process.exit(1));
+if (process.argv[1] && process.argv[1].endsWith("populateDatabase.ts")) {
+  console.log("WILL POPULATE??");
+  await populateDatabase();
+  console.log("DONE");
 }

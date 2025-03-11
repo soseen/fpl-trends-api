@@ -116,5 +116,3 @@ export const insertTeamHistory = async () => {
     await prisma.$disconnect();
   }
 };
-
-insertTeamHistory();

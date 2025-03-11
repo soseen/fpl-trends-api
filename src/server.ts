@@ -14,11 +14,14 @@ const PORT = parseInt(process.env.PORT as string) || 3000;
 app.use(helmet());
 app.use(compression());
 app.use(express.json());
+
+const allowedOrigins = ["https://fpltrends.app", "https://www.fpltrends.app"];
+
 const corsOptions = {
   origin:
     process.env.NODE_ENV === "production"
-      ? "https://fpltrends.app"
-      : "http://localhost:5000",
+      ? allowedOrigins
+      : [...allowedOrigins, "http://localhost:5000"],
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
