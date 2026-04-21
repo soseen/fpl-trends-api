@@ -1,5 +1,5 @@
 import fs from "fs";
-import { BootstrapStaticData } from "../bootstrapStatic/types.js";
+import type { BootstrapStaticData } from "../bootstrapStatic/types.js";
 import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
 import { prisma } from "../database/client.js";
 
@@ -68,7 +68,7 @@ export const insertEvents = async () => {
         },
       });
     }
-    console.log("Events populated successfully.");
+    console.info("Events populated successfully.");
   } catch (error) {
     console.error("Error inserting events:", error);
   } finally {

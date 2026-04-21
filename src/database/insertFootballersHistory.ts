@@ -1,7 +1,7 @@
 import fs from "fs";
 import { prisma } from "./client.js";
 import { RAW_FOOTBALLERS_FILE } from "../file.helpers.js";
-import { Footballer } from "../footballers/types.js";
+import type { Footballer } from "../footballers/types.js";
 
 export const insertFootballersHistory = async () => {
   try {

@@ -214,6 +214,13 @@ model team_history {
   @@unique([team_id, round])
 }
 
+model app_metadata {
+  key   String @id @db.VarChar(100)
+  value String @db.VarChar(500)
+
+  @@map("app_metadata")
+}
+
 model events {
   id                        Int     @id @unique
   name                      String  @db.VarChar(255)

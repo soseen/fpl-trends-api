@@ -1,6 +1,6 @@
 import fs from "fs";
 import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
-import { BootstrapStaticData } from "../bootstrapStatic/types.js";
+import type { BootstrapStaticData } from "../bootstrapStatic/types.js";
 import { prisma } from "./client.js";
 
 export const insertFootballers = async () => {
@@ -124,7 +124,7 @@ export const insertFootballers = async () => {
       (error as Error)?.message,
     );
   } finally {
-    console.log("Footballers populated successfully.");
+    console.info("Footballers populated successfully.");
     await prisma.$disconnect();
   }
 };

@@ -3,8 +3,8 @@ import {
   RAW_FOOTBALLERS_FILE,
   RAW_BOOTSTRAP_STATIC_FILE,
 } from "../file.helpers.js";
-import { Footballer } from "../footballers/types.js";
-import { BootstrapStaticData } from "../bootstrapStatic/types.js";
+import type { Footballer } from "../footballers/types.js";
+import type { BootstrapStaticData } from "../bootstrapStatic/types.js";
 import { prisma } from "./client.js";
 
 export const insertTeamHistory = async () => {
@@ -106,7 +106,7 @@ export const insertTeamHistory = async () => {
       }
     }
 
-    console.log("Team history data populated successfully.");
+    console.info("Team history data populated successfully.");
   } catch (error) {
     console.error(
       "Couldn't populate team history table. Error:",

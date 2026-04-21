@@ -1,5 +1,5 @@
 import fs from "fs";
-import { Footballer } from "./types.js";
+import type { Footballer } from "./types.js";
 import { getFootballer, getFootballersIds } from "./utils.js";
 import { RAW_FOOTBALLERS_FILE } from "../file.helpers.js";
 import { delay } from "../utils.js";
@@ -22,7 +22,7 @@ export const fetchFootballers = async () => {
     // Process in batches
     for (let i = 0; i < footballerIds.length; i += BATCH_SIZE) {
       const batch = footballerIds.slice(i, i + BATCH_SIZE);
-      console.log(
+      console.info(
         `Processing batch: ${i + 1} - ${Math.min(i + BATCH_SIZE, footballerIds.length)}`,
       );
 
@@ -48,7 +48,7 @@ export const fetchFootballers = async () => {
             RAW_FOOTBALLERS_FILE,
             JSON.stringify(rawData, null, 2),
           );
-          console.log(
+          console.info(
             `Batch ${i + 1} - ${i + BATCH_SIZE + 1} saved to raw data file.`,
           );
 
@@ -78,5 +78,5 @@ export const fetchFootballers = async () => {
     return;
   }
 
-  console.log("Raw footballers data fetching completed.");
+  console.info("Raw footballers data fetching completed.");
 };

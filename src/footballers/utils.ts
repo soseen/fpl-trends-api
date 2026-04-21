@@ -1,8 +1,8 @@
-import { Footballer } from "./types.js";
+import type { Footballer } from "./types.js";
 import axios from "axios";
 import fs from "fs";
 import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
-import { BootstrapStaticData } from "../bootstrapStatic/types.js";
+import type { BootstrapStaticData } from "../bootstrapStatic/types.js";
 
 export const getFootballersIds = () => {
   const rawData = fs.readFileSync(RAW_BOOTSTRAP_STATIC_FILE, "utf-8");

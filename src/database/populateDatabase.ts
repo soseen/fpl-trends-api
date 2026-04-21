@@ -1,3 +1,4 @@
+import fs from "fs";
 import { insertFootballersFixtures } from "./insertFootballersFixtures.js";
 import { insertFootballers } from "./insertFootballers.js";
 import { insertTeams } from "./insertTeams.js";
@@ -6,41 +7,66 @@ import { fetchBootstrapStatic } from "../bootstrapStatic/fetchBootstrapStatic.js
 import { fetchFootballers } from "../footballers/fetchFootballers.js";
 import { insertEvents } from "../events/insertEvents.js";
 import { insertTeamHistory } from "./insertTeamHistory.js";
+import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
+import { detectSeasonChange, performSeasonReset } from "./seasonManager.js";
 
 export const populateDatabase = async () => {
   try {
-    console.log("Fetching Bootstrap Static...");
+    // 1. Fetch bootstrap data first (needed for season detection)
+    console.info("Fetching Bootstrap Static...");
     await fetchBootstrapStatic();
 
-    console.log("Fetching footballers...");
+    // 2. Season detection: read events from the freshly fetched bootstrap data
+    const bootstrapRaw = fs.readFileSync(RAW_BOOTSTRAP_STATIC_FILE, "utf-8");
+    const bootstrapData = JSON.parse(bootstrapRaw) as {
+      events: Array<{ deadline_time?: string; deadline_time_epoch?: number }>;
+    };
+
+    const seasonCheck = await detectSeasonChange(bootstrapData.events);
+
+    if (seasonCheck.isNewSeason) {
+      console.info(
+        `🔄 Season changed: ${seasonCheck.oldSeason ?? "none"} → ${seasonCheck.newSeason}`,
+      );
+      await performSeasonReset(seasonCheck.newSeason);
+
+      // Re-fetch bootstrap since we deleted the file during wipe
+      console.info("Re-fetching Bootstrap Static after season reset...");
+      await fetchBootstrapStatic();
+    } else {
+      console.info(`📋 Current season: ${seasonCheck.currentSeason}`);
+    }
+
+    // 3. Fetch individual footballer data
+    console.info("Fetching footballers...");
     await fetchFootballers();
 
-    console.log("Starting to populate teams...");
+    // 4. Populate database tables (order matters: teams → events → footballers → fixtures → history)
+    console.info("Populating teams...");
     await insertTeams();
 
-    console.log("Starting to populate events...");
+    console.info("Populating events...");
     await insertEvents();
 
-    console.log("Starting to populate footballers...");
+    console.info("Populating footballers...");
     await insertFootballers();
 
-    console.log("Starting to populate fixtures...");
+    console.info("Populating fixtures...");
     await insertFootballersFixtures();
 
-    console.log("Starting to populate team history...");
+    console.info("Populating team history...");
     await insertTeamHistory();
 
-    console.log("Starting to populate footballers history...");
+    console.info("Populating footballers history...");
     await insertFootballersHistory();
 
-    console.log("✅ Database populated successfully!");
+    console.info("✅ Database populated successfully!");
   } catch (error) {
     console.error("❌ Failed to populate the database:", error);
     process.exit(1);
   }
 };
+
 if (process.argv[1] && process.argv[1].endsWith("populateDatabase.ts")) {
-  console.log("WILL POPULATE??");
   await populateDatabase();
-  console.log("DONE");
 }

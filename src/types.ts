@@ -1,12 +1,3 @@
-export type GameweekData = {
-  Player_ID: string;
-} & GameweekEvent;
-
-export type Blacklist = {
-  ID: number;
-  Reason: string;
-};
-
 export type GameweekEvent = {
   event: number;
   points: number;
@@ -35,7 +26,7 @@ export type Chip = {
 };
 
 export type PlayerHistory = {
-  current: GameweekEvent[]; // Array of gameweek events
-  past: PastSeason[]; // Array of past season performances
-  chips: Chip[]; // Array of chips played
+  current: GameweekEvent[];
+  past: PastSeason[];
+  chips: Chip[];
 };

@@ -1,6 +1,6 @@
 import fs from "fs";
 import { RAW_FOOTBALLERS_FILE } from "../file.helpers.js";
-import { Footballer } from "../footballers/types.js";
+import type { Fixture, Footballer } from "../footballers/types.js";
 import { prisma } from "./client.js";
 
 export const insertFootballersFixtures = async () => {
@@ -11,7 +11,7 @@ export const insertFootballersFixtures = async () => {
       ? JSON.parse(fs.readFileSync(RAW_FOOTBALLERS_FILE, "utf8"))
       : {};
 
-    const uniqueFixtures = new Map<number, any>();
+    const uniqueFixtures = new Map<number, Fixture>();
 
     for (const footballer of Object.values(rawData)) {
       for (const fixture of footballer.fixtures) {
@@ -32,7 +32,7 @@ export const insertFootballersFixtures = async () => {
     );
 
     if (fixtureIdsToDelete.length > 0) {
-      console.log(`Deleting ${fixtureIdsToDelete.length} old fixtures...`);
+      console.info(`Deleting ${fixtureIdsToDelete.length} old fixtures...`);
 
       await prisma.footballer_fixtures.deleteMany({
         where: { fixture_id: { in: fixtureIdsToDelete } },
@@ -88,7 +88,7 @@ export const insertFootballersFixtures = async () => {
       ),
     );
 
-    console.log("Fixtures data populated successfully.");
+    console.info("Fixtures data populated successfully.");
   } catch (error) {
     console.error(
       "Couldn't populate the fixtures table. Error:",

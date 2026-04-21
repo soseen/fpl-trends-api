@@ -1,6 +1,6 @@
 import fs from "fs";
 import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
-import { BootstrapStaticData } from "../bootstrapStatic/types.js";
+import type { BootstrapStaticData } from "../bootstrapStatic/types.js";
 import { prisma } from "./client.js";
 
 export const insertTeams = async () => {
@@ -42,7 +42,7 @@ export const insertTeams = async () => {
         },
       });
     }
-    console.log("Teams populated successfully.");
+    console.info("Teams populated successfully.");
   } catch (error) {
     console.error(
       "Couldn't populate the teams table. Error:",
