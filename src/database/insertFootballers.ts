@@ -107,6 +107,9 @@ export const insertFootballers = async () => {
         selected_rank_type: footballer.selected_rank_type,
         starts_per_90: footballer.starts_per_90,
         clean_sheets_per_90: footballer.clean_sheets_per_90,
+        defensive_contribution: footballer.defensive_contribution ?? null,
+        defensive_contribution_per_90:
+          footballer.defensive_contribution_per_90 ?? null,
       };
       await prisma.footballers.upsert({
         where: { code: footballer.code },

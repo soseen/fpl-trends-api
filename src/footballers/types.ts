@@ -53,6 +53,7 @@ export type History = {
   selected: number;
   transfers_in: number;
   transfers_out: number;
+  defensive_contribution?: number | null;
 };
 
 export type HistoryPast = {

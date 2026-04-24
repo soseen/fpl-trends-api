@@ -101,7 +101,22 @@ export async function detectSeasonChange(
   const storedSeason = await getStoredSeason();
 
   if (storedSeason === null) {
-    // First ever run — store the season, no wipe needed
+    // First run with season tracking. Existing rows in other tables predate
+    // this mechanism and may be from an older season — we can't verify, so
+    // treat this as a season change whenever game data is already present.
+    const existingTeams = await prisma.teams.count();
+    const existingFootballers = await prisma.footballers.count();
+    const existingEvents = await prisma.events.count();
+    const hasExistingData =
+      existingTeams > 0 || existingFootballers > 0 || existingEvents > 0;
+
+    if (hasExistingData) {
+      console.info(
+        `📋 Season tracking initialized on a populated DB — wiping potentially stale data before adopting ${newSeason}.`,
+      );
+      return { isNewSeason: true, newSeason, oldSeason: null };
+    }
+
     console.info(`📋 First run detected. Recording season as ${newSeason}.`);
     await storeCurrentSeason(newSeason);
     return { isNewSeason: false, currentSeason: newSeason };

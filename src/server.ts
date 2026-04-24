@@ -7,6 +7,7 @@ import { getTeamsData } from "./teams/getTeamsData.js";
 import { getBasicInfo } from "./fetch.js";
 import { getEvents } from "./events/getEvents.js";
 import { populateDatabase } from "./database/populateDatabase.js";
+import { cachedJson, invalidateCache } from "./cache/responseCache.js";
 
 const app = express();
 const PORT = parseInt(process.env["PORT"] as string) || 3000;
@@ -29,40 +30,39 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-app.get("/api/footballersData", async (_req: Request, res: Response) => {
+app.get("/api/footballersData", async (req: Request, res: Response) => {
   try {
-    const footballers = await getFootballersWithHistoryAndFixtures();
-    res.status(200).json(footballers);
+    await cachedJson(req, res, "footballersData", getFootballersWithHistoryAndFixtures);
   } catch (error: unknown) {
     console.error("Error fetching footballers data:", error);
     res.status(500).json({ error: "Failed to fetch data." });
   }
 });
 
-app.get("/api/teamsData", async (_req: Request, res: Response) => {
+app.get("/api/teamsData", async (req: Request, res: Response) => {
   try {
-    const teams = await getTeamsData();
-    res.status(200).json(teams);
+    await cachedJson(req, res, "teamsData", getTeamsData);
   } catch (error: unknown) {
     console.error("Error fetching teams data:", error);
     res.status(500).json({ error: "Failed to fetch data." });
   }
 });
 
-app.get("/api/totalPlayersCount", async (_req: Request, res: Response) => {
+app.get("/api/totalPlayersCount", async (req: Request, res: Response) => {
   try {
-    const data = await getBasicInfo();
-    res.status(200).json(data.totalPlayers);
+    await cachedJson(req, res, "totalPlayersCount", async () => {
+      const data = await getBasicInfo();
+      return data.totalPlayers;
+    });
   } catch (error: unknown) {
     console.error("Error fetching total players count:", error);
     res.status(500).json({ error: "Failed to fetch data." });
   }
 });
 
-app.get("/api/eventsData", async (_req: Request, res: Response) => {
+app.get("/api/eventsData", async (req: Request, res: Response) => {
   try {
-    const events = await getEvents();
-    res.status(200).json(events);
+    await cachedJson(req, res, "eventsData", getEvents);
   } catch (error: unknown) {
     console.error("Error fetching events data:", error);
     res.status(500).json({ error: "Failed to fetch data." });
@@ -72,6 +72,7 @@ app.get("/api/eventsData", async (_req: Request, res: Response) => {
 app.get("/api/populate", async (_req: Request, res: Response) => {
   try {
     await populateDatabase();
+    invalidateCache();
     res.status(200).json({ success: true });
   } catch (error: unknown) {
     console.error("Error populating database:", error);

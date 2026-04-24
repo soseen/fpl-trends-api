@@ -125,6 +125,8 @@ model footballers {
   selected_rank_type                   Int?
   starts_per_90                        Float?
   clean_sheets_per_90                  Float?
+  defensive_contribution               Int?
+  defensive_contribution_per_90        Float?
   footballer_fixtures                  footballer_fixtures[]
   teams                                teams?                @relation(fields: [team_id], references: [id], onUpdate: NoAction, map: "fk_team")
   history                              history[]
@@ -168,6 +170,7 @@ model history {
   transfers_out              Int
   fixture_id                 Int
   footballer_id              Int
+  defensive_contribution     Int?
   footballer                 footballers @relation(fields: [footballer_id], references: [id], onDelete: Cascade)
 
   @@id([footballer_id, fixture_id])

@@ -1,12 +1,75 @@
 import { prisma } from "../database/client.js";
 
 export const getFootballersWithHistoryAndFixtures = async () => {
-  const footballers = await prisma.footballers.findMany({
-    include: {
-      teams: true,
-      history: { orderBy: { kickoff_time: "asc" } },
-      footballer_fixtures: { orderBy: { kickoff_time: "asc" } },
+  return prisma.footballers.findMany({
+    select: {
+      id: true,
+      code: true,
+      web_name: true,
+      first_name: true,
+      second_name: true,
+      team_id: true,
+      team_code: true,
+      team: true,
+      element_type: true,
+      now_cost: true,
+      total_points: true,
+      selected_by_percent: true,
+      status: true,
+      chance_of_playing_next_round: true,
+      transfers_in_event: true,
+      transfers_out_event: true,
+      in_dreamteam: true,
+      photo: true,
+      minutes: true,
+      goals_scored: true,
+      assists: true,
+      clean_sheets: true,
+      expected_goals_per_90: true,
+      expected_goal_involvements_per_90: true,
+      expected_goals_conceded_per_90: true,
+      defensive_contribution: true,
+      defensive_contribution_per_90: true,
+      teams: {
+        select: {
+          id: true,
+          name: true,
+          short_name: true,
+          code: true,
+        },
+      },
+      history: {
+        orderBy: { round: "asc" },
+        select: {
+          round: true,
+          total_points: true,
+          minutes: true,
+          goals_scored: true,
+          assists: true,
+          clean_sheets: true,
+          saves: true,
+          team_a_score: true,
+          team_h_score: true,
+          was_home: true,
+          selected: true,
+          opponent_team: true,
+          expected_goal_involvements: true,
+          expected_goals: true,
+          expected_goals_conceded: true,
+          defensive_contribution: true,
+        },
+      },
+      footballer_fixtures: {
+        orderBy: { event: "asc" },
+        select: {
+          event: true,
+          is_home: true,
+          team_h: true,
+          team_a: true,
+          difficulty: true,
+          kickoff_time: true,
+        },
+      },
     },
   });
-  return footballers;
 };

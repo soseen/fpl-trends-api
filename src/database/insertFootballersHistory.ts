@@ -71,6 +71,7 @@ export const insertFootballersHistory = async () => {
             selected: historyEntry.selected,
             transfers_in: historyEntry.transfers_in,
             transfers_out: historyEntry.transfers_out,
+            defensive_contribution: historyEntry.defensive_contribution ?? null,
           },
           create: {
             footballer_id: parsedFootballerId,
@@ -110,6 +111,7 @@ export const insertFootballersHistory = async () => {
             selected: historyEntry.selected,
             transfers_in: historyEntry.transfers_in,
             transfers_out: historyEntry.transfers_out,
+            defensive_contribution: historyEntry.defensive_contribution ?? null,
           },
         });
       }
