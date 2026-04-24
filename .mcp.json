@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "hetzner": {
+      "command": "mcp-hetzner",
+      "args": ["--transport", "stdio"]
+    }
+  }
+}
