@@ -12,6 +12,7 @@
  * or to force a clean slate at any time.
  */
 
+import "dotenv/config";
 import { wipeAllSeasonData } from "./seasonManager.js";
 import { prisma } from "./client.js";
 

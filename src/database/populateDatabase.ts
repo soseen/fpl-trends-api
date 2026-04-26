@@ -1,3 +1,4 @@
+import "dotenv/config";
 import fs from "fs";
 import { insertFootballersFixtures } from "./insertFootballersFixtures.js";
 import { insertFootballers } from "./insertFootballers.js";
