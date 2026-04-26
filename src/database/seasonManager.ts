@@ -163,6 +163,14 @@ export async function wipeAllSeasonData(): Promise<void> {
   await prisma.teams.deleteMany();
   console.info("   ✓ teams cleared");
 
+  // Manager-rank tables are season-scoped — points only make sense within
+  // the season they were earned. Wipe them on season change.
+  await prisma.manager_history.deleteMany();
+  console.info("   ✓ manager_history cleared");
+
+  await prisma.manager_summary.deleteMany();
+  console.info("   ✓ manager_summary cleared");
+
   // Delete cached data files
   const filesToDelete = [RAW_BOOTSTRAP_STATIC_FILE, RAW_FOOTBALLERS_FILE];
 

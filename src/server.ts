@@ -9,6 +9,8 @@ import { getBasicInfo } from "./fetch.js";
 import { getEvents } from "./events/getEvents.js";
 import { populateDatabase } from "./database/populateDatabase.js";
 import { cachedJson, invalidateCache } from "./cache/responseCache.js";
+import { getManagerSummary } from "./managers/getManagerSummary.js";
+import { getRangeRank } from "./managers/getRangeRank.js";
 
 const app = express();
 const PORT = parseInt(process.env["PORT"] as string) || 3000;
@@ -45,7 +47,12 @@ app.use(cors(corsOptions));
 
 app.get("/api/footballersData", async (req: Request, res: Response) => {
   try {
-    await cachedJson(req, res, "footballersData", getFootballersWithHistoryAndFixtures);
+    await cachedJson(
+      req,
+      res,
+      "footballersData",
+      getFootballersWithHistoryAndFixtures,
+    );
   } catch (error: unknown) {
     console.error("Error fetching footballers data:", error);
     res.status(500).json({ error: "Failed to fetch data." });
@@ -90,6 +97,66 @@ app.get("/api/populate", async (_req: Request, res: Response) => {
   } catch (error: unknown) {
     console.error("Error populating database:", error);
     res.status(500).json({ error: "Failed to populate database." });
+  }
+});
+
+const parseEntryId = (raw: string): number | null => {
+  const id = Number(raw);
+  if (!Number.isInteger(id) || id < 1 || id > 20_000_000) return null;
+  return id;
+};
+
+app.get("/api/manager/:id/summary", async (req: Request, res: Response) => {
+  const id = parseEntryId(req.params["id"] ?? "");
+  if (id === null) {
+    res.status(400).json({ error: "Invalid FPL ID." });
+    return;
+  }
+  try {
+    const data = await getManagerSummary(id);
+    res.status(200).json(data);
+  } catch (error: unknown) {
+    const status = (error as { response?: { status?: number } }).response
+      ?.status;
+    if (status === 404) {
+      res.status(404).json({ error: "Manager not found." });
+      return;
+    }
+    console.error(`Error fetching manager ${id} summary:`, error);
+    res.status(502).json({ error: "Failed to fetch manager from FPL." });
+  }
+});
+
+app.get("/api/manager/:id/range-rank", async (req: Request, res: Response) => {
+  const id = parseEntryId(req.params["id"] ?? "");
+  if (id === null) {
+    res.status(400).json({ error: "Invalid FPL ID." });
+    return;
+  }
+  const start = Number(req.query["start"]);
+  const end = Number(req.query["end"]);
+  if (
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    start < 1 ||
+    end < start ||
+    end > 38
+  ) {
+    res.status(400).json({ error: "Invalid gameweek range." });
+    return;
+  }
+  try {
+    const data = await getRangeRank(id, start, end);
+    res.status(200).json(data);
+  } catch (error: unknown) {
+    const status = (error as { response?: { status?: number } }).response
+      ?.status;
+    if (status === 404) {
+      res.status(404).json({ error: "Manager not found." });
+      return;
+    }
+    console.error(`Error computing range rank for ${id}:`, error);
+    res.status(500).json({ error: "Failed to compute range rank." });
   }
 });
 

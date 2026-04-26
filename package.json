@@ -13,6 +13,7 @@
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "populate": "tsx src/database/populateDatabase.ts",
+    "populate-managers": "tsx src/database/populateManagers.ts",
     "reset-season": "tsx src/database/resetSeason.ts",
     "migrate": "npx prisma migrate deploy"
   },

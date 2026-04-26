@@ -17,9 +17,10 @@ Fetches data from the official FPL API, stores it in PostgreSQL via Prisma, and 
 7. [Production deployment](#production-deployment-hetzner)
 8. [Operating the production server](#operating-the-production-server)
 9. [Data refresh / populate](#data-refresh--populate)
-10. [Start-of-season runbook](#start-of-season-runbook)
-11. [Troubleshooting](#troubleshooting)
-12. [Known issues](#known-issues)
+10. [Manager rank estimation (My Trends)](#manager-rank-estimation-my-trends)
+11. [Start-of-season runbook](#start-of-season-runbook)
+12. [Troubleshooting](#troubleshooting)
+13. [Known issues](#known-issues)
 
 ---
 
@@ -34,6 +35,8 @@ The API has three responsibilities:
 Ingest is **manual** — there's no scheduler in the Node process itself. In production we rely on a system **cron** to call the populate script on a schedule (see [Data refresh](#data-refresh--populate)).
 
 The system is **season-aware**: every populate run detects whether the FPL season has changed (by reading the first event's deadline year and comparing it against `app_metadata.current_season` in the DB). On change, all game data tables are wiped and re-populated from scratch.
+
+In addition to the per-player ingest, the API maintains a **stratified sample of FPL managers** in `manager_summary` and `manager_history` tables. This powers the [My Trends](#manager-rank-estimation-my-trends) feature on the frontend, which estimates a user's rank within a chosen gameweek range. Sample collection is incremental and runs via a separate cron-friendly script (`npm run populate-managers`).
 
 ---
 
@@ -64,6 +67,7 @@ src/
 ├── database/
 │   ├── client.ts                      — Prisma client singleton
 │   ├── populateDatabase.ts            — Orchestrates full data refresh (season-aware)
+│   ├── populateManagers.ts            — Stratified sample ingest for manager rank estimation
 │   ├── seasonManager.ts               — Season detection, wipe, and reset logic
 │   ├── resetSeason.ts                 — Manual season reset script
 │   ├── insertFootballers.ts           — Upserts player data
@@ -79,6 +83,13 @@ src/
 │   ├── getAllFootballersData.ts       — API handler for /api/footballersData
 │   ├── types.ts                       — Footballer-specific types
 │   └── utils.ts                       — Footballer utilities
+├── managers/
+│   ├── fetchManager.ts                — FPL API calls for entry/history/standings
+│   ├── activityFilter.ts              — Inactive / trolling classifier (pure)
+│   ├── rateLimitGovernor.ts           — Adaptive backoff for ingestion
+│   ├── getManagerSummary.ts           — Handler for /api/manager/:id/summary
+│   ├── getRangeRank.ts                — Handler for /api/manager/:id/range-rank
+│   └── types.ts                       — Manager-specific types
 ├── teams/
 │   └── getTeamsData.ts                — API handler for /api/teamsData
 └── data/                              — Cached API responses (gitignored)
@@ -94,25 +105,27 @@ prisma/
 
 ## Database schema
 
-7 tables, all defined in `prisma/schema.prisma`.
+9 tables, all defined in `prisma/schema.prisma`.
 
 | Table | Purpose | Key fields |
 |---|---|---|
-| `app_metadata` | Application state KV store | `key`, `value` (currently stores `current_season` like `"2025-26"`) |
+| `app_metadata` | Application state KV store | `key`, `value` (stores `current_season`, manager ingest cursors) |
 | `footballers` | Player data (~100+ columns) | `id`, `web_name`, `team_id`, `now_cost`, `total_points`, `xG`, `xA`, `xGI`, `ICT`, `form`, `status`, per-90 variants |
 | `history` | Per-match player stats | composite PK `(footballer_id, fixture_id)`, `total_points`, goals, assists, xG, xGI, xGC, minutes, opponent |
 | `footballer_fixtures` | Upcoming fixtures per player | `footballer_id`, `fixture_id`, `difficulty`, `is_home`, `team_h`, `team_a` |
 | `teams` | Club data + strength ratings | `id`, `name`, `short_name`, `strength_*` (attack/defence × home/away) |
 | `team_history` | Aggregated team stats per GW | composite PK `(team_id, round)`, `teamXGS`, `teamXGC`, `goals`, `goals_conceded` |
 | `events` | Gameweek metadata | `id`, `name`, `finished`, `is_current`, `deadline_time`, `most_selected`, `top_element` |
+| `manager_summary` | One row per FPL manager evaluated for the rank-estimation sample | `entry_id`, `overall_rank`, `total_points`, `stratum` (1/2/3), `rejected_reason`, `last_checked_gw` |
+| `manager_history` | Per-GW net points (after transfer cost) for active sampled managers | composite PK `(entry_id, gw)`, `points` |
 
-Cascade delete is set on the `footballers → history`, `footballers → footballer_fixtures`, and `teams → team_history` relations.
+Cascade delete is set on the `footballers → history`, `footballers → footballer_fixtures`, `teams → team_history`, and `manager_summary → manager_history` relations. The two manager tables are wiped on season change (they're season-scoped — points only make sense within the season they were earned).
 
 ---
 
 ## API endpoints
 
-All endpoints are public (no auth). CORS allowlist is hardcoded in `src/server.ts`.
+All endpoints are public (no auth). CORS allowlist is configured via `ALLOWED_ORIGINS` env var.
 
 | Method | Path | Returns |
 |---|---|---|
@@ -121,6 +134,10 @@ All endpoints are public (no auth). CORS allowlist is hardcoded in `src/server.t
 | `GET` | `/api/totalPlayersCount` | `{ totalPlayers: number }` |
 | `GET` | `/api/eventsData` | Gameweek events |
 | `GET` | `/api/populate` | Triggers a full data refresh from the FPL API |
+| `GET` | `/api/manager/:id/summary` | Manager identity + season totals (proxies `/api/entry/{id}/`) |
+| `GET` | `/api/manager/:id/range-rank?start=X&end=Y` | Estimated rank within GW range (see [Manager rank estimation](#manager-rank-estimation-my-trends)) |
+
+The manager endpoints validate `:id` (positive integer ≤ 20M) and `start`/`end` (1 ≤ start ≤ end ≤ 38). They return `400` on invalid input, `404` if FPL doesn't recognise the entry, `502` on upstream FPL failures.
 
 CORS allowed origins are configured via the `ALLOWED_ORIGINS` env var (comma-separated). If unset, it falls back to:
 
@@ -494,6 +511,114 @@ npm run populate
 
 ---
 
+## Manager rank estimation (My Trends)
+
+The `/api/manager/:id/range-rank` endpoint returns an estimate of where a manager would rank if FPL re-ranked everyone using only the points scored within a chosen gameweek range. There's no FPL API for "rank in GW range X–Y", so we approximate it from a stratified sample of managers' per-GW points cached in `manager_history`.
+
+### How the estimate is computed
+
+For an incoming request:
+
+1. Fetch the user live from FPL: `GET /entry/{id}/` and `GET /entry/{id}/history/`.
+2. Compute `userRangeTotal = Σ (points − event_transfers_cost)` over each GW in `[start, end]`.
+3. Pick the **stratum** the user belongs to from their season overall rank.
+4. Run a single SQL aggregate against `manager_history` to count how many sampled managers in that stratum scored ≥ `userRangeTotal` over the same range.
+5. Multiply by the stratum's scaling factor → estimated rank.
+6. **Soft-clamp** the result to `[0.3 ×, 3 ×]` of the user's overall rank. This bounds catastrophic miscalls while the sample is sparse. Stratum A (top 10k) skips the clamp because it's a full census.
+
+### Strata
+
+| Stratum | Overall rank band | Sampling | Scaling factor |
+|---|---|---|---|
+| A | 1 – 10,000 | full census via standings pages 1–200 | 1× |
+| B | 10,001 – 100,000 | every 5th page from 201–2000 (1-in-5) | 5× |
+| C | 100,001 – 10,400,000 | random ID probing in `[1, 13_000_000]`, filtered to C range | 50× |
+| — | beyond 10.4M (inactive tail) | not sampled — endpoint returns overall rank with `confidence: "approximate"` | — |
+
+### Activity / troll filter
+
+Each candidate's history is classified before insertion (see `src/managers/activityFilter.ts`):
+
+- **inactive** — no transfers (`event_transfers === 0`) across the most recent 8 finished GWs.
+- **trolling** — total `event_transfers_cost` > 60 across the season, OR any single GW with cost ≥ 20 (5+ extra hits).
+- **active** — anything else; full per-GW history rows are written.
+
+Inactive and trolling managers are recorded in `manager_summary` with `rejected_reason` set, so subsequent cron runs skip them. They're statistically safe to exclude from rank estimation: they all score low in any range, so they sit below every active manager and don't change the "count higher than me" tally.
+
+### Defensive ingestion
+
+`src/database/populateManagers.ts` runs the sampler. It's designed to stay polite to the FPL API — there's no published rate limit, but we treat it as ~25 req/s sustainable.
+
+- **Concurrency**: batches of 8 concurrent fetches with a 300ms inter-batch delay (~25 req/s).
+- **Per-run cap**: at most **5,000 managers per invocation**. Each cron tick is short (~3.5 min) and resumes from a persistent cursor stored in `app_metadata`.
+- **Adaptive backoff** (`src/managers/rateLimitGovernor.ts`): on `429` / `503`, pause 5 minutes and double the inter-batch delay (honoring `Retry-After` if present). On timeout / `ECONNRESET`, pause 2 minutes. After 3 consecutive errors the run aborts cleanly and exits — cron will retry next tick.
+- **User-Agent** header identifies the app: `fpl-trends/1.0 (+https://fpltrends.live)` so FPL admins can throttle politely rather than IP-ban.
+- **Lockfile** at `<os.tmpdir()>/fpl-populate-managers.lock` prevents overlapping cron runs.
+
+### Budget allocation per run
+
+Each invocation allocates the 5,000-entry budget across strata that still have work:
+
+```
+budget A (if not fully covered) = 2,500
+budget B (if not fully covered) = 1,500
+budget C (always)               = remainder (1,000–5,000)
+```
+
+Stratum C is intentionally always given budget so the deep tail starts to fill from day one rather than waiting for A and B to complete.
+
+### Cursors stored in `app_metadata`
+
+| Key | Tracks |
+|---|---|
+| `manager_ingest_cursor_a` | Next page (1–200) for stratum A's standings walk |
+| `manager_ingest_cursor_b` | Next page (201–2000, advancing by 5) for stratum B |
+| _none for C_ | Stratum C uses random probing — there's no cursor; it just keeps probing |
+
+When stratum A or B is fully covered, its cursor wraps back to its start page so the sample refreshes over time.
+
+### Manual run
+
+```bash
+npm run populate-managers
+```
+
+Each invocation processes ≤ 5,000 entries then exits. Re-run as many times as you like; the cursor advances each time.
+
+### Production cron (recommended)
+
+Every 15 minutes — each run is short, polite, and self-limited:
+
+```cron
+*/15 * * * * cd /home/deploy/fpl-trends-api && /usr/bin/node dist/database/populateManagers.js >> /home/deploy/populate-managers.log 2>&1
+```
+
+For a cold-start (fresh server), expect ~12 hours of wall time spread across the day before the sample is dense enough to give `confidence: "estimated"` for the median user. Stratum A converges to `confidence: "exact"` after 2–3 runs.
+
+### Inspecting the sample
+
+```sql
+-- How big is each stratum (active only)?
+SELECT stratum, COUNT(*) AS active
+FROM manager_summary
+WHERE rejected_reason IS NULL
+GROUP BY stratum;
+
+-- Reject reasons distribution
+SELECT rejected_reason, COUNT(*)
+FROM manager_summary
+GROUP BY rejected_reason;
+
+-- Sample density around a specific rank
+SELECT stratum, COUNT(*)
+FROM manager_summary
+WHERE overall_rank BETWEEN 100000 AND 200000
+  AND rejected_reason IS NULL
+GROUP BY stratum;
+```
+
+---
+
 ## Start-of-season runbook
 
 When a new Premier League season begins (typically mid-August), the FPL API resets to the new season. The system **should** detect this automatically on the next populate, but here's the manual path if it doesn't.
@@ -502,7 +627,7 @@ When a new Premier League season begins (typically mid-August), the FPL API rese
 
 Just wait for the next scheduled populate. `seasonManager.ts` derives the season from the first event's deadline year (e.g. an Aug 2026 first deadline → season `"2026-27"`) and compares it to `app_metadata.current_season`. On mismatch:
 
-1. All 6 game data tables are truncated (`footballers`, `history`, `footballer_fixtures`, `teams`, `team_history`, `events`).
+1. All game data tables are truncated (`footballers`, `history`, `footballer_fixtures`, `teams`, `team_history`, `events`, plus `manager_history` and `manager_summary` since they're season-scoped).
 2. Cached JSON files in `src/data/` are deleted.
 3. The new season key is stored.
 4. A fresh populate runs.
@@ -595,3 +720,5 @@ The FPL API is occasionally flaky during gameweeks. Re-run `npm run populate`. T
 3. **No authentication** on any endpoint.
 4. **No rate limiting** on any endpoint.
 5. **No health check endpoint.**
+6. **Manager rank precision degrades with overall rank** — top 10k is exact (full census), 10k–100k is ±5 absolute per stratum, 100k–10.4M is ±50 in stratum (≈ ±2,500 absolute). Beyond 10.4M we fall back to the user's overall rank with an "approximate" badge.
+7. **Manager rank ingestion is unverified at scale on the production IP** — the FPL API has no published rate limit; the governor handles 429/503 gracefully but a sustained ban would require routing ingestion through a separate egress.

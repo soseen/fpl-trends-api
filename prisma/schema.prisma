@@ -252,3 +252,27 @@ model events {
 
   @@map("events")
 }
+
+model manager_summary {
+  entry_id        Int               @id
+  overall_rank    Int?
+  total_points    Int?
+  stratum         Int               // 1=A (top 10k), 2=B (10k–100k), 3=C (100k–10.4M)
+  rejected_reason String?           @db.VarChar(20) // null=active; "inactive" | "trolling" | "fetch_failed"
+  last_checked_gw Int?
+  last_updated    DateTime          @updatedAt
+  history         manager_history[]
+
+  @@index([stratum])
+  @@index([rejected_reason])
+}
+
+model manager_history {
+  entry_id Int
+  gw       Int
+  points   Int             // net GW points: event_total minus event_transfers_cost
+  manager  manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
+
+  @@id([entry_id, gw])
+  @@index([gw])
+}
