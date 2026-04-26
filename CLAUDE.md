@@ -20,11 +20,8 @@ ssh deploy@91.98.145.120
 pm2 logs fpl-trends-api --lines 100
 pm2 restart fpl-trends-api
 
-# Deploy code-only change:
-cd ~/fpl-trends-api && git pull && npm run build && pm2 restart fpl-trends-api
-
-# Deploy with schema change:
-cd ~/fpl-trends-api && git pull && npm install && npm run build && npx prisma migrate deploy && pm2 restart fpl-trends-api
+# Deploy (one-liner — handles pull, install, build, migrate, pm2 restart):
+cd ~/fpl-trends-api && npm run deploy
 
 # Manual populate:
 cd ~/fpl-trends-api && npm run populate

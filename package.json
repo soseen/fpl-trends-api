@@ -9,6 +9,7 @@
     "dev": "tsx src/server.ts",
     "build": "tsc",
     "bootstrap": "tsc && npm run migrate && npm run populate",
+    "deploy": "git pull && npm install && npm run build && npm run migrate && pm2 restart fpl-trends-api",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "populate": "tsx src/database/populateDatabase.ts",

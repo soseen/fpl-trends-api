@@ -421,16 +421,13 @@ pm2 save                         # persist current process list
 
 ```bash
 ssh deploy@91.98.145.120
-cd ~/fpl-trends-api
-git pull
-npm install                       # if package.json changed
-npm run build                     # tsc only — does NOT populate
-npx prisma migrate deploy         # apply any new migrations
-pm2 restart fpl-trends-api
-pm2 logs fpl-trends-api --lines 30
+cd ~/fpl-trends-api && npm run deploy
+pm2 logs fpl-trends-api --lines 30   # verify it came up
 ```
 
-`npm run build` is compile-only. Use `npm run bootstrap` only for first-time setup on a fresh server (it also runs migrate + populate).
+`npm run deploy` runs `git pull && npm install && npm run build && prisma migrate deploy && pm2 restart fpl-trends-api`. The migrate step is idempotent — safe to run every deploy. The populate step is **not** included; run `npm run populate` separately when you need to refresh data.
+
+For first-time setup on a fresh server, use `npm run bootstrap` (`tsc + migrate + populate`).
 
 ### nginx changes
 
