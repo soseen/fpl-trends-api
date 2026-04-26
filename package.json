@@ -7,7 +7,8 @@
   "scripts": {
     "start": "node dist/server.js",
     "dev": "tsx src/server.ts",
-    "build": "tsc && npm run migrate && npm run populate",
+    "build": "tsc",
+    "bootstrap": "tsc && npm run migrate && npm run populate",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "populate": "tsx src/database/populateDatabase.ts",

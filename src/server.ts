@@ -17,7 +17,19 @@ app.use(helmet());
 app.use(compression());
 app.use(express.json());
 
-const allowedOrigins = ["https://fpltrends.live", "https://www.fpltrends.live"];
+// Comma-separated list of allowed origins, e.g.
+//   ALLOWED_ORIGINS="https://fpltrends.live,https://www.fpltrends.live"
+// Falls back to the production domain if unset, so a missing env var on a
+// fresh server doesn't accidentally open CORS to everyone.
+const envOrigins = (process.env["ALLOWED_ORIGINS"] ?? "")
+  .split(",")
+  .map((o) => o.trim())
+  .filter(Boolean);
+
+const allowedOrigins =
+  envOrigins.length > 0
+    ? envOrigins
+    : ["https://fpltrends.live", "https://www.fpltrends.live"];
 
 const corsOptions = {
   origin:

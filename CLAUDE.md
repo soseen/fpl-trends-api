@@ -2,6 +2,50 @@
 
 Node.js backend for FPL Trends. Fetches Fantasy Premier League data, stores in PostgreSQL, serves via REST API.
 
+> **For full operational detail** (server bootstrap, deploy, season runbook, troubleshooting), read [`Readme.md`](./Readme.md). This file is the architectural/code-level reference.
+
+## Production at a glance
+
+- Runs as `pm2` process `fpl-trends-api` on port 3000 (Hetzner CX23 at `91.98.145.120`, Ubuntu 24.04, deploy user `deploy`)
+- nginx terminates TLS and reverse-proxies `/api/*` from `https://fpltrends.live` to `127.0.0.1:3000`
+- PostgreSQL 16 on the same box, db `fpl-trends-db`, user `fpl`, local Unix socket
+- Repo at `~/fpl-trends-api`, env at `~/fpl-trends-api/.env`
+- System cron triggers populate (no in-process scheduler)
+- No backups — rebuild-on-failure stance
+
+### Quick ops commands
+
+```bash
+ssh deploy@91.98.145.120
+pm2 logs fpl-trends-api --lines 100
+pm2 restart fpl-trends-api
+
+# Deploy code-only change:
+cd ~/fpl-trends-api && git pull && npm run build && pm2 restart fpl-trends-api
+
+# Deploy with schema change:
+cd ~/fpl-trends-api && git pull && npm install && npm run build && npx prisma migrate deploy && pm2 restart fpl-trends-api
+
+# Manual populate:
+cd ~/fpl-trends-api && npm run populate
+
+# First-time setup on a new server:
+cd ~/fpl-trends-api && npm run bootstrap   # tsc + migrate + populate
+
+# New-season reset (if auto-detect fails):
+cd ~/fpl-trends-api && npm run reset-season && npm run populate && pm2 restart fpl-trends-api
+```
+
+## Architectural notes
+
+1. **dotenv is loaded explicitly.** Prisma CLI auto-loads `.env`, but `tsx` and compiled `node` don't. `server.ts`, `populateDatabase.ts`, and `resetSeason.ts` each have `import "dotenv/config"` at the top. New tsx/node entrypoints need the same line or they'll fail with `Environment variable not found: DATABASE_URL`.
+
+2. **`npm run build` is compile-only** (`tsc`). First-time setup uses `npm run bootstrap` (`tsc && migrate && populate`).
+
+3. **Populate is idempotent.** Everything is upsert-by-id; half-finished runs are safe to retry.
+
+4. **CORS is env-driven.** `ALLOWED_ORIGINS` env var (comma-separated). Defaults to the production domains.
+
 ## Stack
 
 Node.js 22+ (LTS), TypeScript 5.7, Express 4.21, Prisma 6.2, PostgreSQL, Axios, Helmet, Compression, CORS.
@@ -35,7 +79,7 @@ src/
 │   ├── insertTeams.ts                 — Upserts team data
 │   └── insertTeamHistory.ts           — Aggregates + inserts team-level stats per GW
 ├── events/
-│   ├── getEvents.ts                   — API handler for /api/eventsData (HAS BUG — queries teams not events)
+│   ├── getEvents.ts                   — API handler for /api/eventsData
 │   └── insertEvents.ts               — Upserts gameweek event data
 ├── footballers/
 │   ├── fetchFootballers.ts            — Batch-fetches individual player summaries from FPL API
@@ -47,11 +91,6 @@ src/
 ├── data/                              — Cached API responses (gitignored)
 │   ├── raw_bootstrap_static.json      — Cached FPL bootstrap response
 │   └── raw_footballers.json           — Cached player summaries
-└── [DEPRECATED legacy files]
-    ├── fetchSampleData.ts             — Dead: old manager sampling workflow
-    ├── fetchAllRawData.ts             — Dead: old manager data fetching
-    ├── processRawData.ts              — Dead: old data cleaning/blacklisting
-    └── sampling.ts                    — Dead: old sampling utilities
 prisma/
 ├── schema.prisma                      — Database schema (7 models incl. app_metadata)
 └── migrations/                        — Prisma migrations
@@ -106,11 +145,11 @@ The app tracks the current FPL season (e.g. "2025-26") in the `app_metadata` tab
 GET /api/footballersData      — All players with team, history, fixtures (Prisma includes)
 GET /api/teamsData            — All teams with team_history
 GET /api/totalPlayersCount    — { totalPlayers: number }
-GET /api/eventsData           — Gameweek events (BUG: returns teams data)
+GET /api/eventsData           — Gameweek events
 GET /api/populate             — Triggers full data refresh from FPL API (season-aware)
 ```
 
-No authentication. CORS allows `https://fpltrends.app`, `https://www.fpltrends.app`, and `http://localhost:5000` (dev).
+No authentication. CORS origins are configured via the `ALLOWED_ORIGINS` env var (comma-separated). Defaults to `https://fpltrends.live, https://www.fpltrends.live`. In dev (`NODE_ENV !== "production"`), `http://localhost:5000` is also allowed automatically.
 
 ## FPL API Fetching
 
@@ -142,7 +181,8 @@ PORT            — Server port (default: 3000)
 
 ```bash
 npm run dev          — Start with tsx (hot reload)
-npm run build        — tsc + migrate + populate
+npm run build        — tsc only (compile to dist/)
+npm run bootstrap    — tsc + migrate + populate (first-time setup on a new server)
 npm run migrate      — npx prisma migrate deploy
 npm run populate     — Fetch FPL data and insert into DB (detects season changes)
 npm run reset-season — Manual full data wipe (run populate after)
@@ -153,9 +193,8 @@ npm run lint:fix     — ESLint auto-fix
 
 ## Known Issues
 
-1. `/api/eventsData` handler in `src/events/getEvents.ts` queries `prisma.teams` instead of `prisma.events`
-2. No scheduled/automatic data refresh — populate is manual only
-3. Database credentials committed in `.env` file
-4. No rate limiting on API endpoints
-5. No health check endpoint
-6. Legacy dead files (`fetchSampleData.ts`, `fetchAllRawData.ts`, `processRawData.ts`, `sampling.ts`) are emptied but not yet deleted from the repo
+1. No scheduled/automatic data refresh inside the Node process — relies on system cron in production.
+2. Database credentials live in `.env` (gitignored, plaintext on disk).
+3. No rate limiting on API endpoints.
+4. No health check endpoint.
+5. No authentication — all endpoints are public.
