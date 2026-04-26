@@ -17,7 +17,7 @@ app.use(helmet());
 app.use(compression());
 app.use(express.json());
 
-const allowedOrigins = ["https://fpltrends.app", "https://www.fpltrends.app"];
+const allowedOrigins = ["https://fpltrends.live", "https://www.fpltrends.live"];
 
 const corsOptions = {
   origin:
