@@ -7,6 +7,12 @@ export type RangeRankResponse = {
   overall_rank: number | null;
   range_rank: number | null;
   range_total: number;
+  // Cumulative overall rank at the GW immediately before the range, and at
+  // the last GW in the range. Used by the UI to show whether the range
+  // improved or worsened the user's trajectory. `before` is null when the
+  // range starts at GW 1 (no prior GW exists).
+  overall_rank_before: number | null;
+  overall_rank_after: number | null;
   start_gw: number;
   end_gw: number;
   stratum_used: 1 | 2 | 3 | null;
@@ -19,10 +25,26 @@ const STRATUM_A_MAX = 10_000;
 const STRATUM_B_MAX = 100_000;
 const STRATUM_C_MAX = 10_400_000;
 
-const STRATUM_SCALING: Record<1 | 2 | 3, number> = {
-  1: 1,
-  2: 5,
-  3: 50,
+// Total managers each stratum is meant to cover. Used for sample-aware
+// extrapolation: we scale within-sample counts up to the full stratum.
+const STRATUM_TRUE_SIZE: Record<1 | 2 | 3, number> = {
+  1: STRATUM_A_MAX,
+  2: STRATUM_B_MAX - STRATUM_A_MAX,
+  3: STRATUM_C_MAX - STRATUM_B_MAX,
+};
+
+// Overall-rank offset before each stratum. Adding the within-stratum rank
+// to this gives an overall rank in the right band.
+const STRATUM_OFFSET: Record<1 | 2 | 3, number> = {
+  1: 0,
+  2: STRATUM_A_MAX,
+  3: STRATUM_B_MAX,
+};
+
+const STRATUM_UPPER: Record<1 | 2 | 3, number> = {
+  1: STRATUM_A_MAX,
+  2: STRATUM_B_MAX,
+  3: STRATUM_C_MAX,
 };
 
 const pickStratum = (overallRank: number | null): 1 | 2 | 3 | null => {
@@ -31,12 +53,6 @@ const pickStratum = (overallRank: number | null): 1 | 2 | 3 | null => {
   if (overallRank <= STRATUM_B_MAX) return 2;
   if (overallRank <= STRATUM_C_MAX) return 3;
   return null;
-};
-
-const clampRank = (estimated: number, anchor: number): number => {
-  const lower = Math.max(1, Math.floor(anchor * 0.3));
-  const upper = Math.ceil(anchor * 3);
-  return Math.max(lower, Math.min(upper, estimated));
 };
 
 const countHigherInStratum = async (
@@ -78,21 +94,32 @@ export const getRangeRank = async (
     fetchEntryHistory(entryId),
   ]);
 
-  const events = (history.current ?? []).filter(
+  const allEvents = history.current ?? [];
+  const events = allEvents.filter(
     (ev) => ev.event >= startGw && ev.event <= endGw,
   );
   const rangeTotal = events.reduce((acc, ev) => acc + netPointsForEvent(ev), 0);
 
+  const overallRankBefore =
+    startGw > 1
+      ? (allEvents.find((ev) => ev.event === startGw - 1)?.overall_rank ?? null)
+      : null;
+  const overallRankAfter =
+    allEvents.find((ev) => ev.event === endGw)?.overall_rank ?? null;
+
   const stratum = pickStratum(summary.summary_overall_rank);
   const overallRank = summary.summary_overall_rank;
 
-  // No usable stratum (e.g. inactive tail). Return overall as approximation.
-  if (stratum === null || overallRank === null) {
+  // Out of stratified range (e.g. unranked or deep tail past 10.4M). No
+  // calculable range rank; surface null so the UI can render "—" honestly.
+  if (stratum === null) {
     return {
       entry_id: entryId,
       overall_rank: overallRank,
-      range_rank: overallRank,
+      range_rank: null,
       range_total: rangeTotal,
+      overall_rank_before: overallRankBefore,
+      overall_rank_after: overallRankAfter,
       start_gw: startGw,
       end_gw: endGw,
       stratum_used: null,
@@ -103,14 +130,14 @@ export const getRangeRank = async (
 
   const sampleSize = await sampleSizeForStratum(stratum);
 
-  // No data in this stratum yet (e.g. cron hasn't reached stratum B/C).
-  // Fall back to overall rank as the best available estimate.
   if (sampleSize === 0) {
     return {
       entry_id: entryId,
       overall_rank: overallRank,
-      range_rank: overallRank,
+      range_rank: null,
       range_total: rangeTotal,
+      overall_rank_before: overallRankBefore,
+      overall_rank_after: overallRankAfter,
       start_gw: startGw,
       end_gw: endGw,
       stratum_used: stratum,
@@ -125,25 +152,34 @@ export const getRangeRank = async (
     endGw,
     rangeTotal,
   );
-  const scaled = higher * STRATUM_SCALING[stratum];
 
-  // Stratum A is a full census of the top 10k, so for users in stratum A
-  // the count is exact (no scaling factor variance). Outside stratum A we
-  // anchor with overall rank to bound miscalls while the sample is sparse.
-  const rangeRank =
-    stratum === 1
-      ? Math.max(1, scaled)
-      : clampRank(Math.max(1, scaled), overallRank);
+  // Sample-size-aware scaling: extrapolate the in-sample count up to the
+  // full stratum. Static factors (1/5/50) baked in a fully-sampled stratum
+  // assumption that holds only after weeks of cron runs; using the actual
+  // sample makes the estimate vary correctly even with sparse data.
+  const scaling = STRATUM_TRUE_SIZE[stratum] / sampleSize;
+  const withinStratum = Math.max(1, Math.round(higher * scaling));
+  const rangeRank = Math.min(
+    STRATUM_UPPER[stratum],
+    STRATUM_OFFSET[stratum] + withinStratum,
+  );
+
+  // Stratum 1 with a full census gives an exact within-stratum count; any
+  // partial sample (or stratum 2/3) is an extrapolated estimate.
+  const confidence =
+    stratum === 1 && sampleSize >= STRATUM_TRUE_SIZE[1] ? "exact" : "estimated";
 
   return {
     entry_id: entryId,
     overall_rank: overallRank,
     range_rank: rangeRank,
     range_total: rangeTotal,
+    overall_rank_before: overallRankBefore,
+    overall_rank_after: overallRankAfter,
     start_gw: startGw,
     end_gw: endGw,
     stratum_used: stratum,
-    confidence: stratum === 1 ? "exact" : "estimated",
+    confidence,
     sample_size: sampleSize,
   };
 };
