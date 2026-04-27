@@ -1,5 +1,6 @@
 import "dotenv/config";
 import fs from "fs";
+import { fileURLToPath } from "node:url";
 import { insertFootballersFixtures } from "./insertFootballersFixtures.js";
 import { insertFootballers } from "./insertFootballers.js";
 import { insertTeams } from "./insertTeams.js";
@@ -68,6 +69,6 @@ export const populateDatabase = async () => {
   }
 };
 
-if (process.argv[1] && process.argv[1].endsWith("populateDatabase.ts")) {
+if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   await populateDatabase();
 }

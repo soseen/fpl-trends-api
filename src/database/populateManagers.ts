@@ -2,6 +2,7 @@ import "dotenv/config";
 import fs from "fs";
 import path from "path";
 import os from "os";
+import { fileURLToPath } from "node:url";
 import { prisma } from "./client.js";
 import {
   fetchEntryHistory,
@@ -507,6 +508,6 @@ export const populateManagers = async (
   }
 };
 
-if (process.argv[1] && process.argv[1].endsWith("populateManagers.ts")) {
+if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   await populateManagers();
 }
