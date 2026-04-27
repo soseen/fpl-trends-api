@@ -39,6 +39,7 @@ export const insertEvents = async () => {
           transfers_made: event.transfers_made,
           most_captained: event.most_captained,
           most_vice_captained: event.most_vice_captained,
+          chip_plays: event.chip_plays,
         },
         create: {
           id: event.id,
@@ -65,6 +66,7 @@ export const insertEvents = async () => {
           transfers_made: event.transfers_made,
           most_captained: event.most_captained,
           most_vice_captained: event.most_vice_captained,
+          chip_plays: event.chip_plays,
         },
       });
     }

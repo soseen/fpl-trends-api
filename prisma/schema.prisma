@@ -249,6 +249,7 @@ model events {
   transfers_made            Int
   most_captained            Int
   most_vice_captained       Int
+  chip_plays                Json?
 
   @@map("events")
 }
@@ -268,10 +269,12 @@ model manager_summary {
 }
 
 model manager_history {
-  entry_id Int
-  gw       Int
-  points   Int             // net GW points: event_total minus event_transfers_cost
-  manager  manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
+  entry_id             Int
+  gw                   Int
+  points               Int             // net GW points: event_total minus event_transfers_cost
+  event_transfers_cost Int?            // -4 hits cost in this GW (nullable for legacy rows pre-Phase 2 migration)
+  points_on_bench      Int?            // bench points in this GW (nullable for legacy rows)
+  manager              manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
 
   @@id([entry_id, gw])
   @@index([gw])

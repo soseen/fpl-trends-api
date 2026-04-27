@@ -254,11 +254,17 @@ const processEntry = async (
   for (const ev of history.current ?? []) {
     await prisma.manager_history.upsert({
       where: { entry_id_gw: { entry_id: entryId, gw: ev.event } },
-      update: { points: netPointsForEvent(ev) },
+      update: {
+        points: netPointsForEvent(ev),
+        event_transfers_cost: ev.event_transfers_cost,
+        points_on_bench: ev.points_on_bench,
+      },
       create: {
         entry_id: entryId,
         gw: ev.event,
         points: netPointsForEvent(ev),
+        event_transfers_cost: ev.event_transfers_cost,
+        points_on_bench: ev.points_on_bench,
       },
     });
   }
