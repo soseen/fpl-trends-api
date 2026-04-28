@@ -35,10 +35,12 @@ const STRATUM_C_MAX_FALLBACK = 15_000_000;
 
 // Stratum A: full census of the top 10k. 200 pages × 50 entries.
 const STRATUM_A_LAST_PAGE = 200;
-// Stratum B: pages 201–2000, take every Nth page = 1-in-5 sampling.
+// Stratum B: pages 201–2000, take every Nth page. Stride 2 = ~45k unique
+// entries per pass (vs 18k under stride 5) so the "Top 100k" sample sits
+// closer to 50k once accumulated movers from stratum 1 are included.
 const STRATUM_B_FIRST_PAGE = 201;
 const STRATUM_B_LAST_PAGE = 2000;
-const STRATUM_B_PAGE_STRIDE = 5;
+const STRATUM_B_PAGE_STRIDE = 2;
 // Stratum C: random ID probing in this range. Bumped past 13M so probes
 // can find managers in the deep tail FPL has grown into (>12.6M ranked
 // as of late season).
@@ -46,17 +48,17 @@ const STRATUM_C_ID_MIN = 1;
 const STRATUM_C_ID_MAX = 15_000_000;
 
 // Per-run safety cap. Cron fires every 15 min; at ~25 req/s sustained this
-// is ~10 min of work per run, leaving slack for governor backoffs and
+// is ~13 min of work per run, leaving slack for governor backoffs and
 // preventing overlap with the next cron.
-const MAX_MANAGERS_PER_RUN = 15000;
+const MAX_MANAGERS_PER_RUN = 20000;
 
-// Budget split when stratum A is still in progress vs done. A and B refresh
-// existing rows (their populations are bounded — 10k and 18k respectively),
-// so they only need a steady trickle. Most of the per-run budget goes to
-// stratum C, where each new probe is a previously-unseen manager and the
-// extrapolation factor is ~250× even at the bumped sample target.
+// Budget split when stratum A is still in progress vs done. A is the top
+// 10k (fixed population). B with stride 2 has ~45k unique pages to cycle.
+// Most of the per-run budget still goes to stratum C, where the
+// extrapolation factor is the largest and each new probe is most likely
+// previously-unseen.
 const BUDGET_A_WHILE_RUNNING = 2000;
-const BUDGET_B_WHILE_RUNNING = 2000;
+const BUDGET_B_WHILE_RUNNING = 3000;
 
 // Concurrency within each batch. Combined with the governor's inter-batch
 // delay (default 300 ms) this gives ~25 req/s sustained.
@@ -455,16 +457,21 @@ const ingestStratumC = async ({
         }
 
         const rank = summary.summary_overall_rank;
-        if (rank === null || stratumByRank(rank, cMax) !== 3) {
-          return "out_of_stratum" as const;
-        }
+        if (rank === null) return "out_of_stratum" as const;
+        const actualStratum = stratumByRank(rank, cMax);
+        if (actualStratum === null) return "out_of_stratum" as const;
 
+        // Random-ID hits that happen to land in stratum 1 or 2 used to be
+        // discarded as "out_of_stratum". Now we ingest them under their
+        // actual stratum — costs nothing extra (we already paid for the
+        // summary fetch) and trickles a few hundred extra refreshes per
+        // day into S1/S2, helping their stratum tags stay current.
         try {
           return await processEntry(
             id,
             rank,
             summary.summary_overall_points ?? 0,
-            3,
+            actualStratum,
             currentGw,
             governor,
           );
