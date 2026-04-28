@@ -15,6 +15,10 @@ import {
   netPointsForEvent,
 } from "../managers/activityFilter.js";
 import {
+  fetchEntryEventPicks,
+  summarizePicks,
+} from "../managers/fetchPicks.js";
+import {
   RateLimitGovernor,
   DEFAULT_GOVERNOR_CONFIG,
   type GovernorConfig,
@@ -22,9 +26,12 @@ import {
 import { delay } from "../utils.js";
 
 // ---- Stratum boundaries (must match getRangeRank.ts) ----
+// Stratum 3 upper bound is dynamic — derived from `events.ranked_count`
+// at runtime so it tracks FPL's growing tail. Fallback used only when no
+// finished GWs exist.
 const STRATUM_A_MAX = 10_000;
 const STRATUM_B_MAX = 100_000;
-const STRATUM_C_MAX = 10_400_000;
+const STRATUM_C_MAX_FALLBACK = 15_000_000;
 
 // Stratum A: full census of the top 10k. 200 pages × 50 entries.
 const STRATUM_A_LAST_PAGE = 200;
@@ -32,9 +39,11 @@ const STRATUM_A_LAST_PAGE = 200;
 const STRATUM_B_FIRST_PAGE = 201;
 const STRATUM_B_LAST_PAGE = 2000;
 const STRATUM_B_PAGE_STRIDE = 5;
-// Stratum C: random ID probing in this range.
+// Stratum C: random ID probing in this range. Bumped past 13M so probes
+// can find managers in the deep tail FPL has grown into (>12.6M ranked
+// as of late season).
 const STRATUM_C_ID_MIN = 1;
-const STRATUM_C_ID_MAX = 13_000_000;
+const STRATUM_C_ID_MAX = 15_000_000;
 
 // Per-run safety cap. Cron fires every 15 min; this keeps each invocation
 // short and polite even if the FPL API is generous.
@@ -69,7 +78,10 @@ const releaseLock = (): void => {
   }
 };
 
-const readIntCursor = async (key: string, fallback: number): Promise<number> => {
+const readIntCursor = async (
+  key: string,
+  fallback: number,
+): Promise<number> => {
   const rows = await prisma.$queryRaw<Array<{ value: string }>>`
     SELECT value FROM app_metadata WHERE key = ${key}
   `;
@@ -120,11 +132,19 @@ const withGovernor = async <T>(
   }
 };
 
-const stratumByRank = (rank: number): 1 | 2 | 3 | null => {
+const stratumByRank = (rank: number, cMax: number): 1 | 2 | 3 | null => {
   if (rank <= STRATUM_A_MAX) return 1;
   if (rank <= STRATUM_B_MAX) return 2;
-  if (rank <= STRATUM_C_MAX) return 3;
+  if (rank <= cMax) return 3;
   return null;
+};
+
+const fetchStratumCMax = async (): Promise<number> => {
+  const row = await prisma.events.aggregate({
+    where: { finished: true },
+    _max: { ranked_count: true },
+  });
+  return row._max.ranked_count ?? STRATUM_C_MAX_FALLBACK;
 };
 
 type ProcessOutcome =
@@ -208,29 +228,7 @@ const processEntry = async (
   }
 
   const klass = classifyManager(history, currentGw);
-
-  if (klass !== "active") {
-    await prisma.manager_summary.upsert({
-      where: { entry_id: entryId },
-      update: {
-        overall_rank: overallRank,
-        total_points: totalPoints,
-        stratum,
-        rejected_reason: klass,
-        last_checked_gw: currentGw,
-      },
-      create: {
-        entry_id: entryId,
-        overall_rank: overallRank,
-        total_points: totalPoints,
-        stratum,
-        rejected_reason: klass,
-        last_checked_gw: currentGw,
-      },
-    });
-    await prisma.manager_history.deleteMany({ where: { entry_id: entryId } });
-    return klass;
-  }
+  const rejectedReason = klass === "active" ? null : klass;
 
   await prisma.manager_summary.upsert({
     where: { entry_id: entryId },
@@ -238,7 +236,7 @@ const processEntry = async (
       overall_rank: overallRank,
       total_points: totalPoints,
       stratum,
-      rejected_reason: null,
+      rejected_reason: rejectedReason,
       last_checked_gw: currentGw,
     },
     create: {
@@ -246,16 +244,20 @@ const processEntry = async (
       overall_rank: overallRank,
       total_points: totalPoints,
       stratum,
-      rejected_reason: null,
+      rejected_reason: rejectedReason,
       last_checked_gw: currentGw,
     },
   });
 
+  // Write per-GW history for every classification. Range-rank queries need
+  // inactive/troll managers' real early-GW scores; comparison-average queries
+  // can still filter them out via `manager_summary.rejected_reason IS NULL`.
   for (const ev of history.current ?? []) {
     await prisma.manager_history.upsert({
       where: { entry_id_gw: { entry_id: entryId, gw: ev.event } },
       update: {
         points: netPointsForEvent(ev),
+        event_transfers: ev.event_transfers,
         event_transfers_cost: ev.event_transfers_cost,
         points_on_bench: ev.points_on_bench,
       },
@@ -263,13 +265,74 @@ const processEntry = async (
         entry_id: entryId,
         gw: ev.event,
         points: netPointsForEvent(ev),
+        event_transfers: ev.event_transfers,
         event_transfers_cost: ev.event_transfers_cost,
         points_on_bench: ev.points_on_bench,
       },
     });
   }
 
-  return "active";
+  // Picks ingestion: fill in any (entry_id, gw) we don't already have for
+  // finished GWs. This is the steady-state path; bulk backfill lives in
+  // `backfillPicks.ts` so a heavy historic re-fetch can run separately
+  // without blocking the cron.
+  await ingestPicksForMissingGws(entryId, currentGw, governor);
+
+  return klass;
+};
+
+// Returns the set of finished GWs (1..currentGw) for which we don't yet
+// have a `manager_picks` row for this manager. Skip if we hit the per-call
+// retry limit so a single flaky manager doesn't stall the cron.
+const ingestPicksForMissingGws = async (
+  entryId: number,
+  currentGw: number,
+  governor: RateLimitGovernor,
+): Promise<void> => {
+  if (currentGw < 1) return;
+  const existing = await prisma.manager_picks.findMany({
+    where: { entry_id: entryId, gw: { gte: 1, lte: currentGw } },
+    select: { gw: true },
+  });
+  const have = new Set(existing.map((p) => p.gw));
+  const missing: number[] = [];
+  for (let g = 1; g <= currentGw; g++) {
+    if (!have.has(g)) missing.push(g);
+  }
+  if (missing.length === 0) return;
+
+  for (const gw of missing) {
+    if (governor.shouldAbort) break;
+    let payload;
+    try {
+      payload = await withGovernor(governor, () =>
+        fetchEntryEventPicks(entryId, gw),
+      );
+    } catch {
+      // Skip individual GW on persistent failure; we'll retry on the next
+      // populate run when the per-GW skip in processEntry doesn't apply.
+      continue;
+    }
+    const { captain_element, vice_captain_element, captain_multiplier } =
+      summarizePicks(payload.picks ?? []);
+    await prisma.manager_picks.upsert({
+      where: { entry_id_gw: { entry_id: entryId, gw } },
+      update: {
+        captain_element,
+        vice_captain_element,
+        captain_multiplier,
+        active_chip: payload.active_chip,
+      },
+      create: {
+        entry_id: entryId,
+        gw,
+        captain_element,
+        vice_captain_element,
+        captain_multiplier,
+        active_chip: payload.active_chip,
+      },
+    });
+  }
 };
 
 // ---- Stratum A & B: paginated standings ----
@@ -298,11 +361,7 @@ const ingestFromStandings = async ({
   let page = await readIntCursor(cursorKey, startPage);
   if (page < startPage) page = startPage;
 
-  while (
-    !governor.shouldAbort &&
-    page <= endPage &&
-    stats.processed < budget
-  ) {
+  while (!governor.shouldAbort && page <= endPage && stats.processed < budget) {
     let pageData;
     try {
       pageData = await withGovernor(governor, () =>
@@ -367,11 +426,13 @@ const randomEntryId = (): number =>
 const ingestStratumC = async ({
   budget,
   currentGw,
+  cMax,
   governor,
   stats,
 }: {
   budget: number;
   currentGw: number;
+  cMax: number;
   governor: RateLimitGovernor;
   stats: Stats;
 }): Promise<void> => {
@@ -392,7 +453,7 @@ const ingestStratumC = async ({
         }
 
         const rank = summary.summary_overall_rank;
-        if (rank === null || stratumByRank(rank) !== 3) {
+        if (rank === null || stratumByRank(rank, cMax) !== 3) {
           return "out_of_stratum" as const;
         }
 
@@ -436,9 +497,12 @@ export const populateManagers = async (
   try {
     const currentGw = await getCurrentFinishedGw();
     if (currentGw < 1) {
-      console.warn("[populateManagers] No finished GWs yet — nothing to ingest.");
+      console.warn(
+        "[populateManagers] No finished GWs yet — nothing to ingest.",
+      );
       return;
     }
+    const cMax = await fetchStratumCMax();
 
     const aPage = await readIntCursor(CURSOR_KEY_A, 1);
     const bPage = await readIntCursor(CURSOR_KEY_B, STRATUM_B_FIRST_PAGE);
@@ -498,6 +562,7 @@ export const populateManagers = async (
       await ingestStratumC({
         budget: target,
         currentGw,
+        cMax,
         governor,
         stats,
       });

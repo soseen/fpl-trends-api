@@ -14,6 +14,8 @@
     "lint:fix": "eslint src/ --fix",
     "populate": "tsx src/database/populateDatabase.ts",
     "populate-managers": "tsx src/database/populateManagers.ts",
+    "backfill-nonactive-history": "tsx src/database/backfillNonActiveHistory.ts",
+    "backfill-picks": "tsx src/database/backfillPicks.ts",
     "reset-season": "tsx src/database/resetSeason.ts",
     "migrate": "npx prisma migrate deploy"
   },

@@ -8,12 +8,12 @@ datasource db {
 }
 
 model footballer_fixtures {
-  id            Int      @id @default(autoincrement())
-  footballer_id Int
-  fixture_id    Int
-  is_home       Boolean?
-  difficulty    Int?
-  code                   Int?                  @unique
+  id                     Int       @id @default(autoincrement())
+  footballer_id          Int
+  fixture_id             Int
+  is_home                Boolean?
+  difficulty             Int?
+  code                   Int?      @unique
   team_h                 Int?
   team_h_score           Int?
   team_a                 Int?
@@ -22,8 +22,8 @@ model footballer_fixtures {
   finished               Boolean?
   minutes                Int?
   provisional_start_time Boolean?
-  kickoff_time           DateTime?             @db.Timestamp(6)
-  event_name             String?               @db.VarChar(255)
+  kickoff_time           DateTime? @db.Timestamp(6)
+  event_name             String?   @db.VarChar(255)
 
   footballers footballers @relation(fields: [footballer_id], references: [id], onDelete: Cascade, onUpdate: NoAction)
 
@@ -200,11 +200,11 @@ model teams {
   pulse_id              Int?          @unique
   footballers           footballers[]
 
-  team_history          team_history[]
+  team_history team_history[]
 }
 
 model team_history {
-  id             Int     @id @default(autoincrement())
+  id             Int   @id @default(autoincrement())
   team_id        Int
   round          Int
   teamXGC        Float
@@ -212,7 +212,7 @@ model team_history {
   goals          Int
   goals_conceded Int
 
-  team           teams   @relation(fields: [team_id], references: [id], onDelete: Cascade)
+  team teams @relation(fields: [team_id], references: [id], onDelete: Cascade)
 
   @@unique([team_id, round])
 }
@@ -258,11 +258,12 @@ model manager_summary {
   entry_id        Int               @id
   overall_rank    Int?
   total_points    Int?
-  stratum         Int               // 1=A (top 10k), 2=B (10k–100k), 3=C (100k–10.4M)
+  stratum         Int // 1=A (top 10k), 2=B (10k–100k), 3=C (100k–end-of-tail, dynamic)
   rejected_reason String?           @db.VarChar(20) // null=active; "inactive" | "trolling" | "fetch_failed"
   last_checked_gw Int?
   last_updated    DateTime          @updatedAt
   history         manager_history[]
+  picks           manager_picks[]
 
   @@index([stratum])
   @@index([rejected_reason])
@@ -271,11 +272,26 @@ model manager_summary {
 model manager_history {
   entry_id             Int
   gw                   Int
-  points               Int             // net GW points: event_total minus event_transfers_cost
-  event_transfers_cost Int?            // -4 hits cost in this GW (nullable for legacy rows pre-Phase 2 migration)
-  points_on_bench      Int?            // bench points in this GW (nullable for legacy rows)
+  points               Int // net GW points: event_total minus event_transfers_cost
+  event_transfers      Int? // count of transfers made in this GW (nullable for pre-migration rows)
+  event_transfers_cost Int? // -4 hits cost in this GW (nullable for legacy rows pre-Phase 2 migration)
+  points_on_bench      Int? // bench points in this GW (nullable for legacy rows)
   manager              manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
 
   @@id([entry_id, gw])
   @@index([gw])
+}
+
+model manager_picks {
+  entry_id             Int
+  gw                   Int
+  captain_element      Int? // footballer id with multiplier 2 or 3 (TC)
+  vice_captain_element Int? // backup captain (footballer id)
+  captain_multiplier   Int? // 2 = standard captain, 3 = triple captain, 0 = captain benched
+  active_chip          String?         @db.VarChar(20) // wildcard | freehit | bboost | 3xc | manager
+  manager              manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
+
+  @@id([entry_id, gw])
+  @@index([gw])
+  @@index([captain_element])
 }

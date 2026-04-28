@@ -22,25 +22,40 @@ export type RangeRankResponse = {
 };
 
 // Stratum boundaries (upper bound of overall rank, inclusive).
+// Stratum 3 upper bound is dynamic — derived per request from the latest
+// finished gameweek's `ranked_count`. FPL's ranked count grows through the
+// season as new managers join, and a static cap (e.g. 10.4M) becomes stale
+// quickly. STRATUM_C_MAX_FALLBACK is used only when the events table has
+// no finished GWs (boot state) and is set generously so users in the deep
+// tail still get a calculated rank.
 const STRATUM_A_MAX = 10_000;
 const STRATUM_B_MAX = 100_000;
-const STRATUM_C_MAX = 10_400_000;
-
-// Total managers each stratum is meant to cover. Used for sample-aware
-// extrapolation: we scale within-sample counts up to the full stratum.
-const STRATUM_TRUE_SIZE: Record<1 | 2 | 3, number> = {
-  1: STRATUM_A_MAX,
-  2: STRATUM_B_MAX - STRATUM_A_MAX,
-  3: STRATUM_C_MAX - STRATUM_B_MAX,
-};
+const STRATUM_C_MAX_FALLBACK = 15_000_000;
 
 const ALL_STRATA: ReadonlyArray<1 | 2 | 3> = [1, 2, 3];
 
-const pickStratum = (overallRank: number | null): 1 | 2 | 3 | null => {
+const stratumCMax = async (): Promise<number> => {
+  const row = await prisma.events.aggregate({
+    where: { finished: true },
+    _max: { ranked_count: true },
+  });
+  return row._max.ranked_count ?? STRATUM_C_MAX_FALLBACK;
+};
+
+const stratumTrueSize = (cMax: number): Record<1 | 2 | 3, number> => ({
+  1: STRATUM_A_MAX,
+  2: STRATUM_B_MAX - STRATUM_A_MAX,
+  3: Math.max(cMax - STRATUM_B_MAX, 1),
+});
+
+const pickStratum = (
+  overallRank: number | null,
+  cMax: number,
+): 1 | 2 | 3 | null => {
   if (overallRank === null) return null;
   if (overallRank <= STRATUM_A_MAX) return 1;
   if (overallRank <= STRATUM_B_MAX) return 2;
-  if (overallRank <= STRATUM_C_MAX) return 3;
+  if (overallRank <= cMax) return 3;
   return null;
 };
 
@@ -108,7 +123,9 @@ export const getRangeRank = async (
   const overallRankAfter =
     allEvents.find((ev) => ev.event === endGw)?.overall_rank ?? null;
 
-  const stratum = pickStratum(summary.summary_overall_rank);
+  const cMax = await stratumCMax();
+  const trueSize = stratumTrueSize(cMax);
+  const stratum = pickStratum(summary.summary_overall_rank, cMax);
   const overallRank = summary.summary_overall_rank;
   const totalPoints = summary.summary_overall_points ?? null;
 
@@ -158,7 +175,7 @@ export const getRangeRank = async (
     const probes = probesByStratum[s];
     if (probes === 0) continue;
     const higherInS = await countHigherInStratum(s, startGw, endGw, rangeTotal);
-    totalHigher += Math.round((higherInS * STRATUM_TRUE_SIZE[s]) / probes);
+    totalHigher += Math.round((higherInS * trueSize[s]) / probes);
   }
 
   // Sanity bound: the rank can't exceed how many managers were actually
@@ -172,9 +189,7 @@ export const getRangeRank = async (
   // it. Anything else is an extrapolated estimate. `approximate` is reserved
   // for the no-data boot state handled above.
   const confidence =
-    stratum === 1 && probesByStratum[1] >= STRATUM_TRUE_SIZE[1]
-      ? "exact"
-      : "estimated";
+    stratum === 1 && probesByStratum[1] >= trueSize[1] ? "exact" : "estimated";
 
   return {
     entry_id: entryId,
