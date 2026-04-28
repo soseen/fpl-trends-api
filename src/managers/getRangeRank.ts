@@ -42,12 +42,6 @@ const stratumCMax = async (): Promise<number> => {
   return row._max.ranked_count ?? STRATUM_C_MAX_FALLBACK;
 };
 
-const stratumTrueSize = (cMax: number): Record<1 | 2 | 3, number> => ({
-  1: STRATUM_A_MAX,
-  2: STRATUM_B_MAX - STRATUM_A_MAX,
-  3: Math.max(cMax - STRATUM_B_MAX, 1),
-});
-
 const pickStratum = (
   overallRank: number | null,
   cMax: number,
@@ -88,11 +82,38 @@ const countHigherInStratum = async (
 };
 
 // Total probes in the stratum: active + inactive + trolling + fetch_failed.
-// This is the correct denominator for Bernoulli-urn extrapolation. Filtering
-// to `rejected_reason IS NULL` here would systematically overcount because
-// the active subset scores higher on average than the full stratum.
+// Used for the `sample_size` reported to the UI (cron progress indicator).
+// NOT the right denominator for the Bernoulli-urn extrapolation — see
+// `probesWithHistoryInStratum` below for that.
 const totalProbesInStratum = async (stratum: 1 | 2 | 3): Promise<number> => {
   return prisma.manager_summary.count({ where: { stratum } });
+};
+
+// Probes in the stratum that actually have a manager_history row inside
+// the queried GW range. This is the correct denominator for the
+// Bernoulli urn — only these probes are eligible to satisfy the
+// `SUM(points) >= threshold` condition. Late joiners (no early-GW
+// history) and fetch_failed probes are excluded because they can never
+// be in the numerator regardless of their true score.
+//
+// Pairing this with a stratum-3 trueSize derived from `rankedAtEnd[gw]`
+// (rather than current `cMax`) removes the late-joiner inflation that
+// previously biased early-range queries by ~25%: cMax/probes was ~197×
+// per probe, but the correct ranked-at-GW4 / probes-with-GW4-history
+// ratio is ~158× — exactly the gap between observed and expected ranks.
+const probesWithHistoryInStratum = async (
+  stratum: 1 | 2 | 3,
+  startGw: number,
+  endGw: number,
+): Promise<number> => {
+  const rows = await prisma.$queryRaw<Array<{ count: number }>>`
+    SELECT COUNT(DISTINCT mh.entry_id)::int AS count
+    FROM manager_history mh
+    JOIN manager_summary ms ON ms.entry_id = mh.entry_id
+    WHERE mh.gw BETWEEN ${startGw} AND ${endGw}
+      AND ms.stratum = ${stratum}
+  `;
+  return rows[0]?.count ?? 0;
 };
 
 const rankedCountForGw = async (gw: number): Promise<number | null> => {
@@ -127,14 +148,29 @@ export const getRangeRank = async (
     allEvents.find((ev) => ev.event === endGw)?.overall_rank ?? null;
 
   const cMax = await stratumCMax();
-  const trueSize = stratumTrueSize(cMax);
   const stratum = pickStratum(summary.summary_overall_rank, cMax);
   const overallRank = summary.summary_overall_rank;
   const totalPoints = summary.summary_overall_points ?? null;
 
-  // Per-stratum probe counts. Used both for extrapolation scaling and to
-  // report `sample_size` for the user's stratum. We always pull all three
-  // — they're cheap counts on an indexed column.
+  // Resolve the historical ranked_count for the end of the query range.
+  // Stratum 3's true population at that point in time was
+  // `rankedAtEnd - 100k`, NOT `cMax - 100k`. Using cMax (current
+  // ranked_count, ~12.6M) for an early-GW query inflates the per-probe
+  // weight because it includes ~7M late-joiners who couldn't have been
+  // ranked at GW 4. Falling back to cMax keeps behaviour sensible if the
+  // events table is missing a row for endGw (boot state, missed populate).
+  const rankedAtEnd = await rankedCountForGw(endGw);
+  const effectiveCMax = rankedAtEnd ?? cMax;
+  const trueSize: Record<1 | 2 | 3, number> = {
+    1: STRATUM_A_MAX,
+    2: STRATUM_B_MAX - STRATUM_A_MAX,
+    3: Math.max(effectiveCMax - STRATUM_B_MAX, 1),
+  };
+
+  // Total probes per stratum — only used to report `sample_size` to the UI
+  // and to detect the boot state. The rank math uses
+  // `probesWithHistoryByStratum` below, which excludes late joiners and
+  // fetch_failed probes.
   const [probes1, probes2, probes3] = (await Promise.all(
     ALL_STRATA.map((s) => totalProbesInStratum(s)),
   )) as [number, number, number];
@@ -166,25 +202,35 @@ export const getRangeRank = async (
     };
   }
 
-  // Sum extrapolated higher-scorer counts across all strata. Each stratum is
-  // a Bernoulli urn: a random probe either scored >= rangeTotal in the range
-  // or didn't (inactive/troll/fetch_failed probes count toward the
-  // denominator but not the numerator — they have no `manager_history`).
-  // This replaces the previous offset+within-stratum approach: strata 1 and
-  // 2 are densely sampled (census + 1-in-5), so their contribution is
-  // essentially direct measurement; stratum 3 still extrapolates ~1000x.
+  // Sum extrapolated higher-scorer counts across all strata using the
+  // Bernoulli-urn formula:
+  //
+  //     estimate_S = higherInS × trueSize[S] / probesWithHistory[S]
+  //
+  // Numerator: probes that satisfied SUM(history.points) >= threshold —
+  // by definition only probes WITH manager_history rows for the range.
+  // Denominator (the fix): probes ELIGIBLE to satisfy that condition,
+  // i.e. those with at least one history row in the range. Excludes late
+  // joiners and fetch_failed probes that never could have been the
+  // numerator regardless of their true score.
+  // trueSize: the true population that *was* ranked over the range. For
+  // stratum 3 this scales with `rankedAtEnd`, not `cMax`, fixing the
+  // ~25% over-estimate observed on early-range queries.
   let totalHigher = 0;
   for (const s of ALL_STRATA) {
-    const probes = probesByStratum[s];
-    if (probes === 0) continue;
+    const probesWithHistory = await probesWithHistoryInStratum(
+      s,
+      startGw,
+      endGw,
+    );
+    if (probesWithHistory === 0) continue;
     const higherInS = await countHigherInStratum(s, startGw, endGw, rangeTotal);
-    totalHigher += Math.round((higherInS * trueSize[s]) / probes);
+    totalHigher += Math.round((higherInS * trueSize[s]) / probesWithHistory);
   }
 
   // Sanity bound: the rank can't exceed how many managers were actually
   // ranked at the end of the range. Especially relevant for early-season
   // ranges (e.g. only ~5.7M had a rank after GW7).
-  const rankedAtEnd = await rankedCountForGw(endGw);
   const cap = rankedAtEnd ?? Number.MAX_SAFE_INTEGER;
   const rangeRank = Math.max(1, Math.min(totalHigher + 1, cap));
 
