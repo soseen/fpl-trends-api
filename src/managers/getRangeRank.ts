@@ -59,10 +59,13 @@ const pickStratum = (
   return null;
 };
 
-// Counts active managers in a stratum whose summed range points >= threshold.
-// `rejected_reason IS NULL` is implicit (non-active managers have no
-// `manager_history` rows and so cannot satisfy the HAVING clause), but kept
-// explicit for auditability.
+// Counts managers in a stratum whose summed range points >= threshold.
+// Includes inactive/trolling managers — they DO have `manager_history` rows
+// (see populateManagers.ts where history is upserted regardless of
+// classification). They're correctly part of the rank denominator: they
+// were ranked at the relevant GW even if they later went idle. Only
+// `fetch_failed` probes lack history and so naturally drop out of the
+// HAVING clause.
 const countHigherInStratum = async (
   stratum: 1 | 2 | 3,
   startGw: number,

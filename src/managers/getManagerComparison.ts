@@ -10,6 +10,7 @@ export type ComparisonStat = {
   user: number;
   average: number | null;
   top10k_average: number | null;
+  top100k_average: number | null;
 };
 
 export type CaptainSummary = {
@@ -19,6 +20,16 @@ export type CaptainSummary = {
   average_player_name: string | null;
   top10k_player_id: number | null;
   top10k_player_name: string | null;
+  top100k_player_id: number | null;
+  top100k_player_name: string | null;
+};
+
+type StratumFilter = "active" | "stratum1" | "stratum1or2";
+
+const stratumClauseFor = (f: StratumFilter): string => {
+  if (f === "stratum1") return `AND ms.stratum = 1`;
+  if (f === "stratum1or2") return `AND ms.stratum IN (1, 2)`;
+  return ``;
 };
 
 export type ManagerComparisonResponse = {
@@ -182,10 +193,9 @@ const userCaptainStats = async (
 const sampleCaptainBonusAvg = async (
   startGw: number,
   endGw: number,
-  stratumFilter: "active" | "stratum1",
+  stratumFilter: StratumFilter,
 ): Promise<{ avg: number | null; sample_size: number }> => {
-  const stratumClause =
-    stratumFilter === "stratum1" ? `AND ms.stratum = 1` : ``;
+  const stratumClause = stratumClauseFor(stratumFilter);
   const rows = await prisma.$queryRawUnsafe<
     Array<{ avg_bonus: number | null; sample_size: number }>
   >(
@@ -226,10 +236,9 @@ const sampleCaptainBonusAvg = async (
 const sampleMostCaptained = async (
   startGw: number,
   endGw: number,
-  stratumFilter: "active" | "stratum1",
+  stratumFilter: StratumFilter,
 ): Promise<number | null> => {
-  const stratumClause =
-    stratumFilter === "stratum1" ? `AND ms.stratum = 1` : ``;
+  const stratumClause = stratumClauseFor(stratumFilter);
   const rows = await prisma.$queryRawUnsafe<
     Array<{ captain_element: number; picks: number }>
   >(
@@ -256,7 +265,7 @@ const sampleMostCaptained = async (
 const sampleStratumAggregates = async (
   startGw: number,
   endGw: number,
-  stratumFilter: "active" | "stratum1",
+  stratumFilter: StratumFilter,
 ): Promise<{
   avg_total_points: number | null;
   avg_transfers: number | null;
@@ -272,8 +281,7 @@ const sampleStratumAggregates = async (
   with_transfers_data: number;
   picks_sample_size: number;
 }> => {
-  const stratumClause =
-    stratumFilter === "stratum1" ? `AND ms.stratum = 1` : ``;
+  const stratumClause = stratumClauseFor(stratumFilter);
 
   // Aggregate per-entry then average across entries. Covers total points,
   // transfers, hits, bench, and GW score — all from manager_history.
@@ -468,10 +476,11 @@ export const getManagerComparison = async (
     }
   }
 
-  // ---- Sample-side per-stratum aggregates (active + top-10k).
-  const [activeAgg, top10kAgg] = await Promise.all([
+  // ---- Sample-side per-stratum aggregates (active + top-10k + top-100k).
+  const [activeAgg, top10kAgg, top100kAgg] = await Promise.all([
     sampleStratumAggregates(startGw, endGw, "active"),
     sampleStratumAggregates(startGw, endGw, "stratum1"),
+    sampleStratumAggregates(startGw, endGw, "stratum1or2"),
   ]);
 
   const avgHits = gateOnCoverage(
@@ -501,27 +510,49 @@ export const getManagerComparison = async (
     top10kAgg.sample_size,
   );
 
+  const avgHitsTop100k = gateOnCoverage(
+    top100kAgg.avg_hits,
+    top100kAgg.with_hits_data,
+    top100kAgg.sample_size,
+  );
+  const avgBenchTop100k = gateOnCoverage(
+    top100kAgg.avg_bench,
+    top100kAgg.with_bench_data,
+    top100kAgg.sample_size,
+  );
+
   // ---- Captain bonus + most captained.
   // User-side captain stats run in parallel with the sample-side queries
   // because the FPL picks fetches are the slowest leg.
-  const [userCaptain, activeBonus, top10kBonus, activeMost, top10kMost] =
-    await Promise.all([
-      userCaptainStats(entryId, startGw, endGw),
-      sampleCaptainBonusAvg(startGw, endGw, "active"),
-      sampleCaptainBonusAvg(startGw, endGw, "stratum1"),
-      sampleMostCaptained(startGw, endGw, "active"),
-      sampleMostCaptained(startGw, endGw, "stratum1"),
-    ]);
+  const [
+    userCaptain,
+    activeBonus,
+    top10kBonus,
+    top100kBonus,
+    activeMost,
+    top10kMost,
+    top100kMost,
+  ] = await Promise.all([
+    userCaptainStats(entryId, startGw, endGw),
+    sampleCaptainBonusAvg(startGw, endGw, "active"),
+    sampleCaptainBonusAvg(startGw, endGw, "stratum1"),
+    sampleCaptainBonusAvg(startGw, endGw, "stratum1or2"),
+    sampleMostCaptained(startGw, endGw, "active"),
+    sampleMostCaptained(startGw, endGw, "stratum1"),
+    sampleMostCaptained(startGw, endGw, "stratum1or2"),
+  ]);
 
   const captainAveragePartial =
     activeBonus.sample_size === 0 ||
     activeBonus.sample_size < activeAgg.sample_size * COVERAGE_THRESHOLD;
 
-  const [userMostName, activeMostName, top10kMostName] = await Promise.all([
-    footballerName(userCaptain.mostCaptainedElement),
-    footballerName(activeMost),
-    footballerName(top10kMost),
-  ]);
+  const [userMostName, activeMostName, top10kMostName, top100kMostName] =
+    await Promise.all([
+      footballerName(userCaptain.mostCaptainedElement),
+      footballerName(activeMost),
+      footballerName(top10kMost),
+      footballerName(top100kMost),
+    ]);
 
   return {
     entry_id: entryId,
@@ -531,6 +562,7 @@ export const getManagerComparison = async (
       user: userTotalPoints,
       average: avgTotalPoints,
       top10k_average: top10kAgg.avg_total_points,
+      top100k_average: top100kAgg.avg_total_points,
     },
     transfers: {
       user: userTransfers,
@@ -539,41 +571,49 @@ export const getManagerComparison = async (
       // event-level rate otherwise.
       average: avgTransfersFromHistory ?? avgTransfersTotal,
       top10k_average: top10kAgg.avg_transfers,
+      top100k_average: top100kAgg.avg_transfers,
     },
     wildcards: {
       user: userWildcard,
       average: avgWildcardRate,
       top10k_average: top10kAgg.wildcards_rate,
+      top100k_average: top100kAgg.wildcards_rate,
     },
     free_hits: {
       user: userFreeHit,
       average: avgFreeHitRate,
       top10k_average: top10kAgg.free_hits_rate,
+      top100k_average: top100kAgg.free_hits_rate,
     },
     bench_boosts: {
       user: userBenchBoost,
       average: avgBenchBoostRate,
       top10k_average: top10kAgg.bench_boosts_rate,
+      top100k_average: top100kAgg.bench_boosts_rate,
     },
     hits: {
       user: userHits,
       average: avgHits,
       top10k_average: avgHitsTop10k,
+      top100k_average: avgHitsTop100k,
     },
     bench_points: {
       user: userBench,
       average: avgBench,
       top10k_average: avgBenchTop10k,
+      top100k_average: avgBenchTop100k,
     },
     captain_bonus: {
       user: userCaptain.bonus,
       average: activeBonus.avg,
       top10k_average: top10kBonus.avg,
+      top100k_average: top100kBonus.avg,
     },
     avg_gw_score: {
       user: userGwScore,
       average: activeAgg.avg_gw_score,
       top10k_average: top10kAgg.avg_gw_score,
+      top100k_average: top100kAgg.avg_gw_score,
     },
     most_captained: {
       user_player_id: userCaptain.mostCaptainedElement,
@@ -582,6 +622,8 @@ export const getManagerComparison = async (
       average_player_name: activeMostName,
       top10k_player_id: top10kMost,
       top10k_player_name: top10kMostName,
+      top100k_player_id: top100kMost,
+      top100k_player_name: top100kMostName,
     },
     notes: {
       hits_average_partial:

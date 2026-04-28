@@ -45,13 +45,18 @@ const STRATUM_B_PAGE_STRIDE = 5;
 const STRATUM_C_ID_MIN = 1;
 const STRATUM_C_ID_MAX = 15_000_000;
 
-// Per-run safety cap. Cron fires every 15 min; this keeps each invocation
-// short and polite even if the FPL API is generous.
-const MAX_MANAGERS_PER_RUN = 5000;
+// Per-run safety cap. Cron fires every 15 min; at ~25 req/s sustained this
+// is ~10 min of work per run, leaving slack for governor backoffs and
+// preventing overlap with the next cron.
+const MAX_MANAGERS_PER_RUN = 15000;
 
-// Budget split when stratum A is still in progress vs done.
-const BUDGET_A_WHILE_RUNNING = 2500;
-const BUDGET_B_WHILE_RUNNING = 1500;
+// Budget split when stratum A is still in progress vs done. A and B refresh
+// existing rows (their populations are bounded — 10k and 18k respectively),
+// so they only need a steady trickle. Most of the per-run budget goes to
+// stratum C, where each new probe is a previously-unseen manager and the
+// extrapolation factor is ~250× even at the bumped sample target.
+const BUDGET_A_WHILE_RUNNING = 2000;
+const BUDGET_B_WHILE_RUNNING = 2000;
 
 // Concurrency within each batch. Combined with the governor's inter-batch
 // delay (default 300 ms) this gives ~25 req/s sustained.
