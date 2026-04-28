@@ -35,12 +35,16 @@ const STRATUM_C_MAX_FALLBACK = 15_000_000;
 
 // Stratum A: full census of the top 10k. 200 pages × 50 entries.
 const STRATUM_A_LAST_PAGE = 200;
-// Stratum B: pages 201–2000, take every Nth page. Stride 2 = ~45k unique
-// entries per pass (vs 18k under stride 5) so the "Top 100k" sample sits
-// closer to 50k once accumulated movers from stratum 1 are included.
+// Stratum B: pages 201–2000. Stride 1 = full census of the 10k–100k cohort
+// (~90k entries per pass). Critically, stride 1 also keeps stratum tags
+// fresh: any manager whose rank has crossed back into the top 100k (i.e.,
+// improved out of stratum 3) gets re-tagged on its next pass. Strides > 1
+// skipped half (or more) of S2 pages, leaving "improvement movers" stuck
+// in our DB tagged stratum=3 with high cumulative scores — that drove a
+// ~14% over-count on stratum-3 rank queries.
 const STRATUM_B_FIRST_PAGE = 201;
 const STRATUM_B_LAST_PAGE = 2000;
-const STRATUM_B_PAGE_STRIDE = 2;
+const STRATUM_B_PAGE_STRIDE = 1;
 // Stratum C: random ID probing in this range. Bumped past 13M so probes
 // can find managers in the deep tail FPL has grown into (>12.6M ranked
 // as of late season).
@@ -53,12 +57,12 @@ const STRATUM_C_ID_MAX = 15_000_000;
 const MAX_MANAGERS_PER_RUN = 20000;
 
 // Budget split when stratum A is still in progress vs done. A is the top
-// 10k (fixed population). B with stride 2 has ~45k unique pages to cycle.
-// Most of the per-run budget still goes to stratum C, where the
-// extrapolation factor is the largest and each new probe is most likely
-// previously-unseen.
+// 10k (fixed). B with stride 1 has 1800 pages = 90k entries to cover
+// per pass; at 5000/cron that's a full pass every ~4.5 hours, fast enough
+// to keep stratum tags reasonably fresh. C still gets the largest share
+// (extrapolation factor is biggest and new probes are most likely unseen).
 const BUDGET_A_WHILE_RUNNING = 2000;
-const BUDGET_B_WHILE_RUNNING = 3000;
+const BUDGET_B_WHILE_RUNNING = 5000;
 
 // Concurrency within each batch. Combined with the governor's inter-batch
 // delay (default 300 ms) this gives ~25 req/s sustained.
