@@ -33,19 +33,7 @@ const STRATUM_TRUE_SIZE: Record<1 | 2 | 3, number> = {
   3: STRATUM_C_MAX - STRATUM_B_MAX,
 };
 
-// Overall-rank offset before each stratum. Adding the within-stratum rank
-// to this gives an overall rank in the right band.
-const STRATUM_OFFSET: Record<1 | 2 | 3, number> = {
-  1: 0,
-  2: STRATUM_A_MAX,
-  3: STRATUM_B_MAX,
-};
-
-const STRATUM_UPPER: Record<1 | 2 | 3, number> = {
-  1: STRATUM_A_MAX,
-  2: STRATUM_B_MAX,
-  3: STRATUM_C_MAX,
-};
+const ALL_STRATA: ReadonlyArray<1 | 2 | 3> = [1, 2, 3];
 
 const pickStratum = (overallRank: number | null): 1 | 2 | 3 | null => {
   if (overallRank === null) return null;
@@ -55,6 +43,10 @@ const pickStratum = (overallRank: number | null): 1 | 2 | 3 | null => {
   return null;
 };
 
+// Counts active managers in a stratum whose summed range points >= threshold.
+// `rejected_reason IS NULL` is implicit (non-active managers have no
+// `manager_history` rows and so cannot satisfy the HAVING clause), but kept
+// explicit for auditability.
 const countHigherInStratum = async (
   stratum: 1 | 2 | 3,
   startGw: number,
@@ -69,7 +61,6 @@ const countHigherInStratum = async (
       JOIN manager_summary ms ON ms.entry_id = mh.entry_id
       WHERE mh.gw BETWEEN ${startGw} AND ${endGw}
         AND ms.stratum = ${stratum}
-        AND ms.rejected_reason IS NULL
       GROUP BY mh.entry_id
       HAVING SUM(mh.points) >= ${threshold}
     ) t
@@ -77,11 +68,20 @@ const countHigherInStratum = async (
   return rows[0]?.higher ?? 0;
 };
 
-const sampleSizeForStratum = async (stratum: 1 | 2 | 3): Promise<number> => {
-  const result = await prisma.manager_summary.count({
-    where: { stratum, rejected_reason: null },
+// Total probes in the stratum: active + inactive + trolling + fetch_failed.
+// This is the correct denominator for Bernoulli-urn extrapolation. Filtering
+// to `rejected_reason IS NULL` here would systematically overcount because
+// the active subset scores higher on average than the full stratum.
+const totalProbesInStratum = async (stratum: 1 | 2 | 3): Promise<number> => {
+  return prisma.manager_summary.count({ where: { stratum } });
+};
+
+const rankedCountForGw = async (gw: number): Promise<number | null> => {
+  const ev = await prisma.events.findUnique({
+    where: { id: gw },
+    select: { ranked_count: true },
   });
-  return result;
+  return ev?.ranked_count ?? null;
 };
 
 export const getRangeRank = async (
@@ -110,27 +110,24 @@ export const getRangeRank = async (
   const stratum = pickStratum(summary.summary_overall_rank);
   const overallRank = summary.summary_overall_rank;
 
-  // Out of stratified range (e.g. unranked or deep tail past 10.4M). No
-  // calculable range rank; surface null so the UI can render "—" honestly.
-  if (stratum === null) {
-    return {
-      entry_id: entryId,
-      overall_rank: overallRank,
-      range_rank: null,
-      range_total: rangeTotal,
-      overall_rank_before: overallRankBefore,
-      overall_rank_after: overallRankAfter,
-      start_gw: startGw,
-      end_gw: endGw,
-      stratum_used: null,
-      confidence: "approximate",
-      sample_size: 0,
-    };
-  }
+  // Per-stratum probe counts. Used both for extrapolation scaling and to
+  // report `sample_size` for the user's stratum. We always pull all three
+  // — they're cheap counts on an indexed column.
+  const [probes1, probes2, probes3] = (await Promise.all(
+    ALL_STRATA.map((s) => totalProbesInStratum(s)),
+  )) as [number, number, number];
+  const probesByStratum: Record<1 | 2 | 3, number> = {
+    1: probes1,
+    2: probes2,
+    3: probes3,
+  };
 
-  const sampleSize = await sampleSizeForStratum(stratum);
+  const userStratumProbes = stratum === null ? 0 : probesByStratum[stratum];
 
-  if (sampleSize === 0) {
+  // Boot state: no managers ingested yet at all. Surface null so the UI can
+  // render "—" honestly rather than fabricate a rank.
+  const totalProbesAll = probes1 + probes2 + probes3;
+  if (totalProbesAll === 0) {
     return {
       entry_id: entryId,
       overall_rank: overallRank,
@@ -146,28 +143,35 @@ export const getRangeRank = async (
     };
   }
 
-  const higher = await countHigherInStratum(
-    stratum,
-    startGw,
-    endGw,
-    rangeTotal,
-  );
+  // Sum extrapolated higher-scorer counts across all strata. Each stratum is
+  // a Bernoulli urn: a random probe either scored >= rangeTotal in the range
+  // or didn't (inactive/troll/fetch_failed probes count toward the
+  // denominator but not the numerator — they have no `manager_history`).
+  // This replaces the previous offset+within-stratum approach: strata 1 and
+  // 2 are densely sampled (census + 1-in-5), so their contribution is
+  // essentially direct measurement; stratum 3 still extrapolates ~1000x.
+  let totalHigher = 0;
+  for (const s of ALL_STRATA) {
+    const probes = probesByStratum[s];
+    if (probes === 0) continue;
+    const higherInS = await countHigherInStratum(s, startGw, endGw, rangeTotal);
+    totalHigher += Math.round((higherInS * STRATUM_TRUE_SIZE[s]) / probes);
+  }
 
-  // Sample-size-aware scaling: extrapolate the in-sample count up to the
-  // full stratum. Static factors (1/5/50) baked in a fully-sampled stratum
-  // assumption that holds only after weeks of cron runs; using the actual
-  // sample makes the estimate vary correctly even with sparse data.
-  const scaling = STRATUM_TRUE_SIZE[stratum] / sampleSize;
-  const withinStratum = Math.max(1, Math.round(higher * scaling));
-  const rangeRank = Math.min(
-    STRATUM_UPPER[stratum],
-    STRATUM_OFFSET[stratum] + withinStratum,
-  );
+  // Sanity bound: the rank can't exceed how many managers were actually
+  // ranked at the end of the range. Especially relevant for early-season
+  // ranges (e.g. only ~5.7M had a rank after GW7).
+  const rankedAtEnd = await rankedCountForGw(endGw);
+  const cap = rankedAtEnd ?? Number.MAX_SAFE_INTEGER;
+  const rangeRank = Math.max(1, Math.min(totalHigher + 1, cap));
 
-  // Stratum 1 with a full census gives an exact within-stratum count; any
-  // partial sample (or stratum 2/3) is an extrapolated estimate.
+  // "exact" only when the user is in stratum 1 and we have a full census of
+  // it. Anything else is an extrapolated estimate. `approximate` is reserved
+  // for the no-data boot state handled above.
   const confidence =
-    stratum === 1 && sampleSize >= STRATUM_TRUE_SIZE[1] ? "exact" : "estimated";
+    stratum === 1 && probesByStratum[1] >= STRATUM_TRUE_SIZE[1]
+      ? "exact"
+      : "estimated";
 
   return {
     entry_id: entryId,
@@ -180,6 +184,6 @@ export const getRangeRank = async (
     end_gw: endGw,
     stratum_used: stratum,
     confidence,
-    sample_size: sampleSize,
+    sample_size: userStratumProbes,
   };
 };
