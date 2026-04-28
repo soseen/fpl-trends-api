@@ -58,6 +58,13 @@ const getCurrentFinishedGw = async (): Promise<number> => {
 // Produces the (entry_id, gw) pairs to fetch for one stratum, ordered by
 // stratum then gw. Returns missing pairs only — i.e., the ones we don't
 // have manager_picks rows for already.
+//
+// `rejected_reason IS NULL` filters out fetch_failed / inactive / trolling
+// managers. fetch_failed entry_ids are gone from FPL (banned/deleted) and
+// will return 404 forever — repeatedly hitting them used to trip the
+// governor's consecutive-error abort. Inactive/trolling picks aren't used
+// by any comparison query (those filter on the same flag), so backfilling
+// them is wasted FPL traffic.
 const findMissingPairs = async (
   stratum: 1 | 2 | 3,
   currentGw: number,
@@ -71,6 +78,7 @@ const findMissingPairs = async (
       FROM manager_summary ms
       CROSS JOIN gw_series
       WHERE ms.stratum = ${stratum}
+        AND ms.rejected_reason IS NULL
     )
     SELECT c.entry_id, c.gw
     FROM candidates c
@@ -178,7 +186,12 @@ export const backfillPicks = async (
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
-    await backfillPicks();
+    // Looser abort threshold than the cron default. The backfill churns
+    // through millions of pairs; a stretch of unrelated 404s or transient
+    // network errors on the FPL side shouldn't kill an hours-long run.
+    // 429s and 503s still trigger the 5-minute pause via the governor —
+    // this only widens the bucket for "unknown" errors before it gives up.
+    await backfillPicks({ abortAfterConsecutiveErrors: 20 });
   } finally {
     await prisma.$disconnect();
   }
