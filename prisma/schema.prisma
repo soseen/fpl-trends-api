@@ -247,8 +247,8 @@ model events {
   most_transferred_in       Int
   top_element               Int
   transfers_made            Int
-  most_captained            Int
-  most_vice_captained       Int
+  most_captained            Int?
+  most_vice_captained       Int?
   chip_plays                Json?
 
   @@map("events")

@@ -60,8 +60,8 @@ export type Event = {
   top_element: number;
   top_element_info: TopElementInfo;
   transfers_made: number;
-  most_captained: number;
-  most_vice_captained: number;
+  most_captained: number | null;
+  most_vice_captained: number | null;
 };
 
 export type Team = {
