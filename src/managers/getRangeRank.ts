@@ -5,6 +5,7 @@ import { netPointsForEvent } from "./activityFilter.js";
 export type RangeRankResponse = {
   entry_id: number;
   overall_rank: number | null;
+  total_points: number | null;
   range_rank: number | null;
   range_total: number;
   // Cumulative overall rank at the GW immediately before the range, and at
@@ -109,6 +110,7 @@ export const getRangeRank = async (
 
   const stratum = pickStratum(summary.summary_overall_rank);
   const overallRank = summary.summary_overall_rank;
+  const totalPoints = summary.summary_overall_points ?? null;
 
   // Per-stratum probe counts. Used both for extrapolation scaling and to
   // report `sample_size` for the user's stratum. We always pull all three
@@ -131,6 +133,7 @@ export const getRangeRank = async (
     return {
       entry_id: entryId,
       overall_rank: overallRank,
+      total_points: totalPoints,
       range_rank: null,
       range_total: rangeTotal,
       overall_rank_before: overallRankBefore,
@@ -176,6 +179,7 @@ export const getRangeRank = async (
   return {
     entry_id: entryId,
     overall_rank: overallRank,
+    total_points: totalPoints,
     range_rank: rangeRank,
     range_total: rangeTotal,
     overall_rank_before: overallRankBefore,
