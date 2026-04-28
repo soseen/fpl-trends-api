@@ -281,58 +281,55 @@ const processEntry = async (
   return klass;
 };
 
-// Returns the set of finished GWs (1..currentGw) for which we don't yet
-// have a `manager_picks` row for this manager. Skip if we hit the per-call
-// retry limit so a single flaky manager doesn't stall the cron.
+// Inline picks ingestion: fetch picks for the LATEST finished GW only,
+// and only if not already stored for this manager. Historical depth is
+// the job of `backfillPicks.ts` — keeping the cron path bounded to one
+// extra FPL call per manager per run means the steady-state load is
+// predictable (~5k extra calls / 15-min run) and it stays correct even
+// if the backfill never runs.
 const ingestPicksForMissingGws = async (
   entryId: number,
   currentGw: number,
   governor: RateLimitGovernor,
 ): Promise<void> => {
   if (currentGw < 1) return;
-  const existing = await prisma.manager_picks.findMany({
-    where: { entry_id: entryId, gw: { gte: 1, lte: currentGw } },
+  if (governor.shouldAbort) return;
+
+  const existing = await prisma.manager_picks.findUnique({
+    where: { entry_id_gw: { entry_id: entryId, gw: currentGw } },
     select: { gw: true },
   });
-  const have = new Set(existing.map((p) => p.gw));
-  const missing: number[] = [];
-  for (let g = 1; g <= currentGw; g++) {
-    if (!have.has(g)) missing.push(g);
-  }
-  if (missing.length === 0) return;
+  if (existing) return;
 
-  for (const gw of missing) {
-    if (governor.shouldAbort) break;
-    let payload;
-    try {
-      payload = await withGovernor(governor, () =>
-        fetchEntryEventPicks(entryId, gw),
-      );
-    } catch {
-      // Skip individual GW on persistent failure; we'll retry on the next
-      // populate run when the per-GW skip in processEntry doesn't apply.
-      continue;
-    }
-    const { captain_element, vice_captain_element, captain_multiplier } =
-      summarizePicks(payload.picks ?? []);
-    await prisma.manager_picks.upsert({
-      where: { entry_id_gw: { entry_id: entryId, gw } },
-      update: {
-        captain_element,
-        vice_captain_element,
-        captain_multiplier,
-        active_chip: payload.active_chip,
-      },
-      create: {
-        entry_id: entryId,
-        gw,
-        captain_element,
-        vice_captain_element,
-        captain_multiplier,
-        active_chip: payload.active_chip,
-      },
-    });
+  let payload;
+  try {
+    payload = await withGovernor(governor, () =>
+      fetchEntryEventPicks(entryId, currentGw),
+    );
+  } catch {
+    // Skip on persistent failure; next cron after the next GW transition
+    // (or backfillPicks) will retry.
+    return;
   }
+  const { captain_element, vice_captain_element, captain_multiplier } =
+    summarizePicks(payload.picks ?? []);
+  await prisma.manager_picks.upsert({
+    where: { entry_id_gw: { entry_id: entryId, gw: currentGw } },
+    update: {
+      captain_element,
+      vice_captain_element,
+      captain_multiplier,
+      active_chip: payload.active_chip,
+    },
+    create: {
+      entry_id: entryId,
+      gw: currentGw,
+      captain_element,
+      vice_captain_element,
+      captain_multiplier,
+      active_chip: payload.active_chip,
+    },
+  });
 };
 
 // ---- Stratum A & B: paginated standings ----
