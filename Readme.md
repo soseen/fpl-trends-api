@@ -4,6 +4,8 @@ Backend for **FPL Trends** (https://fpltrends.live) — a Fantasy Premier League
 
 Fetches data from the official FPL API, stores it in PostgreSQL via Prisma, and exposes it through a small REST API consumed by [`fpl-trends-app`](https://github.com/soseen/fpl-trends-app).
 
+> **Operator-focused per-flow docs** for the more complicated jobs live under [`docs/`](./docs/) — see [`populate-managers.md`](./docs/populate-managers.md), [`backfill-nonactive-history.md`](./docs/backfill-nonactive-history.md), and [`backfill-picks.md`](./docs/backfill-picks.md). Read those first if you're trying to operate the system rather than understand the architecture.
+
 ---
 
 ## Table of contents
