@@ -35,17 +35,31 @@ const STRATUM_A_LAST_PAGE = 200;
 // ~14% over-count on stratum-3 rank queries.
 const STRATUM_B_FIRST_PAGE = 201;
 const STRATUM_B_LAST_PAGE = 2000;
-const STRATUM_B_PAGE_STRIDE = 1;
 // Stratum C: systematic 1-in-20 walk over the FPL standings tail. Each page
 // has 50 entries; stride 20 means we sample 50 of every 1000 ranked
-// managers, giving ~625k unique probes per pass over a 12.6M-ranked tail.
+// managers, giving ~12,500 distinct page slots per pass over a 12.6M
+// ranked tail (≈ 625k unique probes once full).
 //
 // We deliberately moved away from random-entry-ID probing here: random IDs
 // over-sampled engaged returning users (low IDs 1..3M) and undersampled
 // recent joiners (high IDs 10M+), which biased the rank-rank estimate by
 // ~12% even with very large samples. The standings page is FPL's own
 // ranking, which is exactly the population we want to extrapolate from —
-// so a systematic walk is unbiased by construction.
+// so a 1-in-N walk is unbiased *in the limit* of a complete cycle.
+//
+// IMPORTANT: a sequential cursor (page → page+stride → …) gives a heavily
+// front-loaded sample mid-cycle: pages 2001..N have all been visited, but
+// pages N+1..252000 haven't. Mid-cycle samples therefore over-represent
+// the upper end of stratum 3 (current rank 100k–N×50), which has higher
+// average GW totals than the deep tail. Observed effect on a fresh prod
+// cycle: rank-rank queries over-counted "managers above user" by ~3× in
+// stratum 3, blowing the GW-range rank estimate up by 100% on long ranges.
+//
+// Fix: interleave the slot order using a golden-ratio modular step.
+// `STRATUM_C_GOLDEN_STEP` is coprime to `STRATUM_C_NUM_SLOTS`, so the
+// sequence `(idx * STEP) mod NUM_SLOTS` for idx = 0,1,2,… is a permutation
+// of [0, NUM_SLOTS). After ~10 steps the visited slots are spread evenly
+// across the entire rank tail; partial cycles are no longer front-loaded.
 //
 // LAST_PAGE 252_000 covers ranks up to 12.6M, comfortably above the
 // largest observed `events.ranked_count`. Pages past the live tail return
@@ -54,6 +68,19 @@ const STRATUM_B_PAGE_STRIDE = 1;
 const STRATUM_C_FIRST_PAGE = 2001;
 const STRATUM_C_LAST_PAGE = 252_000;
 const STRATUM_C_PAGE_STRIDE = 20;
+const STRATUM_C_NUM_SLOTS = Math.floor(
+  (STRATUM_C_LAST_PAGE - STRATUM_C_FIRST_PAGE + 1) / STRATUM_C_PAGE_STRIDE,
+); // = 12_500
+// Coprime to 12_500 (gcd = 1), ratio ≈ 0.618 (golden). Any prime that is
+// neither 2 nor 5 (the prime factors of 12_500) works equally well; 7727
+// happens to be the closest prime to 12_500 × (√5 − 1)/2.
+const STRATUM_C_GOLDEN_STEP = 7727;
+const stratumCPageForIndex = (idx: number): number => {
+  const wrapped =
+    ((idx % STRATUM_C_NUM_SLOTS) + STRATUM_C_NUM_SLOTS) % STRATUM_C_NUM_SLOTS;
+  const slot = (wrapped * STRATUM_C_GOLDEN_STEP) % STRATUM_C_NUM_SLOTS;
+  return STRATUM_C_FIRST_PAGE + slot * STRATUM_C_PAGE_STRIDE;
+};
 
 // Per-run safety cap. Cron fires every 15 min; at ~25 req/s sustained this
 // is ~13 min of work per run, leaving slack for governor backoffs and
@@ -75,6 +102,11 @@ const HISTORY_BATCH_SIZE = 8;
 const CURSOR_KEY_A = "manager_ingest_cursor_a";
 const CURSOR_KEY_B = "manager_ingest_cursor_b";
 const CURSOR_KEY_C = "manager_ingest_cursor_c";
+// Bumped when cursor semantics change in a way that pre-existing cursor
+// values would be silently misinterpreted. v1 = raw page number (pre
+// golden-step refactor). v2 = iteration index within a walk's `numSteps`.
+const CURSOR_FORMAT_KEY = "manager_walk_cursor_version";
+const CURRENT_CURSOR_FORMAT_VERSION = 2;
 const LOCKFILE_PATH = path.join(os.tmpdir(), "fpl-populate-managers.lock");
 // Conservative max age — a normal run is ~13 min; anything older than this
 // can only mean the previous owner died without releasing.
@@ -397,33 +429,74 @@ const ingestPicksForMissingGws = async (
   });
 };
 
-// ---- Stratum A & B: paginated standings ----
+// ---- Stratum A / B / C: paginated standings ----
+//
+// Each stratum has a "walk plan": how many distinct pages exist in one
+// cycle, and how to map an iteration index → standings page number.
+//
+// S1 and S2 are full-census strides (every page visited once), so the
+// mapping is trivial (idx → first_page + idx). S3 is a 1-in-N stride
+// over a much larger range; to keep partial cycles unbiased we visit
+// slots in golden-ratio interleaved order (see `stratumCPageForIndex`).
+//
+// The cursor stored in `app_metadata` is the *iteration index* (0-based
+// step count within the current cycle), not the raw page number. When a
+// cycle completes, the cursor wraps back to 0.
+type StratumWalk = {
+  cursorKey: string;
+  numSteps: number;
+  pageOf: (idx: number) => number;
+  stratum: 1 | 2 | 3;
+};
+
+const STRATUM_A_WALK: StratumWalk = {
+  cursorKey: CURSOR_KEY_A,
+  numSteps: STRATUM_A_LAST_PAGE,
+  pageOf: (idx) => idx + 1,
+  stratum: 1,
+};
+
+const STRATUM_B_WALK: StratumWalk = {
+  cursorKey: CURSOR_KEY_B,
+  numSteps: STRATUM_B_LAST_PAGE - STRATUM_B_FIRST_PAGE + 1,
+  pageOf: (idx) => STRATUM_B_FIRST_PAGE + idx,
+  stratum: 2,
+};
+
+const STRATUM_C_WALK: StratumWalk = {
+  cursorKey: CURSOR_KEY_C,
+  numSteps: STRATUM_C_NUM_SLOTS,
+  pageOf: stratumCPageForIndex,
+  stratum: 3,
+};
 
 const ingestFromStandings = async ({
-  cursorKey,
-  startPage,
-  endPage,
-  pageStride,
-  stratum,
+  walk,
   budget,
   currentGw,
   governor,
   stats,
 }: {
-  cursorKey: string;
-  startPage: number;
-  endPage: number;
-  pageStride: number;
-  stratum: 1 | 2 | 3;
+  walk: StratumWalk;
   budget: number;
   currentGw: number;
   governor: RateLimitGovernor;
   stats: Stats;
 }): Promise<void> => {
-  let page = await readIntCursor(cursorKey, startPage);
-  if (page < startPage) page = startPage;
+  // Read the iteration index. Pre-refactor the cursor stored a raw page
+  // number; if we still see one of those (e.g. > numSteps), fall back to
+  // 0 so a partial-cycle deploy doesn't get stuck in an out-of-range
+  // state.
+  let idx = await readIntCursor(walk.cursorKey, 0);
+  if (idx < 0 || idx >= walk.numSteps) idx = 0;
 
-  while (!governor.shouldAbort && page <= endPage && stats.processed < budget) {
+  while (
+    !governor.shouldAbort &&
+    idx < walk.numSteps &&
+    stats.processed < budget
+  ) {
+    const page = walk.pageOf(idx);
+
     let pageData;
     try {
       pageData = await withGovernor(governor, () =>
@@ -432,10 +505,10 @@ const ingestFromStandings = async ({
     } catch {
       if (governor.shouldAbort) break;
       console.warn(
-        `[populateManagers] Stratum ${stratum}: skipping page ${page} after repeated failures.`,
+        `[populateManagers] Stratum ${walk.stratum}: skipping page ${page} after repeated failures.`,
       );
-      page += pageStride;
-      await writeIntCursor(cursorKey, page);
+      idx += 1;
+      await writeIntCursor(walk.cursorKey, idx);
       continue;
     }
 
@@ -454,7 +527,7 @@ const ingestFromStandings = async ({
               e.entry,
               e.rank,
               e.total,
-              stratum,
+              walk.stratum,
               currentGw,
               governor,
             );
@@ -467,15 +540,15 @@ const ingestFromStandings = async ({
       await delay(governor.interBatchDelayMs);
     }
 
-    page += pageStride;
-    await writeIntCursor(cursorKey, page);
+    idx += 1;
+    await writeIntCursor(walk.cursorKey, idx);
   }
 
-  if (page > endPage) {
+  if (idx >= walk.numSteps) {
     console.info(
-      `[populateManagers] Stratum ${stratum} complete — wrapping cursor to ${startPage}.`,
+      `[populateManagers] Stratum ${walk.stratum} complete — wrapping cursor to 0.`,
     );
-    await writeIntCursor(cursorKey, startPage);
+    await writeIntCursor(walk.cursorKey, 0);
   }
 };
 
@@ -505,12 +578,36 @@ export const populateManagers = async (
       );
       return;
     }
-    const aPage = await readIntCursor(CURSOR_KEY_A, 1);
-    const bPage = await readIntCursor(CURSOR_KEY_B, STRATUM_B_FIRST_PAGE);
-    const cPage = await readIntCursor(CURSOR_KEY_C, STRATUM_C_FIRST_PAGE);
 
-    const aDone = aPage > STRATUM_A_LAST_PAGE;
-    const bDone = bPage > STRATUM_B_LAST_PAGE;
+    // One-time migration: pre-refactor cursors stored raw page numbers,
+    // which would be silently misread as iteration indices by the new
+    // walk logic (e.g. cursor=5000 in v1 meant "page 5000", in v2 means
+    // "step 5000 within the walk"). Reset all three cursors on first
+    // run after the format bump so the new walks start fresh.
+    const cursorVersion = await readIntCursor(CURSOR_FORMAT_KEY, 0);
+    if (cursorVersion < CURRENT_CURSOR_FORMAT_VERSION) {
+      console.info(
+        `[populateManagers] Cursor format ${cursorVersion} → ${CURRENT_CURSOR_FORMAT_VERSION}: resetting walk cursors.`,
+      );
+      await writeIntCursor(CURSOR_KEY_A, 0);
+      await writeIntCursor(CURSOR_KEY_B, 0);
+      await writeIntCursor(CURSOR_KEY_C, 0);
+      await writeIntCursor(CURSOR_FORMAT_KEY, CURRENT_CURSOR_FORMAT_VERSION);
+    }
+
+    // Cursors are now iteration indices (0-based) within their walk's
+    // `numSteps`. Old deploys stored raw page numbers; values out of
+    // [0, numSteps) get treated as "fresh start" by ingestFromStandings.
+    const aIdx = await readIntCursor(CURSOR_KEY_A, 0);
+    const bIdx = await readIntCursor(CURSOR_KEY_B, 0);
+    const cIdx = await readIntCursor(CURSOR_KEY_C, 0);
+
+    // Treat A/B as "done for this pass" only when the cursor sits at the
+    // end of the iteration range. C never goes "done" on the same
+    // condition because we want to keep refilling its sample (cycle wraps
+    // each time A and B finish a pass).
+    const aDone = aIdx >= STRATUM_A_WALK.numSteps;
+    const bDone = bIdx >= STRATUM_B_WALK.numSteps;
 
     // Budget allocation: keep A moving while it has work, but always reserve
     // the bulk of the budget for C so the deep tail fills as quickly as
@@ -529,17 +626,13 @@ export const populateManagers = async (
     const budgetC = MAX_MANAGERS_PER_RUN - budgetA - budgetB;
 
     console.info(
-      `[populateManagers] Starting: currentGw ${currentGw}, A page ${aPage}/${STRATUM_A_LAST_PAGE} (budget ${budgetA}), B page ${bPage}/${STRATUM_B_LAST_PAGE} (budget ${budgetB}), C page ${cPage}/${STRATUM_C_LAST_PAGE} stride ${STRATUM_C_PAGE_STRIDE} (budget ${budgetC})`,
+      `[populateManagers] Starting: currentGw ${currentGw}, A idx ${aIdx}/${STRATUM_A_WALK.numSteps} (budget ${budgetA}), B idx ${bIdx}/${STRATUM_B_WALK.numSteps} (budget ${budgetB}), C idx ${cIdx}/${STRATUM_C_WALK.numSteps} (interleaved, budget ${budgetC})`,
     );
 
     if (budgetA > 0) {
       const target = stats.processed + budgetA;
       await ingestFromStandings({
-        cursorKey: CURSOR_KEY_A,
-        startPage: 1,
-        endPage: STRATUM_A_LAST_PAGE,
-        pageStride: 1,
-        stratum: 1,
+        walk: STRATUM_A_WALK,
         budget: target,
         currentGw,
         governor,
@@ -550,11 +643,7 @@ export const populateManagers = async (
     if (!governor.shouldAbort && budgetB > 0) {
       const target = stats.processed + budgetB;
       await ingestFromStandings({
-        cursorKey: CURSOR_KEY_B,
-        startPage: STRATUM_B_FIRST_PAGE,
-        endPage: STRATUM_B_LAST_PAGE,
-        pageStride: STRATUM_B_PAGE_STRIDE,
-        stratum: 2,
+        walk: STRATUM_B_WALK,
         budget: target,
         currentGw,
         governor,
@@ -565,11 +654,7 @@ export const populateManagers = async (
     if (!governor.shouldAbort && budgetC > 0) {
       const target = stats.processed + budgetC;
       await ingestFromStandings({
-        cursorKey: CURSOR_KEY_C,
-        startPage: STRATUM_C_FIRST_PAGE,
-        endPage: STRATUM_C_LAST_PAGE,
-        pageStride: STRATUM_C_PAGE_STRIDE,
-        stratum: 3,
+        walk: STRATUM_C_WALK,
         budget: target,
         currentGw,
         governor,

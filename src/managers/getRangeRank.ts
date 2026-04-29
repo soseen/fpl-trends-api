@@ -53,67 +53,57 @@ const pickStratum = (
   return null;
 };
 
-// Counts managers in a stratum whose summed range points >= threshold.
-// Includes inactive/trolling managers — they DO have `manager_history` rows
-// (see populateManagers.ts where history is upserted regardless of
+// Returns both `higher` (managers in the stratum whose summed range points
+// >= threshold) and `probes_with_history` (managers in the stratum with at
+// least one manager_history row in [startGw, endGw]) in a single SQL
+// round-trip.
+//
+// Combining the two saves a full re-scan of `manager_history` per stratum:
+// previously each request did 6 sequential aggregations (3 strata × 2
+// queries), each scanning ~25M rows for stratum 3. With this single-CTE
+// form we drop to 3 round-trips total and the CTE is materialised once.
+//
+// Includes inactive/trolling managers — they DO have `manager_history`
+// rows (see populateManagers.ts where history is upserted regardless of
 // classification). They're correctly part of the rank denominator: they
 // were ranked at the relevant GW even if they later went idle. Only
 // `fetch_failed` probes lack history and so naturally drop out of the
-// HAVING clause.
-const countHigherInStratum = async (
+// numerator's HAVING clause.
+const stratumCounts = async (
   stratum: 1 | 2 | 3,
   startGw: number,
   endGw: number,
   threshold: number,
-): Promise<number> => {
-  const rows = await prisma.$queryRaw<Array<{ higher: number }>>`
-    SELECT COUNT(*)::int AS higher
-    FROM (
+): Promise<{ higher: number; probesWithHistory: number }> => {
+  const rows = await prisma.$queryRaw<
+    Array<{ higher: number; probes_with_history: number }>
+  >`
+    WITH manager_totals AS (
       SELECT mh.entry_id, SUM(mh.points)::int AS s
       FROM manager_history mh
       JOIN manager_summary ms ON ms.entry_id = mh.entry_id
       WHERE mh.gw BETWEEN ${startGw} AND ${endGw}
         AND ms.stratum = ${stratum}
       GROUP BY mh.entry_id
-      HAVING SUM(mh.points) >= ${threshold}
-    ) t
+    )
+    SELECT
+      COUNT(*) FILTER (WHERE s >= ${threshold})::int AS higher,
+      COUNT(*)::int AS probes_with_history
+    FROM manager_totals
   `;
-  return rows[0]?.higher ?? 0;
+  const row = rows[0];
+  return {
+    higher: row?.higher ?? 0,
+    probesWithHistory: row?.probes_with_history ?? 0,
+  };
 };
 
 // Total probes in the stratum: active + inactive + trolling + fetch_failed.
 // Used for the `sample_size` reported to the UI (cron progress indicator).
 // NOT the right denominator for the Bernoulli-urn extrapolation — see
-// `probesWithHistoryInStratum` below for that.
+// `stratumCounts.probesWithHistory` for that.
 const totalProbesInStratum = async (stratum: 1 | 2 | 3): Promise<number> => {
   return prisma.manager_summary.count({ where: { stratum } });
-};
-
-// Probes in the stratum that actually have a manager_history row inside
-// the queried GW range. This is the correct denominator for the
-// Bernoulli urn — only these probes are eligible to satisfy the
-// `SUM(points) >= threshold` condition. Late joiners (no early-GW
-// history) and fetch_failed probes are excluded because they can never
-// be in the numerator regardless of their true score.
-//
-// Pairing this with a stratum-3 trueSize derived from `rankedAtEnd[gw]`
-// (rather than current `cMax`) removes the late-joiner inflation that
-// previously biased early-range queries by ~25%: cMax/probes was ~197×
-// per probe, but the correct ranked-at-GW4 / probes-with-GW4-history
-// ratio is ~158× — exactly the gap between observed and expected ranks.
-const probesWithHistoryInStratum = async (
-  stratum: 1 | 2 | 3,
-  startGw: number,
-  endGw: number,
-): Promise<number> => {
-  const rows = await prisma.$queryRaw<Array<{ count: number }>>`
-    SELECT COUNT(DISTINCT mh.entry_id)::int AS count
-    FROM manager_history mh
-    JOIN manager_summary ms ON ms.entry_id = mh.entry_id
-    WHERE mh.gw BETWEEN ${startGw} AND ${endGw}
-      AND ms.stratum = ${stratum}
-  `;
-  return rows[0]?.count ?? 0;
 };
 
 const rankedCountForGw = async (gw: number): Promise<number | null> => {
@@ -216,16 +206,19 @@ export const getRangeRank = async (
   // trueSize: the true population that *was* ranked over the range. For
   // stratum 3 this scales with `rankedAtEnd`, not `cMax`, fixing the
   // ~25% over-estimate observed on early-range queries.
+  // Run the three stratum aggregations in parallel — each is independent
+  // and the dominant cost is the manager_history scan on stratum 3.
+  // Without parallelism the 3 strata serialise to ~9–10s on the prod box.
+  const stratumResults = await Promise.all(
+    ALL_STRATA.map((s) => stratumCounts(s, startGw, endGw, rangeTotal)),
+  );
+
   let totalHigher = 0;
-  for (const s of ALL_STRATA) {
-    const probesWithHistory = await probesWithHistoryInStratum(
-      s,
-      startGw,
-      endGw,
-    );
-    if (probesWithHistory === 0) continue;
-    const higherInS = await countHigherInStratum(s, startGw, endGw, rangeTotal);
-    totalHigher += Math.round((higherInS * trueSize[s]) / probesWithHistory);
+  for (let i = 0; i < ALL_STRATA.length; i++) {
+    const s = ALL_STRATA[i] as 1 | 2 | 3;
+    const r = stratumResults[i];
+    if (!r || r.probesWithHistory === 0) continue;
+    totalHigher += Math.round((r.higher * trueSize[s]) / r.probesWithHistory);
   }
 
   // Sanity bound: the rank can't exceed how many managers were actually
