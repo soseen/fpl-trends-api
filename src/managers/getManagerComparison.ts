@@ -428,24 +428,23 @@ export const getManagerComparison = async (
   const userGwScore =
     eventsInRange.length > 0 ? userTotalPoints / eventsInRange.length : 0;
 
+  // Count chips played by the user in the range. Each chip-type gets two
+  // copies per season — one in the first half (GW1–19), one after the
+  // mid-season reset (GW20–38) — so this can be 0, 1, or 2 for ranges
+  // spanning the reset point. Backend reports the raw count; the UI
+  // decides how to surface it (e.g. "X / Y" or a filled bar).
   const chipsPlayedInRange = (history.chips ?? []).filter(
     (c) => c.event >= startGw && c.event <= endGw,
   );
-  const userWildcard = chipsPlayedInRange.some(
+  const userWildcard = chipsPlayedInRange.filter(
     (c) => c.name === CHIP_NAME_WILDCARD,
-  )
-    ? 1
-    : 0;
-  const userFreeHit = chipsPlayedInRange.some(
+  ).length;
+  const userFreeHit = chipsPlayedInRange.filter(
     (c) => c.name === CHIP_NAME_FREEHIT,
-  )
-    ? 1
-    : 0;
-  const userBenchBoost = chipsPlayedInRange.some(
+  ).length;
+  const userBenchBoost = chipsPlayedInRange.filter(
     (c) => c.name === CHIP_NAME_BBOOST,
-  )
-    ? 1
-    : 0;
+  ).length;
 
   // ---- Per-event aggregates from our DB (cheap; one query covers 1–38 rows).
   const events = await prisma.events.findMany({
