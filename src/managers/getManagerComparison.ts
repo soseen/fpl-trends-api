@@ -13,6 +13,30 @@ export type ComparisonStat = {
   top100k_average: number | null;
 };
 
+// Sample-side rates for one half-season slice. Each value is a fraction
+// (0..1) of sampled managers in that stratum who played the chip in this
+// slice of the requested range.
+export type ChipHalfStat = {
+  average: number | null;
+  top10k_average: number | null;
+  top100k_average: number | null;
+};
+
+// Chip stat with first-half / second-half breakdown. Each chip type comes
+// in two copies per season (one in GW1–19, one in GW20–38), so the UI
+// renders them as two side-by-side bars whenever the requested range
+// spans the GW20 reset.
+//
+// `h1` / `h2` are null for the half the range doesn't overlap — caller
+// uses that as the signal to render a single bar.
+//
+// `user` is the raw count of chips the user played in range (0, 1, or 2).
+export type ChipUsageStat = {
+  user: number;
+  h1: ChipHalfStat | null;
+  h2: ChipHalfStat | null;
+};
+
 export type CaptainSummary = {
   user_player_id: number | null;
   user_player_name: string | null;
@@ -38,11 +62,10 @@ export type ManagerComparisonResponse = {
   end_gw: number;
   total_points: ComparisonStat;
   transfers: ComparisonStat;
-  // Chip stats: user is 0 or 1 (played within range or not). Average is the
-  // fraction of FPL managers (0..1) who played that chip in the range.
-  wildcards: ComparisonStat;
-  free_hits: ComparisonStat;
-  bench_boosts: ComparisonStat;
+  // Chips have a first-half / second-half breakdown — see ChipUsageStat.
+  wildcards: ChipUsageStat;
+  free_hits: ChipUsageStat;
+  bench_boosts: ChipUsageStat;
   hits: ComparisonStat;
   bench_points: ComparisonStat;
   // Sum of (captained_player_points × (multiplier − 1)) across the range.
@@ -261,7 +284,11 @@ const sampleMostCaptained = async (
 };
 
 // Per-stratum aggregate: average per-manager total points, transfers, hits,
-// bench points, GW score, plus chip rates from manager_picks.
+// bench points, GW score, plus chip usage split by season half from
+// manager_picks. Each chip type has two copies per season — one usable
+// in GW1–19, one after the GW20 reset — so the per-half breakdown is
+// what UI bars actually want to display.
+const SEASON_FIRST_HALF_LAST_GW = 19;
 const sampleStratumAggregates = async (
   startGw: number,
   endGw: number,
@@ -272,9 +299,15 @@ const sampleStratumAggregates = async (
   avg_hits: number | null;
   avg_bench: number | null;
   avg_gw_score: number | null;
-  wildcards_rate: number | null;
-  free_hits_rate: number | null;
-  bench_boosts_rate: number | null;
+  // Per-half rates: fraction of sampled managers in this stratum who played
+  // that chip in the given half slice of the requested range. Null when
+  // the requested range doesn't overlap that half (caller short-circuits).
+  wildcards_h1_rate: number | null;
+  wildcards_h2_rate: number | null;
+  free_hits_h1_rate: number | null;
+  free_hits_h2_rate: number | null;
+  bench_boosts_h1_rate: number | null;
+  bench_boosts_h2_rate: number | null;
   sample_size: number;
   with_hits_data: number;
   with_bench_data: number;
@@ -334,21 +367,30 @@ const sampleStratumAggregates = async (
 
   const histRow = histRows[0];
 
-  // Chip rates from manager_picks. Rate = chip_plays_in_sample / sample_size,
-  // matching the existing event-level avg semantics.
+  // Chip rates split by season half. Rate = distinct managers in stratum
+  // who played that chip in the half-slice of the requested range,
+  // divided by total sampled managers (anyone with picks data in range).
+  // 100% therefore reads as "every sampled manager played their available
+  // copy of this chip in this half."
   const chipRows = await prisma.$queryRawUnsafe<
     Array<{
-      wildcards: number;
-      free_hits: number;
-      bench_boosts: number;
+      wildcards_h1: number;
+      wildcards_h2: number;
+      free_hits_h1: number;
+      free_hits_h2: number;
+      bench_boosts_h1: number;
+      bench_boosts_h2: number;
       sample_size: number;
     }>
   >(
     `
     SELECT
-      SUM(CASE WHEN mp.active_chip = 'wildcard' THEN 1 ELSE 0 END)::int AS wildcards,
-      SUM(CASE WHEN mp.active_chip = 'freehit'  THEN 1 ELSE 0 END)::int AS free_hits,
-      SUM(CASE WHEN mp.active_chip = 'bboost'   THEN 1 ELSE 0 END)::int AS bench_boosts,
+      COUNT(DISTINCT CASE WHEN mp.active_chip = 'wildcard' AND mp.gw <= $3 THEN mp.entry_id END)::int AS wildcards_h1,
+      COUNT(DISTINCT CASE WHEN mp.active_chip = 'wildcard' AND mp.gw >  $3 THEN mp.entry_id END)::int AS wildcards_h2,
+      COUNT(DISTINCT CASE WHEN mp.active_chip = 'freehit'  AND mp.gw <= $3 THEN mp.entry_id END)::int AS free_hits_h1,
+      COUNT(DISTINCT CASE WHEN mp.active_chip = 'freehit'  AND mp.gw >  $3 THEN mp.entry_id END)::int AS free_hits_h2,
+      COUNT(DISTINCT CASE WHEN mp.active_chip = 'bboost'   AND mp.gw <= $3 THEN mp.entry_id END)::int AS bench_boosts_h1,
+      COUNT(DISTINCT CASE WHEN mp.active_chip = 'bboost'   AND mp.gw >  $3 THEN mp.entry_id END)::int AS bench_boosts_h2,
       COUNT(DISTINCT mp.entry_id)::int AS sample_size
     FROM manager_picks mp
     JOIN manager_summary ms ON ms.entry_id = mp.entry_id
@@ -358,10 +400,13 @@ const sampleStratumAggregates = async (
   `,
     startGw,
     endGw,
+    SEASON_FIRST_HALF_LAST_GW,
   );
 
   const chipRow = chipRows[0];
   const picksSampleSize = chipRow?.sample_size ?? 0;
+  const rateOrNull = (count: number | undefined): number | null =>
+    picksSampleSize > 0 ? (count ?? 0) / picksSampleSize : null;
 
   return {
     avg_total_points: histRow?.avg_total_points ?? null,
@@ -369,14 +414,12 @@ const sampleStratumAggregates = async (
     avg_hits: histRow?.avg_hits ?? null,
     avg_bench: histRow?.avg_bench ?? null,
     avg_gw_score: histRow?.avg_gw_score ?? null,
-    wildcards_rate:
-      picksSampleSize > 0 ? (chipRow?.wildcards ?? 0) / picksSampleSize : null,
-    free_hits_rate:
-      picksSampleSize > 0 ? (chipRow?.free_hits ?? 0) / picksSampleSize : null,
-    bench_boosts_rate:
-      picksSampleSize > 0
-        ? (chipRow?.bench_boosts ?? 0) / picksSampleSize
-        : null,
+    wildcards_h1_rate: rateOrNull(chipRow?.wildcards_h1),
+    wildcards_h2_rate: rateOrNull(chipRow?.wildcards_h2),
+    free_hits_h1_rate: rateOrNull(chipRow?.free_hits_h1),
+    free_hits_h2_rate: rateOrNull(chipRow?.free_hits_h2),
+    bench_boosts_h1_rate: rateOrNull(chipRow?.bench_boosts_h1),
+    bench_boosts_h2_rate: rateOrNull(chipRow?.bench_boosts_h2),
     sample_size: histRow?.sample_size ?? 0,
     with_hits_data: histRow?.with_hits_data ?? 0,
     with_bench_data: histRow?.with_bench_data ?? 0,
@@ -460,20 +503,65 @@ export const getManagerComparison = async (
 
   let avgTotalPoints = 0;
   let avgTransfersTotal = 0;
-  let avgWildcardRate = 0;
-  let avgFreeHitRate = 0;
-  let avgBenchBoostRate = 0;
+  // Event-level chip rates split by season half. Each is summed across
+  // events that fall in the requested range and the relevant half slice.
+  // For non-spanning ranges only one half accumulates anything.
+  const chipHalfRates = {
+    wildcard_h1: 0,
+    wildcard_h2: 0,
+    freehit_h1: 0,
+    freehit_h2: 0,
+    bboost_h1: 0,
+    bboost_h2: 0,
+  };
 
   for (const ev of events) {
     avgTotalPoints += ev.average_entry_score;
     if (ev.ranked_count > 0) {
       avgTransfersTotal += ev.transfers_made / ev.ranked_count;
       const cp = ev.chip_plays as ChipPlay[] | null;
-      avgWildcardRate += sumChipPlays(cp, CHIP_NAME_WILDCARD) / ev.ranked_count;
-      avgFreeHitRate += sumChipPlays(cp, CHIP_NAME_FREEHIT) / ev.ranked_count;
-      avgBenchBoostRate += sumChipPlays(cp, CHIP_NAME_BBOOST) / ev.ranked_count;
+      const isH1 = ev.id <= SEASON_FIRST_HALF_LAST_GW;
+      const wcKey = isH1 ? "wildcard_h1" : "wildcard_h2";
+      const fhKey = isH1 ? "freehit_h1" : "freehit_h2";
+      const bbKey = isH1 ? "bboost_h1" : "bboost_h2";
+      chipHalfRates[wcKey] +=
+        sumChipPlays(cp, CHIP_NAME_WILDCARD) / ev.ranked_count;
+      chipHalfRates[fhKey] +=
+        sumChipPlays(cp, CHIP_NAME_FREEHIT) / ev.ranked_count;
+      chipHalfRates[bbKey] +=
+        sumChipPlays(cp, CHIP_NAME_BBOOST) / ev.ranked_count;
     }
   }
+
+  // Range overlap with each half. Used to null out the side that doesn't
+  // apply so the UI can show a single bar instead of an empty second bar.
+  const overlapsH1 = startGw <= SEASON_FIRST_HALF_LAST_GW;
+  const overlapsH2 = endGw > SEASON_FIRST_HALF_LAST_GW;
+  const buildChipStat = (
+    user: number,
+    avgH1: number,
+    avgH2: number,
+    top10kH1: number | null,
+    top10kH2: number | null,
+    top100kH1: number | null,
+    top100kH2: number | null,
+  ): ChipUsageStat => ({
+    user,
+    h1: overlapsH1
+      ? {
+          average: avgH1,
+          top10k_average: top10kH1,
+          top100k_average: top100kH1,
+        }
+      : null,
+    h2: overlapsH2
+      ? {
+          average: avgH2,
+          top10k_average: top10kH2,
+          top100k_average: top100kH2,
+        }
+      : null,
+  });
 
   // ---- Sample-side per-stratum aggregates (active + top-10k + top-100k).
   const [activeAgg, top10kAgg, top100kAgg] = await Promise.all([
@@ -572,24 +660,33 @@ export const getManagerComparison = async (
       top10k_average: top10kAgg.avg_transfers,
       top100k_average: top100kAgg.avg_transfers,
     },
-    wildcards: {
-      user: userWildcard,
-      average: avgWildcardRate,
-      top10k_average: top10kAgg.wildcards_rate,
-      top100k_average: top100kAgg.wildcards_rate,
-    },
-    free_hits: {
-      user: userFreeHit,
-      average: avgFreeHitRate,
-      top10k_average: top10kAgg.free_hits_rate,
-      top100k_average: top100kAgg.free_hits_rate,
-    },
-    bench_boosts: {
-      user: userBenchBoost,
-      average: avgBenchBoostRate,
-      top10k_average: top10kAgg.bench_boosts_rate,
-      top100k_average: top100kAgg.bench_boosts_rate,
-    },
+    wildcards: buildChipStat(
+      userWildcard,
+      chipHalfRates.wildcard_h1,
+      chipHalfRates.wildcard_h2,
+      top10kAgg.wildcards_h1_rate,
+      top10kAgg.wildcards_h2_rate,
+      top100kAgg.wildcards_h1_rate,
+      top100kAgg.wildcards_h2_rate,
+    ),
+    free_hits: buildChipStat(
+      userFreeHit,
+      chipHalfRates.freehit_h1,
+      chipHalfRates.freehit_h2,
+      top10kAgg.free_hits_h1_rate,
+      top10kAgg.free_hits_h2_rate,
+      top100kAgg.free_hits_h1_rate,
+      top100kAgg.free_hits_h2_rate,
+    ),
+    bench_boosts: buildChipStat(
+      userBenchBoost,
+      chipHalfRates.bboost_h1,
+      chipHalfRates.bboost_h2,
+      top10kAgg.bench_boosts_h1_rate,
+      top10kAgg.bench_boosts_h2_rate,
+      top100kAgg.bench_boosts_h1_rate,
+      top100kAgg.bench_boosts_h2_rate,
+    ),
     hits: {
       user: userHits,
       average: avgHits,
