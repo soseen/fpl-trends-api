@@ -31,6 +31,18 @@ export type PlayerImpactGwBreakdown = {
   eo: number;
   excess: number;
   rank_impact_gw: number;
+  // Match events for this GW. Same fields as `history.*` aggregated
+  // across DGW fixtures. The frontend uses these to break down WHY a
+  // player got a given score (1 G + 1 A vs 8 D + clean sheet, etc.)
+  // and to highlight threshold-met defcon bonuses inline.
+  minutes: number;
+  goals: number;
+  assists: number;
+  clean_sheets: number;
+  goals_conceded: number;
+  defensive_contribution: number;
+  saves: number;
+  bonus: number;
 };
 
 export type PlayerImpact = {
@@ -274,6 +286,18 @@ type PerGwPlayerStat = {
   total_points: number;
   selected: number;
   ranked_count: number;
+  // Match events accumulated across all fixtures in this GW (DGWs sum,
+  // single GWs are just the one row). Surfaced in the per-player
+  // accordion's per-GW breakdown so users can see WHY a player got a
+  // given score, not just the score itself.
+  goals: number;
+  assists: number;
+  clean_sheets: number;
+  goals_conceded: number;
+  defensive_contribution: number;
+  saves: number;
+  bonus: number;
+  minutes: number;
 };
 
 // Map keyed by `${player_id}:${gw}`.
@@ -286,6 +310,12 @@ const fetchPlayerGwStats = async (
   if (playerIds.length === 0) return map;
 
   // Sum across multi-fixture rows in the same GW (DGWs / postponements).
+  // `clean_sheets` is special: in DGWs FPL credits the keeper / defender
+  // a CS only if BOTH fixtures were clean (sum == fixture_count). For
+  // simplicity we use SUM here too — for a single-fixture GW it's
+  // exactly clean_sheets ∈ {0,1}; for the rare DGW it's 0/1/2 which
+  // the UI can render as "1 of 2" or just the count. Same logic for
+  // goals_conceded.
   const rows = await prisma.$queryRawUnsafe<
     Array<{
       footballer_id: number;
@@ -293,6 +323,14 @@ const fetchPlayerGwStats = async (
       total_points: number;
       selected: number;
       ranked_count: number;
+      goals: number;
+      assists: number;
+      clean_sheets: number;
+      goals_conceded: number;
+      defensive_contribution: number;
+      saves: number;
+      bonus: number;
+      minutes: number;
     }>
   >(
     `
@@ -301,7 +339,15 @@ const fetchPlayerGwStats = async (
       h.round,
       SUM(h.total_points)::int AS total_points,
       MAX(h.selected)::int AS selected,
-      COALESCE(MAX(e.ranked_count), 0)::int AS ranked_count
+      COALESCE(MAX(e.ranked_count), 0)::int AS ranked_count,
+      SUM(h.goals_scored)::int AS goals,
+      SUM(h.assists)::int AS assists,
+      SUM(h.clean_sheets)::int AS clean_sheets,
+      SUM(h.goals_conceded)::int AS goals_conceded,
+      COALESCE(SUM(h.defensive_contribution), 0)::int AS defensive_contribution,
+      SUM(h.saves)::int AS saves,
+      SUM(h.bonus)::int AS bonus,
+      SUM(h.minutes)::int AS minutes
     FROM history h
     LEFT JOIN events e ON e.id = h.round
     WHERE h.round BETWEEN $1 AND $2
@@ -317,6 +363,14 @@ const fetchPlayerGwStats = async (
       total_points: r.total_points,
       selected: r.selected,
       ranked_count: r.ranked_count,
+      goals: r.goals,
+      assists: r.assists,
+      clean_sheets: r.clean_sheets,
+      goals_conceded: r.goals_conceded,
+      defensive_contribution: r.defensive_contribution,
+      saves: r.saves,
+      bonus: r.bonus,
+      minutes: r.minutes,
     });
   }
   return map;
@@ -777,6 +831,18 @@ export const getTeamImpact = async (
       eo,
       excess,
       rank_impact_gw: rankImpactGw,
+      // Match events for the breakdown UI. Default to 0 when we have
+      // no history row for this (player, gw) pair — happens when the
+      // player was a non-playing pick (suspended/injured) and never
+      // appeared in a fixture.
+      minutes: stat?.minutes ?? 0,
+      goals: stat?.goals ?? 0,
+      assists: stat?.assists ?? 0,
+      clean_sheets: stat?.clean_sheets ?? 0,
+      goals_conceded: stat?.goals_conceded ?? 0,
+      defensive_contribution: stat?.defensive_contribution ?? 0,
+      saves: stat?.saves ?? 0,
+      bonus: stat?.bonus ?? 0,
     });
   }
 
