@@ -53,15 +53,28 @@ const pickStratum = (
   return null;
 };
 
+// Stratum 3 sub-sampling factor for the slow path. We have ~625k stratum-3
+// probes accumulated; querying SUM(points) over all of them × 34 GWs scans
+// ~21M manager_history rows and takes 8–10s end-to-end on the prod box.
+//
+// `entry_id % SAMPLE_DIVISOR_S3 = 0` filters that to ~21k probes, scanning
+// ~700k rows. Roughly an order of magnitude faster while preserving the
+// Bernoulli-urn ratio: the formula `higherInS × trueSize / probesWithHistory`
+// is invariant to scaling both numerator and denominator by the same
+// constant, and `entry_id mod K` is statistically independent of every
+// covariate that matters (current_rank, range total, joining GW, etc.).
+//
+// We don't apply this to S1 / S2 — those strata are tiny (10k / 90k) and
+// already censused, so sub-sampling there would just inject variance.
+const SAMPLE_DIVISOR_S3 = 30;
+
 // Returns both `higher` (managers in the stratum whose summed range points
 // >= threshold) and `probes_with_history` (managers in the stratum with at
 // least one manager_history row in [startGw, endGw]) in a single SQL
 // round-trip.
 //
-// Combining the two saves a full re-scan of `manager_history` per stratum:
-// previously each request did 6 sequential aggregations (3 strata × 2
-// queries), each scanning ~25M rows for stratum 3. With this single-CTE
-// form we drop to 3 round-trips total and the CTE is materialised once.
+// For stratum 3 we apply a deterministic `entry_id % K = 0` sub-sample
+// to keep the manager_history scan bounded; see SAMPLE_DIVISOR_S3 above.
 //
 // Includes inactive/trolling managers — they DO have `manager_history`
 // rows (see populateManagers.ts where history is upserted regardless of
@@ -75,22 +88,31 @@ const stratumCounts = async (
   endGw: number,
   threshold: number,
 ): Promise<{ higher: number; probesWithHistory: number }> => {
-  const rows = await prisma.$queryRaw<
+  const subSampleClause =
+    stratum === 3 ? `AND mh.entry_id % ${SAMPLE_DIVISOR_S3} = 0` : ``;
+  const rows = await prisma.$queryRawUnsafe<
     Array<{ higher: number; probes_with_history: number }>
-  >`
+  >(
+    `
     WITH manager_totals AS (
       SELECT mh.entry_id, SUM(mh.points)::int AS s
       FROM manager_history mh
       JOIN manager_summary ms ON ms.entry_id = mh.entry_id
-      WHERE mh.gw BETWEEN ${startGw} AND ${endGw}
-        AND ms.stratum = ${stratum}
+      WHERE mh.gw BETWEEN $1 AND $2
+        AND ms.stratum = $3
+        ${subSampleClause}
       GROUP BY mh.entry_id
     )
     SELECT
-      COUNT(*) FILTER (WHERE s >= ${threshold})::int AS higher,
+      COUNT(*) FILTER (WHERE s >= $4)::int AS higher,
       COUNT(*)::int AS probes_with_history
     FROM manager_totals
-  `;
+    `,
+    startGw,
+    endGw,
+    stratum,
+    threshold,
+  );
   const row = rows[0];
   return {
     higher: row?.higher ?? 0,
@@ -98,10 +120,8 @@ const stratumCounts = async (
   };
 };
 
-// Total probes in the stratum: active + inactive + trolling + fetch_failed.
-// Used for the `sample_size` reported to the UI (cron progress indicator).
-// NOT the right denominator for the Bernoulli-urn extrapolation — see
-// `stratumCounts.probesWithHistory` for that.
+// Probe count per stratum, surfaced to the UI's accuracy meter only — not
+// involved in the rank math (which uses probesWithHistory from the SQL above).
 const totalProbesInStratum = async (stratum: 1 | 2 | 3): Promise<number> => {
   return prisma.manager_summary.count({ where: { stratum } });
 };
@@ -142,6 +162,39 @@ export const getRangeRank = async (
   const overallRank = summary.summary_overall_rank;
   const totalPoints = summary.summary_overall_points ?? null;
 
+  // ---------------------------------------------------------------------
+  // FAST PATH: startGw === 1.
+  //
+  // FPL's history endpoint returns `overall_rank` per GW — that field IS
+  // the user's cumulative rank at the end of that GW. For any GW1-to-N
+  // query, that value is the exact answer; we don't need our sample,
+  // our SQL, or our extrapolation. This covers >90% of UI traffic
+  // (the default range slider sits at GW1–latest_finished) and turns
+  // a 5–10s estimation into a sub-100ms passthrough.
+  //
+  // The slow path below is reserved for genuinely partial ranges
+  // (startGw > 1) — e.g. "how did I rank just over GW20–34" — where
+  // there's no FPL-stored answer and we genuinely must estimate.
+  // ---------------------------------------------------------------------
+  if (startGw === 1 && overallRankAfter !== null) {
+    return {
+      entry_id: entryId,
+      overall_rank: overallRank,
+      total_points: totalPoints,
+      range_rank: overallRankAfter,
+      range_total: rangeTotal,
+      overall_rank_before: overallRankBefore,
+      overall_rank_after: overallRankAfter,
+      start_gw: startGw,
+      end_gw: endGw,
+      stratum_used: stratum,
+      // FPL is the source of truth for cumulative-from-GW1 ranks, so
+      // the answer is exact regardless of our sample state.
+      confidence: "exact",
+      sample_size: stratum === null ? 0 : await totalProbesInStratum(stratum),
+    };
+  }
+
   // Resolve the historical ranked_count for the end of the query range.
   // Stratum 3's true population at that point in time was
   // `rankedAtEnd - 100k`, NOT `cMax - 100k`. Using cMax (current
@@ -157,25 +210,18 @@ export const getRangeRank = async (
     3: Math.max(effectiveCMax - STRATUM_B_MAX, 1),
   };
 
-  // Total probes per stratum — only used to report `sample_size` to the UI
-  // and to detect the boot state. The rank math uses
-  // `probesWithHistoryByStratum` below, which excludes late joiners and
-  // fetch_failed probes.
-  const [probes1, probes2, probes3] = (await Promise.all(
-    ALL_STRATA.map((s) => totalProbesInStratum(s)),
-  )) as [number, number, number];
-  const probesByStratum: Record<1 | 2 | 3, number> = {
-    1: probes1,
-    2: probes2,
-    3: probes3,
-  };
+  // The UI's accuracy meter only cares about the user's own stratum
+  // probe count — three separate count() queries to feed it was wasteful.
+  // For stratum-1 census detection we only need to know if S1 specifically
+  // is full; that check happens inline below using the per-stratum result.
+  const userStratumProbes =
+    stratum === null ? 0 : await totalProbesInStratum(stratum);
 
-  const userStratumProbes = stratum === null ? 0 : probesByStratum[stratum];
-
-  // Boot state: no managers ingested yet at all. Surface null so the UI can
-  // render "—" honestly rather than fabricate a rank.
-  const totalProbesAll = probes1 + probes2 + probes3;
-  if (totalProbesAll === 0) {
+  // Boot state: no managers ingested in the user's stratum yet. Surface
+  // null so the UI shows "—" rather than a fabricated rank from an empty
+  // sample. (We only need to detect this for the user's stratum because
+  // the slow path uses the user's stratum to gate confidence reporting.)
+  if (userStratumProbes === 0) {
     return {
       entry_id: entryId,
       overall_rank: overallRank,
@@ -227,11 +273,11 @@ export const getRangeRank = async (
   const cap = rankedAtEnd ?? Number.MAX_SAFE_INTEGER;
   const rangeRank = Math.max(1, Math.min(totalHigher + 1, cap));
 
-  // "exact" only when the user is in stratum 1 and we have a full census of
-  // it. Anything else is an extrapolated estimate. `approximate` is reserved
-  // for the no-data boot state handled above.
-  const confidence =
-    stratum === 1 && probesByStratum[1] >= trueSize[1] ? "exact" : "estimated";
+  // The slow path is always an extrapolation (we got here only when
+  // startGw > 1, which has no FPL-stored cumulative answer). Stratum-1
+  // users on a startGw=1 query already took the fast path above, so we
+  // can't reach here with a guaranteed-exact case.
+  const confidence: "exact" | "estimated" = "estimated";
 
   return {
     entry_id: entryId,
