@@ -90,14 +90,40 @@ const findMissingPairs = async (
   return rows;
 };
 
+const isHttpStatus = (err: unknown, status: number): boolean => {
+  if (typeof err !== "object" || err === null || !("response" in err)) {
+    return false;
+  }
+  const r = (err as { response?: { status?: number } }).response;
+  return r?.status === status;
+};
+
 const fetchAndStorePicks = async (
   entryId: number,
   gw: number,
   governor: RateLimitGovernor,
 ): Promise<void> => {
-  const payload = await withGovernor(governor, () =>
-    fetchEntryEventPicks(entryId, gw),
-  );
+  let payload;
+  try {
+    payload = await withGovernor(governor, () =>
+      fetchEntryEventPicks(entryId, gw),
+    );
+  } catch (err) {
+    // 404 = manager deleted / banned by FPL since we last sampled them.
+    // Tag them in manager_summary so the next backfill run's
+    // `findMissingPairs` filter (rejected_reason IS NULL) excludes them
+    // — otherwise we'd burn API calls on the same dead entries forever.
+    // The flag is set per-entry, not per-(entry,gw): one 404 implies
+    // the whole account is gone, so all remaining (entry, gw) pairs
+    // for them are wasted.
+    if (isHttpStatus(err, 404)) {
+      await prisma.manager_summary.update({
+        where: { entry_id: entryId },
+        data: { rejected_reason: "fetch_failed" },
+      });
+    }
+    throw err;
+  }
   const { captain_element, vice_captain_element, captain_multiplier } =
     summarizePicks(payload.picks ?? []);
   await prisma.manager_picks.upsert({
@@ -123,37 +149,52 @@ const ingestStratum = async (
   stratum: 1 | 2 | 3,
   currentGw: number,
   governor: RateLimitGovernor,
-): Promise<{ done: number; failed: number }> => {
+): Promise<{ done: number; failed: number; skipped: number }> => {
   const pairs = await findMissingPairs(stratum, currentGw);
   console.info(
     `[backfillPicks] stratum ${stratum}: ${pairs.length} missing (manager, gw) pairs.`,
   );
   let done = 0;
   let failed = 0;
+  let skipped = 0;
+  // An entry that 404s on any of its GWs is dead at FPL's end (deleted /
+  // banned). It's already been tagged `fetch_failed` in DB by
+  // fetchAndStorePicks for the next run, but the rest of THIS run's
+  // pairs for that entry are still in the in-memory `pairs` array.
+  // Track them in this set so we skip them without a network call.
+  const deadEntries = new Set<number>();
   for (let i = 0; i < pairs.length; i += BATCH_SIZE) {
     if (governor.shouldAbort) break;
     const batch = pairs.slice(i, i + BATCH_SIZE);
     await Promise.all(
       batch.map(async (pair) => {
+        if (deadEntries.has(pair.entry_id)) {
+          skipped += 1;
+          return;
+        }
         try {
           await fetchAndStorePicks(pair.entry_id, pair.gw, governor);
           done += 1;
-        } catch {
+        } catch (err) {
           failed += 1;
+          if (isHttpStatus(err, 404)) deadEntries.add(pair.entry_id);
         }
       }),
     );
-    if ((done + failed) % PROGRESS_INTERVAL === 0 && done + failed > 0) {
+    if (
+      (done + failed + skipped) % PROGRESS_INTERVAL === 0 &&
+      done + failed > 0
+    ) {
       console.info(
-        `[backfillPicks] stratum ${stratum}: ${done} done, ${failed} failed, ${pairs.length - done - failed} remaining`,
+        `[backfillPicks] stratum ${stratum}: ${done} done, ${failed} failed, ${skipped} skipped (dead entry), ${pairs.length - done - failed - skipped} remaining`,
       );
     }
     await delay(governor.interBatchDelayMs);
   }
   console.info(
-    `[backfillPicks] stratum ${stratum}: complete (${done} done, ${failed} failed).`,
+    `[backfillPicks] stratum ${stratum}: complete (${done} done, ${failed} failed, ${skipped} skipped).`,
   );
-  return { done, failed };
+  return { done, failed, skipped };
 };
 
 export const backfillPicks = async (
@@ -173,14 +214,16 @@ export const backfillPicks = async (
 
   let totalDone = 0;
   let totalFailed = 0;
+  let totalSkipped = 0;
   for (const stratum of [1, 2, 3] as const) {
     if (governor.shouldAbort) break;
     const result = await ingestStratum(stratum, currentGw, governor);
     totalDone += result.done;
     totalFailed += result.failed;
+    totalSkipped += result.skipped;
   }
   console.info(
-    `[backfillPicks] all strata complete: ${totalDone} done, ${totalFailed} failed (governor aborted: ${governor.shouldAbort}).`,
+    `[backfillPicks] all strata complete: ${totalDone} done, ${totalFailed} failed, ${totalSkipped} skipped (governor aborted: ${governor.shouldAbort}).`,
   );
 };
 

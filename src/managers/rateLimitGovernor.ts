@@ -60,6 +60,23 @@ export class RateLimitGovernor {
   }
 
   async noteError(error: unknown): Promise<void> {
+    const status = extractStatus(error);
+
+    // 404 = the specific entry/event doesn't exist (manager deleted, banned,
+    // or never existed at this entry_id). It's a *per-call* permanent
+    // failure, NOT a signal that the API is unhappy with us. Treating it
+    // like a transient error trips the consecutive-errors abort during
+    // backfills of large strata that always have a few dead entries
+    // sprinkled through. Treat 404 as a soft skip: don't count it toward
+    // the consecutive-error budget, don't pause, just bubble up so the
+    // caller can record the per-entry failure and move on.
+    if (status === 404) {
+      // Reset successStreak so a fresh streak after the 404 still has to
+      // earn its delay-decay, but leave consecutiveErrors alone.
+      this.successStreak = 0;
+      return;
+    }
+
     this.consecutiveErrors += 1;
     this.successStreak = 0;
 
@@ -71,7 +88,6 @@ export class RateLimitGovernor {
       return;
     }
 
-    const status = extractStatus(error);
     const retryAfterMs = extractRetryAfterMs(error);
 
     if (status === 429 || status === 503) {
