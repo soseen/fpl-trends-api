@@ -71,21 +71,85 @@ const HISTORY_BATCH_SIZE = 8;
 const CURSOR_KEY_A = "manager_ingest_cursor_a";
 const CURSOR_KEY_B = "manager_ingest_cursor_b";
 const LOCKFILE_PATH = path.join(os.tmpdir(), "fpl-populate-managers.lock");
-
-const acquireLock = (): boolean => {
-  try {
-    fs.writeFileSync(LOCKFILE_PATH, String(process.pid), { flag: "wx" });
-    return true;
-  } catch {
-    return false;
-  }
-};
+// Conservative max age — a normal run is ~13 min; anything older than this
+// can only mean the previous owner died without releasing.
+const LOCK_MAX_AGE_MS = 30 * 60 * 1000;
 
 const releaseLock = (): void => {
   try {
     fs.unlinkSync(LOCKFILE_PATH);
   } catch {
     /* ignore */
+  }
+};
+
+let cleanupRegistered = false;
+const registerLockCleanupHandlers = (): void => {
+  if (cleanupRegistered) return;
+  cleanupRegistered = true;
+  process.on("exit", releaseLock);
+  // Signal handlers must call exit explicitly — registering them suppresses
+  // Node's default-terminate behavior. Conventional exit codes are 128+signum.
+  process.on("SIGINT", () => process.exit(130));
+  process.on("SIGTERM", () => process.exit(143));
+};
+
+const isLockStale = (): boolean => {
+  let contents: string;
+  try {
+    contents = fs.readFileSync(LOCKFILE_PATH, "utf8");
+  } catch {
+    return false;
+  }
+
+  const pid = parseInt(contents.trim(), 10);
+  if (Number.isFinite(pid) && pid > 0) {
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (err) {
+      // ESRCH = process is gone. EPERM = exists but owned by another user
+      // (alive on this host) — leave it alone.
+      return (err as NodeJS.ErrnoException).code === "ESRCH";
+    }
+  }
+
+  // PID unparseable — fall back to mtime so a corrupt lockfile can still
+  // self-heal once it's well past any plausible run length.
+  try {
+    const stat = fs.statSync(LOCKFILE_PATH);
+    return Date.now() - stat.mtimeMs > LOCK_MAX_AGE_MS;
+  } catch {
+    return false;
+  }
+};
+
+const acquireLock = (): boolean => {
+  try {
+    fs.writeFileSync(LOCKFILE_PATH, String(process.pid), { flag: "wx" });
+    registerLockCleanupHandlers();
+    return true;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "EEXIST") return false;
+  }
+
+  if (!isLockStale()) return false;
+
+  console.warn(
+    "[populateManagers] Found stale lockfile — previous owner is gone, clearing and retrying.",
+  );
+  try {
+    fs.unlinkSync(LOCKFILE_PATH);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+  }
+
+  try {
+    fs.writeFileSync(LOCKFILE_PATH, String(process.pid), { flag: "wx" });
+    registerLockCleanupHandlers();
+    return true;
+  } catch {
+    return false;
   }
 };
 
@@ -593,5 +657,12 @@ export const populateManagers = async (
 };
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
-  await populateManagers();
+  // Looser abort threshold than the governor default. Stratum C iterates
+  // through random entry IDs; FPL returns 404 for accounts that never
+  // finished a GW, which the governor counts as an error. With 8 parallel
+  // requests, hitting 3 consecutive 404s is easy and was killing every
+  // run before C could do meaningful work. Real rate limiting (429/503)
+  // still triggers the dedicated 5-minute pause path — this only widens
+  // the bucket for unknown errors before giving up.
+  await populateManagers({ abortAfterConsecutiveErrors: 20 });
 }
