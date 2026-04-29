@@ -13,6 +13,7 @@ import { getManagerSummary } from "./managers/getManagerSummary.js";
 import { getRangeRank } from "./managers/getRangeRank.js";
 import { getManagerTrajectory } from "./managers/getManagerTrajectory.js";
 import { getManagerComparison } from "./managers/getManagerComparison.js";
+import { getTeamImpact } from "./managers/getTeamImpact.js";
 
 const app = express();
 const PORT = parseInt(process.env["PORT"] as string) || 3000;
@@ -180,6 +181,39 @@ app.get("/api/manager/:id/range-rank", async (req: Request, res: Response) => {
     }
     console.error(`Error computing range rank for ${id}:`, error);
     res.status(500).json({ error: "Failed to compute range rank." });
+  }
+});
+
+app.get("/api/manager/:id/team-impact", async (req: Request, res: Response) => {
+  const id = parseEntryId(req.params["id"] ?? "");
+  if (id === null) {
+    res.status(400).json({ error: "Invalid FPL ID." });
+    return;
+  }
+  const start = Number(req.query["start"]);
+  const end = Number(req.query["end"]);
+  if (
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    start < 1 ||
+    end < start ||
+    end > 38
+  ) {
+    res.status(400).json({ error: "Invalid gameweek range." });
+    return;
+  }
+  try {
+    const data = await getTeamImpact(id, start, end);
+    res.status(200).json(data);
+  } catch (error: unknown) {
+    const status = (error as { response?: { status?: number } }).response
+      ?.status;
+    if (status === 404) {
+      res.status(404).json({ error: "Manager not found." });
+      return;
+    }
+    console.error(`Error computing team impact for ${id}:`, error);
+    res.status(500).json({ error: "Failed to compute team impact." });
   }
 });
 

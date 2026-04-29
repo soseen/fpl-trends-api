@@ -295,3 +295,22 @@ model manager_picks {
   @@index([gw])
   @@index([captain_element])
 }
+
+// Full XV per (entry_id, gw) for users who have hit the team-impact endpoint.
+// Lazy-populated only on demand — we don't backfill the sample. The FPL
+// `multiplier` field is the post-finalised value (0 benched / 1 starter / 2
+// captain / 3 triple captain), already accounting for autosubs and bench
+// boost, so downstream code can treat it as ground truth.
+model manager_pick_elements {
+  entry_id   Int
+  gw         Int
+  element_id Int
+  position   Int // 1..15 (1..11 = starting, 12..15 = bench order)
+  multiplier Int // 0/1/2/3 — final, post-autosub, post-chip
+  is_captain Boolean
+  is_vice    Boolean
+  fetched_at DateTime @default(now())
+
+  @@id([entry_id, gw, element_id])
+  @@index([entry_id, gw])
+}
