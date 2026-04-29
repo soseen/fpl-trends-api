@@ -6,7 +6,6 @@ import { fileURLToPath } from "node:url";
 import { prisma } from "./client.js";
 import {
   fetchEntryHistory,
-  fetchEntrySummary,
   fetchLeagueStandingsPage,
   OVERALL_LEAGUE_ID,
 } from "../managers/fetchManager.js";
@@ -25,14 +24,6 @@ import {
 } from "../managers/rateLimitGovernor.js";
 import { delay } from "../utils.js";
 
-// ---- Stratum boundaries (must match getRangeRank.ts) ----
-// Stratum 3 upper bound is dynamic — derived from `events.ranked_count`
-// at runtime so it tracks FPL's growing tail. Fallback used only when no
-// finished GWs exist.
-const STRATUM_A_MAX = 10_000;
-const STRATUM_B_MAX = 100_000;
-const STRATUM_C_MAX_FALLBACK = 15_000_000;
-
 // Stratum A: full census of the top 10k. 200 pages × 50 entries.
 const STRATUM_A_LAST_PAGE = 200;
 // Stratum B: pages 201–2000. Stride 1 = full census of the 10k–100k cohort
@@ -45,11 +36,24 @@ const STRATUM_A_LAST_PAGE = 200;
 const STRATUM_B_FIRST_PAGE = 201;
 const STRATUM_B_LAST_PAGE = 2000;
 const STRATUM_B_PAGE_STRIDE = 1;
-// Stratum C: random ID probing in this range. Bumped past 13M so probes
-// can find managers in the deep tail FPL has grown into (>12.6M ranked
-// as of late season).
-const STRATUM_C_ID_MIN = 1;
-const STRATUM_C_ID_MAX = 15_000_000;
+// Stratum C: systematic 1-in-20 walk over the FPL standings tail. Each page
+// has 50 entries; stride 20 means we sample 50 of every 1000 ranked
+// managers, giving ~625k unique probes per pass over a 12.6M-ranked tail.
+//
+// We deliberately moved away from random-entry-ID probing here: random IDs
+// over-sampled engaged returning users (low IDs 1..3M) and undersampled
+// recent joiners (high IDs 10M+), which biased the rank-rank estimate by
+// ~12% even with very large samples. The standings page is FPL's own
+// ranking, which is exactly the population we want to extrapolate from —
+// so a systematic walk is unbiased by construction.
+//
+// LAST_PAGE 252_000 covers ranks up to 12.6M, comfortably above the
+// largest observed `events.ranked_count`. Pages past the live tail return
+// an empty `standings.results` array, which `ingestFromStandings` handles
+// gracefully (page advances, nothing recorded).
+const STRATUM_C_FIRST_PAGE = 2001;
+const STRATUM_C_LAST_PAGE = 252_000;
+const STRATUM_C_PAGE_STRIDE = 20;
 
 // Per-run safety cap. Cron fires every 15 min; at ~25 req/s sustained this
 // is ~13 min of work per run, leaving slack for governor backoffs and
@@ -70,6 +74,7 @@ const HISTORY_BATCH_SIZE = 8;
 
 const CURSOR_KEY_A = "manager_ingest_cursor_a";
 const CURSOR_KEY_B = "manager_ingest_cursor_b";
+const CURSOR_KEY_C = "manager_ingest_cursor_c";
 const LOCKFILE_PATH = path.join(os.tmpdir(), "fpl-populate-managers.lock");
 // Conservative max age — a normal run is ~13 min; anything older than this
 // can only mean the previous owner died without releasing.
@@ -205,21 +210,6 @@ const withGovernor = async <T>(
       if (attempts >= MAX_PER_CALL_RETRIES) throw err;
     }
   }
-};
-
-const stratumByRank = (rank: number, cMax: number): 1 | 2 | 3 | null => {
-  if (rank <= STRATUM_A_MAX) return 1;
-  if (rank <= STRATUM_B_MAX) return 2;
-  if (rank <= cMax) return 3;
-  return null;
-};
-
-const fetchStratumCMax = async (): Promise<number> => {
-  const row = await prisma.events.aggregate({
-    where: { finished: true },
-    _max: { ranked_count: true },
-  });
-  return row._max.ranked_count ?? STRATUM_C_MAX_FALLBACK;
 };
 
 type ProcessOutcome =
@@ -489,70 +479,6 @@ const ingestFromStandings = async ({
   }
 };
 
-// ---- Stratum C: random ID probing ----
-
-const randomEntryId = (): number =>
-  STRATUM_C_ID_MIN +
-  Math.floor(Math.random() * (STRATUM_C_ID_MAX - STRATUM_C_ID_MIN + 1));
-
-const ingestStratumC = async ({
-  budget,
-  currentGw,
-  cMax,
-  governor,
-  stats,
-}: {
-  budget: number;
-  currentGw: number;
-  cMax: number;
-  governor: RateLimitGovernor;
-  stats: Stats;
-}): Promise<void> => {
-  while (!governor.shouldAbort && stats.processed < budget) {
-    const probesThisBatch = Math.min(
-      HISTORY_BATCH_SIZE,
-      budget - stats.processed,
-    );
-    const ids = Array.from({ length: probesThisBatch }, () => randomEntryId());
-
-    const outcomes = await Promise.all(
-      ids.map(async (id) => {
-        let summary;
-        try {
-          summary = await withGovernor(governor, () => fetchEntrySummary(id));
-        } catch {
-          return "fetch_failed" as const;
-        }
-
-        const rank = summary.summary_overall_rank;
-        if (rank === null) return "out_of_stratum" as const;
-        const actualStratum = stratumByRank(rank, cMax);
-        if (actualStratum === null) return "out_of_stratum" as const;
-
-        // Random-ID hits that happen to land in stratum 1 or 2 used to be
-        // discarded as "out_of_stratum". Now we ingest them under their
-        // actual stratum — costs nothing extra (we already paid for the
-        // summary fetch) and trickles a few hundred extra refreshes per
-        // day into S1/S2, helping their stratum tags stay current.
-        try {
-          return await processEntry(
-            id,
-            rank,
-            summary.summary_overall_points ?? 0,
-            actualStratum,
-            currentGw,
-            governor,
-          );
-        } catch {
-          return "fetch_failed" as const;
-        }
-      }),
-    );
-    for (const o of outcomes) recordOutcome(stats, o);
-    await delay(governor.interBatchDelayMs);
-  }
-};
-
 export const populateManagers = async (
   governorConfig?: Partial<GovernorConfig>,
 ): Promise<void> => {
@@ -579,16 +505,18 @@ export const populateManagers = async (
       );
       return;
     }
-    const cMax = await fetchStratumCMax();
-
     const aPage = await readIntCursor(CURSOR_KEY_A, 1);
     const bPage = await readIntCursor(CURSOR_KEY_B, STRATUM_B_FIRST_PAGE);
+    const cPage = await readIntCursor(CURSOR_KEY_C, STRATUM_C_FIRST_PAGE);
 
     const aDone = aPage > STRATUM_A_LAST_PAGE;
     const bDone = bPage > STRATUM_B_LAST_PAGE;
 
     // Budget allocation: keep A moving while it has work, but always reserve
-    // some budget for C so the deep tail starts to fill from day one.
+    // the bulk of the budget for C so the deep tail fills as quickly as
+    // possible. C is now a systematic standings walk (1-in-20), unbiased
+    // by construction — sample size is the only remaining lever for
+    // accuracy, hence the large allocation.
     let budgetA = 0;
     let budgetB = 0;
     if (!aDone) {
@@ -601,7 +529,7 @@ export const populateManagers = async (
     const budgetC = MAX_MANAGERS_PER_RUN - budgetA - budgetB;
 
     console.info(
-      `[populateManagers] Starting: currentGw ${currentGw}, A page ${aPage}/${STRATUM_A_LAST_PAGE} (budget ${budgetA}), B page ${bPage}/${STRATUM_B_LAST_PAGE} (budget ${budgetB}), C random (budget ${budgetC})`,
+      `[populateManagers] Starting: currentGw ${currentGw}, A page ${aPage}/${STRATUM_A_LAST_PAGE} (budget ${budgetA}), B page ${bPage}/${STRATUM_B_LAST_PAGE} (budget ${budgetB}), C page ${cPage}/${STRATUM_C_LAST_PAGE} stride ${STRATUM_C_PAGE_STRIDE} (budget ${budgetC})`,
     );
 
     if (budgetA > 0) {
@@ -636,10 +564,14 @@ export const populateManagers = async (
 
     if (!governor.shouldAbort && budgetC > 0) {
       const target = stats.processed + budgetC;
-      await ingestStratumC({
+      await ingestFromStandings({
+        cursorKey: CURSOR_KEY_C,
+        startPage: STRATUM_C_FIRST_PAGE,
+        endPage: STRATUM_C_LAST_PAGE,
+        pageStride: STRATUM_C_PAGE_STRIDE,
+        stratum: 3,
         budget: target,
         currentGw,
-        cMax,
         governor,
         stats,
       });
@@ -657,12 +589,12 @@ export const populateManagers = async (
 };
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
-  // Looser abort threshold than the governor default. Stratum C iterates
-  // through random entry IDs; FPL returns 404 for accounts that never
-  // finished a GW, which the governor counts as an error. With 8 parallel
-  // requests, hitting 3 consecutive 404s is easy and was killing every
-  // run before C could do meaningful work. Real rate limiting (429/503)
-  // still triggers the dedicated 5-minute pause path — this only widens
-  // the bucket for unknown errors before giving up.
+  // Slightly looser abort threshold than the governor default. With the
+  // standings-walk approach, 404s are no longer routine — every entry
+  // returned by `fetchLeagueStandingsPage` is currently ranked, so
+  // `fetchEntryHistory` should succeed almost universally. Keeping a
+  // wider error budget guards against transient FPL hiccups during
+  // multi-hour buildup runs without masking real 429/503 problems
+  // (those still trip the dedicated 5-minute pause path).
   await populateManagers({ abortAfterConsecutiveErrors: 20 });
 }
