@@ -255,15 +255,16 @@ model events {
 }
 
 model manager_summary {
-  entry_id        Int               @id
+  entry_id        Int                  @id
   overall_rank    Int?
   total_points    Int?
   stratum         Int // 1=A (top 10k), 2=B (10k–100k), 3=C (100k–end-of-tail, dynamic)
-  rejected_reason String?           @db.VarChar(20) // null=active; "inactive" | "trolling" | "fetch_failed"
+  rejected_reason String?              @db.VarChar(20) // null=active; "inactive" | "trolling" | "fetch_failed"
   last_checked_gw Int?
-  last_updated    DateTime          @updatedAt
+  last_updated    DateTime             @updatedAt
   history         manager_history[]
   picks           manager_picks[]
+  cumulative      manager_cumulative[]
 
   @@index([stratum])
   @@index([rejected_reason])
@@ -313,4 +314,38 @@ model manager_pick_elements {
 
   @@id([entry_id, gw, element_id])
   @@index([entry_id, gw])
+}
+
+// Per-(entry_id, gw) running total of manager_history.points up to and
+// including that GW. Maintained by populateManagers.processEntry on every
+// visit; backfilled once via backfillManagerCumulative.ts.
+//
+// Lets stratumCounts (getRangeRank.ts) and computeRankPerPoint
+// (getTeamImpact.ts) compute a manager's range total as
+//   cumulative[end_gw] − cumulative[start_gw − 1]
+// — two indexed lookups per entry instead of GROUP BY over the full
+// manager_history scan. With this in place we can drop the SAMPLE_DIVISOR_S3
+// sub-sample and use the full ~625k S3 sample, lifting range-rank precision
+// by ~5×.
+//
+// Semantic invariant: emit one row per (entry_id, gw) where manager_history
+// has a row for that pair — no synthetic anchor rows, no rows for GWs the
+// entry didn't participate in. The DISTINCT ON / LEFT JOIN query pattern
+// handles late-joiners and pre-range fall-back via COALESCE.
+//
+// stratum and rejected_reason are denormalised from manager_summary so the
+// hot query needs no join. Keep them in sync: every processEntry rebuild
+// rewrites them along with cumulative_points.
+model manager_cumulative {
+  entry_id          Int
+  gw                Int
+  cumulative_points Int     // SUM(history.points) over [1..gw], net of hits
+  stratum           Int     // denormalised from manager_summary
+  rejected_reason   String? @db.VarChar(20) // denormalised; null = active
+
+  manager manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
+
+  @@id([entry_id, gw])
+  @@index([stratum, gw]) // hot path — range-rank stratumCounts
+  @@index([stratum, rejected_reason, gw]) // rank-killer (active-only) — computeRankPerPoint
 }

@@ -165,6 +165,12 @@ export async function wipeAllSeasonData(): Promise<void> {
 
   // Manager-rank tables are season-scoped — points only make sense within
   // the season they were earned. Wipe them on season change.
+  // Order: cumulative + history (children of summary) → summary. Cascade
+  // would handle this via the FK, but explicit deletes keep the wipe log
+  // auditable.
+  await prisma.manager_cumulative.deleteMany();
+  console.info("   ✓ manager_cumulative cleared");
+
   await prisma.manager_history.deleteMany();
   console.info("   ✓ manager_history cleared");
 

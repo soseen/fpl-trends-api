@@ -614,6 +614,14 @@ const fetchCaptainRatesInStratum = async (
   return { rates, perGwSampleSize };
 };
 
+// Read-path feature flag mirrors getRangeRank.ts. When true, the density
+// SQL reads from manager_cumulative; otherwise it falls back to the legacy
+// GROUP BY over manager_history. The same flag controls both call sites
+// because the underlying tables share a maintenance lifecycle and rolling
+// only one over would leave the two estimators inconsistent (range_rank
+// pulled from one source, rank_per_point from another).
+const USE_CUMULATIVE_TABLE = process.env["USE_CUMULATIVE_TABLE"] === "true";
+
 // rank_per_point coefficient at the user's range total.
 //
 // Density = sample managers within ±RANK_DENSITY_HALF_WINDOW of user_total,
@@ -634,35 +642,65 @@ const computeRankPerPoint = async (
   const lo = userRangeTotal - RANK_DENSITY_HALF_WINDOW;
   const hi = userRangeTotal + RANK_DENSITY_HALF_WINDOW;
 
-  const rows = await prisma.$queryRawUnsafe<
-    Array<{
-      neighbours: number;
-      probes_with_history: number;
-      avg_total: number | null;
-    }>
-  >(
-    `
-    WITH manager_totals AS (
-      SELECT mh.entry_id, SUM(mh.points)::int AS total
-      FROM manager_history mh
-      JOIN manager_summary ms ON ms.entry_id = mh.entry_id
-      WHERE mh.gw BETWEEN $1 AND $2
-        AND ms.stratum = $3
-        AND ms.rejected_reason IS NULL
-      GROUP BY mh.entry_id
-    )
-    SELECT
-      COUNT(*) FILTER (WHERE total BETWEEN $4 AND $5)::int AS neighbours,
-      COUNT(*)::int AS probes_with_history,
-      AVG(total)::float AS avg_total
-    FROM manager_totals
-    `,
-    startGw,
-    endGw,
-    stratum,
-    lo,
-    hi,
-  );
+  let rows: Array<{
+    neighbours: number;
+    probes_with_history: number;
+    avg_total: number | null;
+  }>;
+
+  if (USE_CUMULATIVE_TABLE) {
+    rows = await prisma.$queryRaw<typeof rows>`
+      WITH c_end AS (
+        SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
+        FROM manager_cumulative
+        WHERE stratum = ${stratum}
+          AND rejected_reason IS NULL
+          AND gw BETWEEN ${startGw} AND ${endGw}
+        ORDER BY entry_id, gw DESC
+      ),
+      c_start AS (
+        SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
+        FROM manager_cumulative
+        WHERE stratum = ${stratum}
+          AND rejected_reason IS NULL
+          AND gw < ${startGw}
+        ORDER BY entry_id, gw DESC
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE total BETWEEN ${lo} AND ${hi})::int AS neighbours,
+        COUNT(*)::int                                              AS probes_with_history,
+        AVG(total)::float                                          AS avg_total
+      FROM (
+        SELECT c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0) AS total
+        FROM c_end
+        LEFT JOIN c_start USING (entry_id)
+      ) t
+    `;
+  } else {
+    rows = await prisma.$queryRawUnsafe<typeof rows>(
+      `
+      WITH manager_totals AS (
+        SELECT mh.entry_id, SUM(mh.points)::int AS total
+        FROM manager_history mh
+        JOIN manager_summary ms ON ms.entry_id = mh.entry_id
+        WHERE mh.gw BETWEEN $1 AND $2
+          AND ms.stratum = $3
+          AND ms.rejected_reason IS NULL
+        GROUP BY mh.entry_id
+      )
+      SELECT
+        COUNT(*) FILTER (WHERE total BETWEEN $4 AND $5)::int AS neighbours,
+        COUNT(*)::int AS probes_with_history,
+        AVG(total)::float AS avg_total
+      FROM manager_totals
+      `,
+      startGw,
+      endGw,
+      stratum,
+      lo,
+      hi,
+    );
+  }
   const row = rows[0];
   if (!row || row.probes_with_history === 0) {
     return { rank_per_point: null, stratum_avg: null };
@@ -1064,9 +1102,7 @@ export const getTeamImpact = async (
     // (player_id, gw) tuples the user owned. Bench picks count as "owned"
     // — even an unused bench player isn't a "rank killer" in any
     // meaningful sense; the user had the option to play them.
-    const userOwnedKeys = new Set(
-      picks.map((p) => `${p.element_id}:${p.gw}`),
-    );
+    const userOwnedKeys = new Set(picks.map((p) => `${p.element_id}:${p.gw}`));
 
     const allStats = await fetchAllPlayerGwStats(finishedGws);
 

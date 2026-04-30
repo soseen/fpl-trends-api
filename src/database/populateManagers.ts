@@ -369,6 +369,11 @@ const processEntry = async (
     });
   }
 
+  // Rebuild manager_cumulative for this entry. range-rank's hot query
+  // (stratumCounts) reads cumulative_points instead of GROUP-BY-ing
+  // manager_history every call — see getRangeRank.ts.
+  await rebuildCumulativeForEntry(entryId, stratum, rejectedReason);
+
   // Picks ingestion: fill in any (entry_id, gw) we don't already have for
   // finished GWs. This is the steady-state path; bulk backfill lives in
   // `backfillPicks.ts` so a heavy historic re-fetch can run separately
@@ -376,6 +381,58 @@ const processEntry = async (
   await ingestPicksForMissingGws(entryId, currentGw, governor);
 
   return klass;
+};
+
+// Per-entry cumulative rebuild: DELETE all this entry's manager_cumulative
+// rows then INSERT one fresh row per (entry_id, gw) where manager_history
+// has a row. Keeping cumulative as a strict mirror of history (no synthetic
+// anchor rows, no rows for non-participated GWs) is what lets the range
+// query use DISTINCT ON to find the latest in-range row per entry — see
+// getRangeRank.ts.
+//
+// Re-querying manager_history rather than computing from `history.current`
+// is intentional: if FPL ever returns a smaller payload than what we've
+// already persisted (we never delete history rows), the DB query is
+// canonical. Stratum and rejected_reason are denormalised onto every row
+// so the read path needs no manager_summary join.
+const rebuildCumulativeForEntry = async (
+  entryId: number,
+  stratum: 1 | 2 | 3,
+  rejectedReason: string | null,
+): Promise<void> => {
+  const histRows = await prisma.manager_history.findMany({
+    where: { entry_id: entryId },
+    orderBy: { gw: "asc" },
+    select: { gw: true, points: true },
+  });
+
+  let acc = 0;
+  const cumRows = histRows.map((r) => {
+    acc += r.points;
+    return { gw: r.gw, cum: acc };
+  });
+
+  await prisma.$transaction(async (tx) => {
+    await tx.$executeRaw`DELETE FROM manager_cumulative WHERE entry_id = ${entryId}`;
+    if (cumRows.length === 0) return;
+
+    const tuples: string[] = [];
+    const values: unknown[] = [];
+    for (let i = 0; i < cumRows.length; i++) {
+      const base = i * 5;
+      const r = cumRows[i]!;
+      tuples.push(
+        `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`,
+      );
+      values.push(entryId, r.gw, r.cum, stratum, rejectedReason);
+    }
+    await tx.$executeRawUnsafe(
+      `INSERT INTO manager_cumulative
+         (entry_id, gw, cumulative_points, stratum, rejected_reason)
+       VALUES ${tuples.join(", ")}`,
+      ...values,
+    );
+  });
 };
 
 // Inline picks ingestion: fetch picks for the LATEST finished GW only,
