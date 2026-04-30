@@ -7,6 +7,7 @@ For the high-level architecture / project structure / deployment story, see the 
 | Doc | Cadence | Purpose |
 |---|---|---|
 | [`populate-managers.md`](./populate-managers.md) | recurring (cron, every 15 min) | Ingest the stratified sample of FPL managers — history + per-GW picks |
+| [`manager-cumulative.md`](./manager-cumulative.md) | derived table (one-off backfill + inline maintenance) | Pre-aggregated per-(entry, gw) running totals so range-rank can use the full sample instead of a 1-in-30 sub-sample |
 | [`backfill-nonactive-history.md`](./backfill-nonactive-history.md) | one-off (≈30–35 min) | Repair history rows that the pre-fix code path deleted on inactive/troll classification |
 | [`backfill-picks.md`](./backfill-picks.md) | one-off (≈6–9 hours) | Fill historical captain picks for every (sampled manager, finished GW) pair |
 

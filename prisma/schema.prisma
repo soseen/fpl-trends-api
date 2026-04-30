@@ -346,6 +346,13 @@ model manager_cumulative {
   manager manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
 
   @@id([entry_id, gw])
-  @@index([stratum, gw]) // hot path — range-rank stratumCounts
-  @@index([stratum, rejected_reason, gw]) // rank-killer (active-only) — computeRankPerPoint
+  @@index([stratum, gw]) // c_start (range-rank): WHERE stratum=X AND gw<Y is a contiguous range
+  @@index([stratum, rejected_reason, gw]) // c_start (rank-killer): same pattern, active-only
+  // c_end for both stratumCounts and computeRankPerPoint: DISTINCT ON
+  // (entry_id) ORDER BY entry_id, gw DESC over a stratum partition. Without
+  // this index PG picks the primary key (entry_id, gw) and post-filters
+  // stratum, scanning the full table and Incremental-Sorting 12M+ rows.
+  // With it, PG range-scans the stratum partition in entry-then-gw-DESC
+  // order, no sort needed.
+  @@index([stratum, entry_id, gw(sort: Desc)])
 }
