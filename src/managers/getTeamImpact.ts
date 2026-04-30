@@ -23,6 +23,17 @@ export type TileSlot = {
   rank_impact: number; // signed; positive = rank improved
 };
 
+// One played fixture for a (player, gw) pair. Most GWs produce a
+// single match; double GWs produce two. `team_score` / `opponent_score`
+// are from the player's perspective (i.e. flipped for away fixtures so
+// the first number is always the player's club).
+export type PlayerMatch = {
+  opponent_short: string;
+  was_home: boolean;
+  team_score: number | null;
+  opponent_score: number | null;
+};
+
 export type PlayerImpactGwBreakdown = {
   gw: number;
   multiplier: number;
@@ -31,6 +42,15 @@ export type PlayerImpactGwBreakdown = {
   eo: number;
   excess: number;
   rank_impact_gw: number;
+  // True if the player had a fixture in this GW (i.e. an `history` row
+  // exists). False for blank GWs where the player's club didn't play —
+  // the frontend renders these as "—" rather than "0" to make the
+  // distinction from "had a fixture but blanked" obvious.
+  had_fixture: boolean;
+  // Per-fixture match info for this GW (opponent + score). Empty for
+  // blanks; one entry for normal GWs; two for DGWs. Used by the frontend
+  // to anchor each row in actual match context.
+  matches: PlayerMatch[];
   // Match events for this GW. Same fields as `history.*` aggregated
   // across DGW fixtures. The frontend uses these to break down WHY a
   // player got a given score (1 G + 1 A vs 8 D + clean sheet, etc.)
@@ -74,6 +94,14 @@ export type TeamImpactResponse = {
     fwd: TileSlot[];
   } | null;
   players: PlayerImpact[];
+  // Top 10 players the user did NOT have in their squad in the GW range
+  // who scored points and were widely owned in the stratum — i.e. they
+  // gave rank to other managers and so cost the user rank. `played_count`,
+  // `starts`, `captaincies`, `triple_captaincies`, and `points_for_user`
+  // are all 0 here. `raw_points` is the total points the player scored
+  // across the GWs the user didn't own them (= points the user "missed").
+  // `rank_impact` is signed and always non-positive.
+  rank_killers: PlayerImpact[];
   totals: {
     user_range_points: number;
     stratum_avg_range_points: number | null;
@@ -105,11 +133,21 @@ const PICKS_BATCH_SIZE = 6;
 // When triggered we drop captain/TC uplift and use global ownership only.
 const SMALL_SAMPLE_THRESHOLD = 50;
 
-// Density window for rank_per_point. 5 points either side of the user's
-// total = a 10-point window over which we count sample managers, then
-// divide by 10 to get managers/point density. Wider window smooths the
-// estimate, narrower picks up local irregularities — 5 is a compromise.
-const RANK_DENSITY_HALF_WINDOW = 5;
+// Density window for rank_per_point. We count sample managers within
+// ±W points of the user, divide by 2W to get managers-per-point, and
+// scale that by the stratum's true population. Width is a noise-vs-
+// locality trade-off:
+//   W=5  → tight locality, but users in sparse tails (or wide ranges
+//          where the mode is well off the user's total) get 0 neighbours
+//          and the whole attribution collapses to 0.
+//   W=25 → averages over a 50-point band — still a small slice of any
+//          stratum's spread, but reliably non-empty even in tails.
+// Bumped from 5 to 25 after observing that the same player's
+// rank_impact would swing 100× between adjacent ranges (e.g. 1-34 vs
+// 8-34) for the same entry just because one window happened to be
+// empty. Stability matters more than perfect locality for an attribution
+// display.
+const RANK_DENSITY_HALF_WINDOW = 25;
 
 // Frequency-XI repair: a "started" GW means the user fielded the player
 // (multiplier ≥ 1 — autosubs included).
@@ -372,6 +410,133 @@ const fetchPlayerGwStats = async (
       bonus: r.bonus,
       minutes: r.minutes,
     });
+  }
+  return map;
+};
+
+// Map keyed by `${footballer_id}:${round}` for every (player, GW) pair in
+// `finishedGws` where the player scored at least 1 point. Uses the same
+// per-row aggregation as `fetchPlayerGwStats` but without the player-id
+// filter — needed to compute rank-killer impact for players the user did
+// NOT own. Filtering to `total_points > 0` keeps the result set small
+// (~roughly the active player count × GWs in range).
+const fetchAllPlayerGwStats = async (
+  finishedGws: number[],
+): Promise<Map<string, PerGwPlayerStat>> => {
+  const map = new Map<string, PerGwPlayerStat>();
+  if (finishedGws.length === 0) return map;
+
+  const rows = await prisma.$queryRawUnsafe<
+    Array<{
+      footballer_id: number;
+      round: number;
+      total_points: number;
+      selected: number;
+      ranked_count: number;
+      goals: number;
+      assists: number;
+      clean_sheets: number;
+      goals_conceded: number;
+      defensive_contribution: number;
+      saves: number;
+      bonus: number;
+      minutes: number;
+    }>
+  >(
+    `
+    SELECT
+      h.footballer_id,
+      h.round,
+      SUM(h.total_points)::int AS total_points,
+      MAX(h.selected)::int AS selected,
+      COALESCE(MAX(e.ranked_count), 0)::int AS ranked_count,
+      SUM(h.goals_scored)::int AS goals,
+      SUM(h.assists)::int AS assists,
+      SUM(h.clean_sheets)::int AS clean_sheets,
+      SUM(h.goals_conceded)::int AS goals_conceded,
+      COALESCE(SUM(h.defensive_contribution), 0)::int AS defensive_contribution,
+      SUM(h.saves)::int AS saves,
+      SUM(h.bonus)::int AS bonus,
+      SUM(h.minutes)::int AS minutes
+    FROM history h
+    LEFT JOIN events e ON e.id = h.round
+    WHERE h.round = ANY($1::int[])
+    GROUP BY h.footballer_id, h.round
+    HAVING SUM(h.total_points) > 0
+    `,
+    finishedGws,
+  );
+  for (const r of rows) {
+    map.set(`${r.footballer_id}:${r.round}`, {
+      total_points: r.total_points,
+      selected: r.selected,
+      ranked_count: r.ranked_count,
+      goals: r.goals,
+      assists: r.assists,
+      clean_sheets: r.clean_sheets,
+      goals_conceded: r.goals_conceded,
+      defensive_contribution: r.defensive_contribution,
+      saves: r.saves,
+      bonus: r.bonus,
+      minutes: r.minutes,
+    });
+  }
+  return map;
+};
+
+// Per-fixture match info (opponent + score) keyed by `${footballer_id}:${round}`.
+// Each value is a list because DGWs produce two matches under the same
+// (player, GW) pair. Joined to `teams` to surface the opponent's
+// short_name (the only club identifier the frontend needs to render).
+const fetchPlayerMatches = async (
+  playerIds: number[],
+  finishedGws: number[],
+): Promise<Map<string, PlayerMatch[]>> => {
+  const map = new Map<string, PlayerMatch[]>();
+  if (playerIds.length === 0 || finishedGws.length === 0) return map;
+
+  const rows = await prisma.$queryRawUnsafe<
+    Array<{
+      footballer_id: number;
+      round: number;
+      was_home: boolean;
+      team_h_score: number | null;
+      team_a_score: number | null;
+      opponent_short: string | null;
+      kickoff_time: Date;
+    }>
+  >(
+    `
+    SELECT
+      h.footballer_id,
+      h.round,
+      h.was_home,
+      h.team_h_score,
+      h.team_a_score,
+      h.kickoff_time,
+      t.short_name AS opponent_short
+    FROM history h
+    LEFT JOIN teams t ON t.id = h.opponent_team
+    WHERE h.round = ANY($1::int[])
+      AND h.footballer_id = ANY($2::int[])
+    ORDER BY h.footballer_id, h.round, h.kickoff_time
+    `,
+    finishedGws,
+    playerIds,
+  );
+
+  for (const r of rows) {
+    const key = `${r.footballer_id}:${r.round}`;
+    const teamScore = r.was_home ? r.team_h_score : r.team_a_score;
+    const opponentScore = r.was_home ? r.team_a_score : r.team_h_score;
+    const list = map.get(key) ?? [];
+    list.push({
+      opponent_short: r.opponent_short ?? "?",
+      was_home: r.was_home,
+      team_score: teamScore,
+      opponent_score: opponentScore,
+    });
+    map.set(key, list);
   }
   return map;
 };
@@ -704,6 +869,7 @@ export const getTeamImpact = async (
       end_gw: endGw,
       most_played_xi: null,
       players: [],
+      rank_killers: [],
       totals: {
         user_range_points: 0,
         stratum_avg_range_points: null,
@@ -728,14 +894,17 @@ export const getTeamImpact = async (
   // Element ids the user owned at any GW in the range.
   const elementIds = Array.from(new Set(picks.map((p) => p.element_id)));
 
-  // In parallel: footballer metadata, per-GW player points/ownership, and
-  // captain-rate sample data.
-  const [infoMap, statsMap, capInfo, rankInfo] = await Promise.all([
-    fetchFootballerInfo(elementIds),
-    fetchPlayerGwStats(elementIds, startGw, endGw),
-    fetchCaptainRatesInStratum(stratum, startGw, endGw),
-    computeRankPerPoint(stratum, startGw, endGw, userRangeTotal),
-  ]);
+  // In parallel: footballer metadata, per-GW player points/ownership,
+  // captain-rate sample data, rank density, and per-fixture match info
+  // (so the frontend can show "vs ARS 2-1" alongside each per-GW row).
+  const [infoMap, statsMap, capInfo, rankInfo, ownedMatchesMap] =
+    await Promise.all([
+      fetchFootballerInfo(elementIds),
+      fetchPlayerGwStats(elementIds, startGw, endGw),
+      fetchCaptainRatesInStratum(stratum, startGw, endGw),
+      computeRankPerPoint(stratum, startGw, endGw, userRangeTotal),
+      fetchPlayerMatches(elementIds, finishedGws),
+    ]);
 
   const smallSampleGws = new Set<number>();
   for (const [gw, n] of capInfo.perGwSampleSize.entries()) {
@@ -831,10 +1000,11 @@ export const getTeamImpact = async (
       eo,
       excess,
       rank_impact_gw: rankImpactGw,
-      // Match events for the breakdown UI. Default to 0 when we have
-      // no history row for this (player, gw) pair — happens when the
-      // player was a non-playing pick (suspended/injured) and never
-      // appeared in a fixture.
+      // Missing stat row → no fixture this GW (blank). Anything else
+      // (including minutes=0 / suspended / injured) is "had fixture
+      // but blanked" — the frontend treats these differently.
+      had_fixture: !!stat,
+      matches: ownedMatchesMap.get(`${pick.element_id}:${pick.gw}`) ?? [],
       minutes: stat?.minutes ?? 0,
       goals: stat?.goals ?? 0,
       assists: stat?.assists ?? 0,
@@ -880,12 +1050,153 @@ export const getTeamImpact = async (
     0,
   );
 
+  // Rank killers: players the user did NOT have in their squad but who
+  // scored points and were widely owned in the stratum, lifting OTHER
+  // managers' totals and so dragging the user's relative rank down.
+  // We only do this when rank_per_point is computable (otherwise the
+  // attribution would always be 0 and the section would be hidden anyway).
+  const rankKillers: PlayerImpact[] = [];
+  if (rankInfo.rank_per_point !== null) {
+    // GWs we have picks for. If a GW failed to load we have no idea what
+    // the user owned, so we skip it rather than treat every player as
+    // un-owned (which would generate a wildly inflated rank-killer list).
+    const gwsWithPicks = new Set(picks.map((p) => p.gw));
+    // (player_id, gw) tuples the user owned. Bench picks count as "owned"
+    // — even an unused bench player isn't a "rank killer" in any
+    // meaningful sense; the user had the option to play them.
+    const userOwnedKeys = new Set(
+      picks.map((p) => `${p.element_id}:${p.gw}`),
+    );
+
+    const allStats = await fetchAllPlayerGwStats(finishedGws);
+
+    type KillerAcc = {
+      excess_total: number;
+      raw_points_missed: number;
+      ownership_sum: number;
+      eo_sum: number;
+      per_gw: PlayerImpactGwBreakdown[];
+    };
+    const killerAccs = new Map<number, KillerAcc>();
+
+    for (const [key, stat] of allStats.entries()) {
+      const [playerIdStr, gwStr] = key.split(":");
+      if (playerIdStr === undefined || gwStr === undefined) continue;
+      const playerId = Number(playerIdStr);
+      const gw = Number(gwStr);
+
+      if (!gwsWithPicks.has(gw)) continue;
+      if (userOwnedKeys.has(`${playerId}:${gw}`)) continue;
+
+      const ownershipPct =
+        stat.ranked_count > 0
+          ? Math.min(stat.selected / stat.ranked_count, 1)
+          : 0;
+
+      const capKey = `${playerId}:${gw}`;
+      const cap = capInfo.rates.get(capKey);
+      const sampleSize = capInfo.perGwSampleSize.get(gw) ?? 0;
+
+      let eo: number;
+      if (sampleSize >= SMALL_SAMPLE_THRESHOLD && cap) {
+        eo = ownershipPct + cap.cap_rate + 2 * cap.tc_rate;
+      } else {
+        eo = ownershipPct;
+      }
+
+      if (eo === 0) continue;
+
+      const excess = -eo * stat.total_points;
+      const rankImpactGw = excess * rankInfo.rank_per_point;
+
+      let acc = killerAccs.get(playerId);
+      if (!acc) {
+        acc = {
+          excess_total: 0,
+          raw_points_missed: 0,
+          ownership_sum: 0,
+          eo_sum: 0,
+          per_gw: [],
+        };
+        killerAccs.set(playerId, acc);
+      }
+      acc.excess_total += excess;
+      acc.raw_points_missed += stat.total_points;
+      acc.ownership_sum += ownershipPct;
+      acc.eo_sum += eo;
+      acc.per_gw.push({
+        gw,
+        multiplier: 0,
+        points: stat.total_points,
+        ownership_pct: ownershipPct,
+        eo,
+        excess,
+        rank_impact_gw: rankImpactGw,
+        // Rank killers come from `fetchAllPlayerGwStats`, which already
+        // filters to rows that exist in `history` (i.e. had a fixture
+        // and total_points > 0).
+        had_fixture: true,
+        // Populated below once we've selected the top-10 — avoids
+        // joining `teams` for every player who scored in the range.
+        matches: [],
+        minutes: stat.minutes,
+        goals: stat.goals,
+        assists: stat.assists,
+        clean_sheets: stat.clean_sheets,
+        goals_conceded: stat.goals_conceded,
+        defensive_contribution: stat.defensive_contribution,
+        saves: stat.saves,
+        bonus: stat.bonus,
+      });
+    }
+
+    // Top 10 by lowest excess_total (most negative — biggest rank cost).
+    const top = Array.from(killerAccs.entries())
+      .sort((a, b) => a[1].excess_total - b[1].excess_total)
+      .slice(0, 10);
+
+    const killerPlayerIds = top.map(([id]) => id);
+    const [killerInfoMap, killerMatchesMap] = await Promise.all([
+      fetchFootballerInfo(killerPlayerIds),
+      fetchPlayerMatches(killerPlayerIds, finishedGws),
+    ]);
+    for (const [playerId, acc] of top) {
+      const info = killerInfoMap.get(playerId);
+      if (!info) continue;
+      const denom = acc.per_gw.length || 1;
+      const perGw = acc.per_gw
+        .map((row) => ({
+          ...row,
+          matches: killerMatchesMap.get(`${playerId}:${row.gw}`) ?? [],
+        }))
+        .sort((a, b) => a.gw - b.gw);
+      rankKillers.push({
+        player_id: info.id,
+        code: info.code,
+        web_name: info.web_name,
+        team_code: info.team_code,
+        element_type: info.element_type,
+        points_for_user: 0,
+        raw_points: acc.raw_points_missed,
+        starts: 0,
+        captaincies: 0,
+        triple_captaincies: 0,
+        played_count: 0,
+        avg_ownership_pct: acc.ownership_sum / denom,
+        avg_eo_in_stratum: acc.eo_sum / denom,
+        rank_impact: acc.excess_total * rankInfo.rank_per_point,
+        per_gw: perGw,
+      });
+    }
+  }
+
   return {
     entry_id: entryId,
     start_gw: startGw,
     end_gw: endGw,
     most_played_xi: buildMostPlayedXi(players),
     players,
+    rank_killers: rankKillers,
     totals: {
       user_range_points: userRangeTotal,
       stratum_avg_range_points: rankInfo.stratum_avg,
