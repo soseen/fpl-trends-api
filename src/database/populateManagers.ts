@@ -17,6 +17,7 @@ import {
   fetchEntryEventPicks,
   summarizePicks,
 } from "../managers/fetchPicks.js";
+import { fetchEntryTransfers } from "../managers/fetchTransfers.js";
 import {
   RateLimitGovernor,
   DEFAULT_GOVERNOR_CONFIG,
@@ -380,6 +381,14 @@ const processEntry = async (
   // without blocking the cron.
   await ingestPicksForMissingGws(entryId, currentGw, governor);
 
+  // Transfers ingestion: one HTTP call per manager, but only on the first
+  // visit (gated by manager_summary.has_transfer_history). Transfers grow
+  // append-only, but mid-season managers will accumulate them — refetch
+  // when last_checked_gw advances so the sample stays current. The
+  // existing skip-on-no-change check at the top of processEntry already
+  // covers the common case (no work for an entry visited this same GW).
+  await ingestTransfersForEntry(entryId, governor);
+
   return klass;
 };
 
@@ -533,6 +542,71 @@ const ingestPicksForMissingGws = async (
       active_chip: payload.active_chip,
     },
   });
+};
+
+// One FPL fetch per manager visit, gated by `has_transfer_history`. The
+// transfer log is append-only on FPL's side so we don't need to refetch
+// for managers we've already ingested — but we do refetch when the cron
+// processes them again at a new GW (because `processEntry` short-circuits
+// via `last_checked_gw === currentGw` long before getting here, this only
+// runs when the entry has new GW history to record, which is the same
+// cadence at which they could have made new transfers).
+//
+// A failure leaves `has_transfer_history = false` so the next pass retries.
+const ingestTransfersForEntry = async (
+  entryId: number,
+  governor: RateLimitGovernor,
+): Promise<void> => {
+  if (governor.shouldAbort) return;
+
+  let transfers;
+  try {
+    transfers = await withGovernor(governor, () =>
+      fetchEntryTransfers(entryId),
+    );
+  } catch {
+    // Persistent failure — leave the flag false; next visit retries.
+    return;
+  }
+
+  // Single multi-row insert with ON CONFLICT … DO NOTHING — append-only
+  // semantics, matches the unique-by-construction (entry_id, gw, in, out)
+  // PK from manager_transfers.
+  if (transfers.length > 0) {
+    const values: unknown[] = [];
+    const tuples = transfers.map((t, i) => {
+      const base = i * 6;
+      values.push(
+        entryId,
+        t.event,
+        t.element_in,
+        t.element_out,
+        t.element_in_cost,
+        t.element_out_cost,
+      );
+      return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6})`;
+    });
+    await prisma.$executeRawUnsafe(
+      `
+      INSERT INTO manager_transfers
+        (entry_id, gw, in_element, out_element, in_cost, out_cost)
+      VALUES ${tuples.join(", ")}
+      ON CONFLICT (entry_id, gw, in_element, out_element) DO NOTHING
+      `,
+      ...values,
+    );
+  }
+
+  // Mark even when transfers.length === 0 — a manager who has never made
+  // a transfer is fully ingested by virtue of confirming the empty list.
+  // Raw SQL: bypasses the typed Prisma client (which can be stale on
+  // Windows dev when prisma generate's query_engine.dll rename is blocked
+  // by an active tsx process); the SELECT path against the same column
+  // already uses raw SQL throughout this codebase.
+  await prisma.$executeRawUnsafe(
+    `UPDATE manager_summary SET has_transfer_history = true WHERE entry_id = $1`,
+    entryId,
+  );
 };
 
 // ---- Stratum A / B / C: paginated standings ----

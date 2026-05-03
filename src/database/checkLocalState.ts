@@ -97,21 +97,29 @@ const main = async (): Promise<void> => {
   console.info(
     `  ${picks[0]?.rows ?? 0n} rows across ${picks[0]?.managers ?? 0n} managers, ${picks[0]?.gws ?? 0n} distinct GWs`,
   );
-  console.info(`  with captain_element NOT NULL: ${picks[0]?.with_captain ?? 0n}`);
+  console.info(
+    `  with captain_element NOT NULL: ${picks[0]?.with_captain ?? 0n}`,
+  );
 
-  console.info("\nmanager_pick_elements (full XV cache, per-user team-impact):");
+  console.info(
+    "\nmanager_pick_elements (full XV cache, per-user team-impact):",
+  );
   console.info(
     `  ${pickElements[0]?.rows ?? 0n} rows across ${pickElements[0]?.managers ?? 0n} managers, ${pickElements[0]?.gws ?? 0n} distinct GWs`,
   );
 
-  console.info("\nmanager_cumulative (running totals — the comparison hot path):");
+  console.info(
+    "\nmanager_cumulative (running totals — the comparison hot path):",
+  );
   console.info(
     `  ${cumulative[0]?.rows ?? 0n} rows across ${cumulative[0]?.managers ?? 0n} managers, ${cumulative[0]?.gws ?? 0n} distinct GWs`,
   );
 
   console.info("\nstratum_captain_picks_gw (captain-rate read path):");
   if (captainPicks.length === 0) {
-    console.info("  EMPTY — derived from manager_picks; sparse picks ⇒ empty here.");
+    console.info(
+      "  EMPTY — derived from manager_picks; sparse picks ⇒ empty here.",
+    );
   } else {
     for (const r of captainPicks) {
       console.info(
@@ -129,7 +137,9 @@ const main = async (): Promise<void> => {
   );
 
   if (cumRows === 0) {
-    console.info("  ❌ manager_cumulative empty — run `npm run backfill-cumulative`.");
+    console.info(
+      "  ❌ manager_cumulative empty — run `npm run backfill-cumulative`.",
+    );
   } else {
     console.info("  ✅ manager_cumulative populated.");
   }
@@ -138,7 +148,7 @@ const main = async (): Promise<void> => {
     console.info(
       "  ❌ manager_picks empty — run `npm run populate-managers` (or `backfill-picks` for historic depth).",
     );
-  } else if (picksRows < (Number(history[0]?.rows ?? 0n) / 2)) {
+  } else if (picksRows < Number(history[0]?.rows ?? 0n) / 2) {
     console.info(
       "  ⚠️  manager_picks sparse vs. manager_history — run `npm run backfill-picks` to fill historic GWs (or accept empty captain stats).",
     );

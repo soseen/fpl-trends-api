@@ -2,6 +2,8 @@ import { prisma } from "../database/client.js";
 import { fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks, captainPicksFromResolved } from "./resolvePicks.js";
+import { sampleAvgPtsPerTransfer } from "./transferImpactCalc.js";
+import { computeUserTransferNet } from "./getManagerTransfers.js";
 
 type ChipPlay = { chip_name: string; num_played: number };
 
@@ -41,6 +43,14 @@ export type ManagerComparisonResponse = {
   // (LEFT JOIN; missing picks contribute 0 — see populateManagers
   // rebuildCumulativeForEntry).
   captain_bonus: ComparisonStat;
+  // Average net points per transfer made in range. User value:
+  // (sum of (in_player_points − out_player_points) over [transfer.gw, end_gw])
+  // / number_of_transfers_in_range. Sample averages are per-manager averages
+  // averaged across the stratum (managers with zero in-range transfers are
+  // excluded from the sample mean — they have no defined per-transfer rate).
+  // Range-conditional, so this metric isn't backed by manager_cumulative;
+  // sampleAvgPtsPerTransfer runs at request time over manager_transfers.
+  avg_pts_per_transfer: ComparisonStat;
   // Mean per-GW points (range total / GWs played). For sample averages this
   // is computed per-manager then averaged.
   avg_gw_score: ComparisonStat;
@@ -51,6 +61,7 @@ export type ManagerComparisonResponse = {
     hits_average_partial: boolean;
     bench_average_partial: boolean;
     captain_average_partial: boolean;
+    transfers_average_partial: boolean;
   };
 };
 
@@ -391,19 +402,32 @@ export const getManagerComparison = async (
   }
 
   // ---- Sample-side per-stratum aggregates (active + top-10k) and most
-  // captained, plus user picks resolution. All in parallel — sample
-  // queries run on indexed cumulative tables (sub-second), most-captained
-  // hits the tiny stratum_captain_picks_gw table (ms), and resolvePicks
-  // dedups the FPL picks fetch with team-impact when both endpoints fire
-  // simultaneously from the frontend.
-  const [activeAgg, top10kAgg, activeMost, top10kMost, userPicks] =
-    await Promise.all([
-      sampleStratumAggregates(startGw, endGw, "active"),
-      sampleStratumAggregates(startGw, endGw, "stratum1"),
-      sampleMostCaptained(startGw, endGw, "active"),
-      sampleMostCaptained(startGw, endGw, "stratum1"),
-      resolvePicks(entryId, finishedGws),
-    ]);
+  // captained, plus user picks resolution and user transfer net. All in
+  // parallel — sample queries run on indexed cumulative tables (sub-second),
+  // most-captained hits the tiny stratum_captain_picks_gw table (ms),
+  // resolvePicks dedups the FPL picks fetch with team-impact when both
+  // endpoints fire simultaneously from the frontend, and
+  // computeUserTransferNet shares its FPL fetch with the transfers
+  // endpoint via the in-flight de-dup in resolveTransfers.
+  const [
+    activeAgg,
+    top10kAgg,
+    activeMost,
+    top10kMost,
+    userPicks,
+    userXferNet,
+    activeXferAgg,
+    top10kXferAgg,
+  ] = await Promise.all([
+    sampleStratumAggregates(startGw, endGw, "active"),
+    sampleStratumAggregates(startGw, endGw, "stratum1"),
+    sampleMostCaptained(startGw, endGw, "active"),
+    sampleMostCaptained(startGw, endGw, "stratum1"),
+    resolvePicks(entryId, finishedGws),
+    computeUserTransferNet(entryId, startGw, endGw),
+    sampleAvgPtsPerTransfer(startGw, endGw, "active"),
+    sampleAvgPtsPerTransfer(startGw, endGw, "stratum1"),
+  ]);
 
   const avgHits = gateOnCoverage(
     activeAgg.avg_hits,
@@ -431,6 +455,26 @@ export const getManagerComparison = async (
     top10kAgg.with_bench_data,
     top10kAgg.sample_size,
   );
+
+  // Coverage gates for the new transfers-per-manager metric. The "active"
+  // pool drives the partial-data flag because it's the larger sample —
+  // top-10k transfers data fills in faster (smaller stratum) so it's
+  // gated separately but doesn't influence the response-level note.
+  const avgPtsPerTransferActive = gateOnCoverage(
+    activeXferAgg.avg,
+    activeXferAgg.with_data,
+    activeXferAgg.stratum_size,
+  );
+  const avgPtsPerTransferTop10k = gateOnCoverage(
+    top10kXferAgg.avg,
+    top10kXferAgg.with_data,
+    top10kXferAgg.stratum_size,
+  );
+
+  const userAvgPtsPerTransfer =
+    userXferNet.total_count > 0
+      ? userXferNet.total_net / userXferNet.total_count
+      : 0;
 
   // ---- User captain bonus + most captained, derived from the resolved
   // picks. Every is_captain row already carries the post-autosub
@@ -523,6 +567,11 @@ export const getManagerComparison = async (
       average: activeAgg.avg_captain_bonus,
       top10k_average: top10kAgg.avg_captain_bonus,
     },
+    avg_pts_per_transfer: {
+      user: userAvgPtsPerTransfer,
+      average: avgPtsPerTransferActive,
+      top10k_average: avgPtsPerTransferTop10k,
+    },
     avg_gw_score: {
       user: userGwScore,
       average: activeAgg.avg_gw_score,
@@ -549,6 +598,15 @@ export const getManagerComparison = async (
       // than the previous sample-size heuristic — the user can see for
       // themselves that some of their own picks weren't fetched).
       captain_average_partial: userPicks.incomplete,
+      // Transfers-per-manager backfill is still trickling in via
+      // backfillManagerTransfers / per-visit ingestTransfersForEntry; gate
+      // partial when the active stratum's coverage is below the threshold
+      // baked into gateOnCoverage. The flag mirrors hits/bench:
+      // displayed-as-≈ on the frontend rather than null, since we still
+      // have a meaningful sample.
+      transfers_average_partial:
+        avgPtsPerTransferActive !== null &&
+        activeXferAgg.with_data < activeXferAgg.stratum_size,
     },
   };
 };

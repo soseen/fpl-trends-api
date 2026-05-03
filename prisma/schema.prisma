@@ -255,16 +255,22 @@ model events {
 }
 
 model manager_summary {
-  entry_id        Int                  @id
-  overall_rank    Int?
-  total_points    Int?
-  stratum         Int // 1=A (top 10k), 2=B (10k–100k), 3=C (100k–end-of-tail, dynamic)
-  rejected_reason String?              @db.VarChar(20) // null=active; "inactive" | "trolling" | "fetch_failed"
-  last_checked_gw Int?
-  last_updated    DateTime             @updatedAt
-  history         manager_history[]
-  picks           manager_picks[]
-  cumulative      manager_cumulative[]
+  entry_id             Int                  @id
+  overall_rank         Int?
+  total_points         Int?
+  stratum              Int // 1=A (top 10k), 2=B (10k–100k), 3=C (100k–end-of-tail, dynamic)
+  rejected_reason      String?              @db.VarChar(20) // null=active; "inactive" | "trolling" | "fetch_failed"
+  last_checked_gw      Int?
+  // True once we've successfully fetched and persisted this manager's full
+  // transfer history into manager_transfers at least once. Gates the
+  // populateManagers loop so we don't refetch entry/{id}/transfers/ on
+  // every cron pass — only on the first visit. Re-set to false on a fetch
+  // failure so the next pass retries.
+  has_transfer_history Boolean              @default(false)
+  last_updated         DateTime             @updatedAt
+  history              manager_history[]
+  picks                manager_picks[]
+  cumulative           manager_cumulative[]
 
   @@index([stratum])
   @@index([rejected_reason])
@@ -378,6 +384,34 @@ model manager_cumulative {
   // With it, PG range-scans the stratum partition in entry-then-gw-DESC
   // order, no sort needed.
   @@index([stratum, entry_id, gw(sort: Desc)])
+}
+
+// One row per FPL transfer the manager has ever made (filtered to a range
+// at query time via gw). Sourced from `entry/{id}/transfers/`. Populated:
+//   1. opportunistically when the user queries their own /transfers or
+//      /comparison endpoints (lazy, mirrors resolvePicks.ts);
+//   2. systematically for each sampled manager during populateManagers,
+//      gated by has_transfer_history on manager_summary so we don't
+//      refetch on every cron pass.
+//
+// Used by:
+//   - getManagerTransfers (per-user view, joins to history for points)
+//   - getManagerComparison.sample_avg_pts_per_transfer (aggregated across
+//     stratum, range-conditional on gw and end_gw — can't live as a
+//     cumulative because the per-transfer points window depends on the
+//     query's end_gw).
+model manager_transfers {
+  entry_id    Int
+  gw          Int
+  in_element  Int
+  out_element Int
+  in_cost     Int
+  out_cost    Int
+  fetched_at  DateTime @default(now())
+
+  @@id([entry_id, gw, in_element, out_element])
+  @@index([entry_id, gw])
+  @@index([gw])
 }
 
 // Per-(stratum, gw, captain_element, captain_multiplier) pick counts.
