@@ -4,6 +4,13 @@ Node.js backend for FPL Trends. Fetches Fantasy Premier League data, stores in P
 
 > **For full operational detail** (server bootstrap, deploy, season runbook, troubleshooting), read [`Readme.md`](./Readme.md). This file is the architectural/code-level reference.
 
+> **Development mode.** This app is still pre-stable. Schemas, endpoints,
+> and pipelines are all fair game to delete or restructure. Wiping the DB
+> (`npm run reset-season` then `populate`) is a routine operation, not a
+> recovery scenario — feel free to drop tables, change column semantics,
+> or rip out features when a cleaner design appears. No data migrations
+> for legacy state, no compat shims for old API consumers.
+
 ## Production at a glance
 
 - Runs as `pm2` process `fpl-trends-api` on port 3000 (Hetzner CX23 at `91.98.145.120`, Ubuntu 24.04, deploy user `deploy`)
@@ -31,6 +38,14 @@ cd ~/fpl-trends-api && npm run bootstrap   # tsc + migrate + populate
 
 # New-season reset (if auto-detect fails):
 cd ~/fpl-trends-api && npm run reset-season && npm run populate && pm2 restart fpl-trends-api
+
+# Backfills (one-off, idempotent):
+npm run backfill-cumulative              # required after schema migrations that add cumulative cols
+npm run backfill-stratum-captain-picks   # optional; populate cron does the same at end of each tick
+npm run backfill-picks                   # one-off historic catch-up of manager_picks (heavy FPL load)
+
+# Diagnostic — prints row counts for every My Trends-relevant table:
+npm run check-local-state
 ```
 
 ## Architectural notes
@@ -138,6 +153,8 @@ The app tracks the current FPL season (e.g. "2025-26") in the `app_metadata` tab
 
 ## API Endpoints
 
+### Bulk data (cached globally via `cachedJson`, invalidated on populate)
+
 ```
 GET /api/footballersData      — All players with team, history, fixtures (Prisma includes)
 GET /api/teamsData            — All teams with team_history
@@ -145,6 +162,27 @@ GET /api/totalPlayersCount    — { totalPlayers: number }
 GET /api/eventsData           — Gameweek events
 GET /api/populate             — Triggers full data refresh from FPL API (season-aware)
 ```
+
+### My Trends (per-(entry, range), cached via `cachedManagerJson`)
+
+All four take an FPL entry id; range-rank/comparison/team-impact also
+take `?start=N&end=M` GW range params. Wrapped in a 5-minute TTL'd LRU
+keyed on `(endpoint, entryId, startGw, endGw)`, with in-flight de-dup so
+duplicate concurrent requests share one execution.
+
+```
+GET /api/manager/:id/summary       — FPL summary (overall rank, total points, name)
+GET /api/manager/:id/trajectory    — per-GW points + transfers + hits across the season
+GET /api/manager/:id/range-rank    — estimated GW-range rank vs. sample (Bernoulli urn)
+GET /api/manager/:id/comparison    — user vs. active-sample + top-10k averages for the range
+GET /api/manager/:id/team-impact   — per-player rank attribution + rank killers
+```
+
+Heavy reads in comparison/team-impact are served from `manager_cumulative`
+(running totals, range = subtraction) and `stratum_captain_picks_gw`
+(pre-aggregated captain rates). User picks are resolved via the shared
+`src/managers/resolvePicks.ts` (DB cache + FPL fallback, in-flight de-dup
+across endpoints).
 
 No authentication. CORS origins are configured via the `ALLOWED_ORIGINS` env var (comma-separated). Defaults to `https://fpltrends.live, https://www.fpltrends.live`. In dev (`NODE_ENV !== "production"`), `http://localhost:5000` is also allowed automatically.
 
@@ -177,15 +215,20 @@ PORT            — Server port (default: 3000)
 ## Commands
 
 ```bash
-npm run dev          — Start with tsx (hot reload)
-npm run build        — tsc only (compile to dist/)
-npm run bootstrap    — tsc + migrate + populate (first-time setup on a new server)
-npm run migrate      — npx prisma migrate deploy
-npm run populate     — Fetch FPL data and insert into DB (detects season changes)
-npm run reset-season — Manual full data wipe (run populate after)
-npm start            — node dist/server.js
-npm run lint         — ESLint check
-npm run lint:fix     — ESLint auto-fix
+npm run dev                            — Start with tsx (no auto-reload — restart manually after edits)
+npm run build                          — prisma generate + tsc
+npm run bootstrap                      — generate + tsc + migrate + populate (first-time setup)
+npm run migrate                        — npx prisma migrate deploy
+npm run populate                       — Fetch FPL bulk data into DB (season-aware)
+npm run populate-managers              — Walk standings + ingest manager histories (cron job entrypoint)
+npm run reset-season                   — Wipe all season data (run populate after)
+npm run backfill-cumulative            — Bulk-build manager_cumulative from manager_history
+npm run backfill-stratum-captain-picks — Rebuild stratum_captain_picks_gw out-of-band
+npm run backfill-picks                 — One-off historic catch-up of manager_picks (heavy FPL load)
+npm run check-local-state              — Print row counts for every My Trends-relevant table
+npm start                              — node dist/server.js
+npm run lint                           — ESLint check
+npm run lint:fix                       — ESLint auto-fix
 ```
 
 ## Known Issues
