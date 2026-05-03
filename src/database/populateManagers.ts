@@ -383,6 +383,12 @@ const processEntry = async (
   return klass;
 };
 
+// Boundary GW between FPL chip halves. Each chip can be played at most once
+// in [1..CHIP_HALVES_BOUNDARY] and once in (CHIP_HALVES_BOUNDARY..38]. The
+// h1/h2 cumulative flags rely on this split so any (start, end) range can
+// detect a chip play via XOR of c_end and c_start halves.
+const CHIP_HALVES_BOUNDARY = 19;
+
 // Per-entry cumulative rebuild: DELETE all this entry's manager_cumulative
 // rows then INSERT one fresh row per (entry_id, gw) where manager_history
 // has a row. Keeping cumulative as a strict mirror of history (no synthetic
@@ -395,42 +401,85 @@ const processEntry = async (
 // already persisted (we never delete history rows), the DB query is
 // canonical. Stratum and rejected_reason are denormalised onto every row
 // so the read path needs no manager_summary join.
+//
+// Captain bonus joins manager_picks for the entry and the footballers'
+// `history` table for the captained player's GW points. For GWs where
+// picks haven't been ingested yet (the typical case before backfillPicks
+// has run for this entry's earlier GWs), the LEFT JOIN yields NULL and
+// the contribution is 0 — the comparison endpoint's sample average is
+// best-effort and converges as picks are filled in over subsequent
+// processEntry visits.
 const rebuildCumulativeForEntry = async (
   entryId: number,
   stratum: 1 | 2 | 3,
   rejectedReason: string | null,
 ): Promise<void> => {
-  const histRows = await prisma.manager_history.findMany({
-    where: { entry_id: entryId },
-    orderBy: { gw: "asc" },
-    select: { gw: true, points: true },
-  });
-
-  let acc = 0;
-  const cumRows = histRows.map((r) => {
-    acc += r.points;
-    return { gw: r.gw, cum: acc };
-  });
-
   await prisma.$transaction(async (tx) => {
     await tx.$executeRaw`DELETE FROM manager_cumulative WHERE entry_id = ${entryId}`;
-    if (cumRows.length === 0) return;
-
-    const tuples: string[] = [];
-    const values: unknown[] = [];
-    for (let i = 0; i < cumRows.length; i++) {
-      const base = i * 5;
-      const r = cumRows[i]!;
-      tuples.push(
-        `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5})`,
-      );
-      values.push(entryId, r.gw, r.cum, stratum, rejectedReason);
-    }
     await tx.$executeRawUnsafe(
-      `INSERT INTO manager_cumulative
-         (entry_id, gw, cumulative_points, stratum, rejected_reason)
-       VALUES ${tuples.join(", ")}`,
-      ...values,
+      `
+      INSERT INTO manager_cumulative
+        (entry_id, gw, cumulative_points, cumulative_transfers,
+         cumulative_hits_cost, cumulative_bench, cumulative_captain_bonus,
+         gws_played,
+         chip_wildcard_h1, chip_wildcard_h2,
+         chip_freehit_h1,  chip_freehit_h2,
+         chip_bboost_h1,   chip_bboost_h2,
+         has_transfers, has_hits, has_bench,
+         stratum, rejected_reason)
+      SELECT
+        base.entry_id, base.gw,
+        (SUM(base.points)                            OVER w)::int AS cumulative_points,
+        (SUM(COALESCE(base.event_transfers,      0)) OVER w)::int AS cumulative_transfers,
+        (SUM(COALESCE(base.event_transfers_cost, 0)) OVER w)::int AS cumulative_hits_cost,
+        (SUM(COALESCE(base.points_on_bench,      0)) OVER w)::int AS cumulative_bench,
+        (SUM(base.captain_bonus)                     OVER w)::int AS cumulative_captain_bonus,
+        (COUNT(*)                                    OVER w)::int AS gws_played,
+        -- COALESCE to FALSE: when manager_picks is missing for a (entry, gw),
+        -- active_chip is NULL via LEFT JOIN, and (NULL = 'wildcard') is NULL.
+        -- For h1 (gw <= 19) the AND with TRUE leaves NULL; BOOL_OR over an
+        -- all-NULL partition then returns NULL, which violates the NOT NULL
+        -- constraint on the chip columns. Coercing to FALSE pre-aggregate
+        -- keeps the read-path semantics correct (an entry with no picks for
+        -- the GW didn't play that chip) and the column non-null.
+        BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw <= $4, false)) OVER w AS chip_wildcard_h1,
+        BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw  > $4, false)) OVER w AS chip_wildcard_h2,
+        BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw <= $4, false)) OVER w AS chip_freehit_h1,
+        BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw  > $4, false)) OVER w AS chip_freehit_h2,
+        BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw <= $4, false)) OVER w AS chip_bboost_h1,
+        BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw  > $4, false)) OVER w AS chip_bboost_h2,
+        BOOL_OR(base.event_transfers      IS NOT NULL) OVER w AS has_transfers,
+        BOOL_OR(base.event_transfers_cost IS NOT NULL) OVER w AS has_hits,
+        BOOL_OR(base.points_on_bench      IS NOT NULL) OVER w AS has_bench,
+        $2, $3
+      FROM (
+        SELECT
+          mh.entry_id, mh.gw, mh.points,
+          mh.event_transfers, mh.event_transfers_cost, mh.points_on_bench,
+          mp.active_chip,
+          COALESCE(
+            CASE
+              WHEN mp.captain_multiplier IS NOT NULL AND mp.captain_multiplier > 1 THEN
+                (SELECT SUM(h.total_points)::int
+                   FROM history h
+                   WHERE h.footballer_id = mp.captain_element AND h.round = mh.gw)
+                * (mp.captain_multiplier - 1)
+              ELSE 0
+            END,
+            0
+          ) AS captain_bonus
+        FROM manager_history mh
+        LEFT JOIN manager_picks mp
+          ON mp.entry_id = mh.entry_id AND mp.gw = mh.gw
+        WHERE mh.entry_id = $1
+      ) base
+      WINDOW w AS (PARTITION BY base.entry_id ORDER BY base.gw)
+      ORDER BY base.gw
+      `,
+      entryId,
+      stratum,
+      rejectedReason,
+      CHIP_HALVES_BOUNDARY,
     );
   });
 };
@@ -609,6 +658,37 @@ const ingestFromStandings = async ({
   }
 };
 
+// Rebuild the (stratum, gw, captain_element, captain_multiplier) aggregate
+// table used by getTeamImpact.fetchCaptainRatesInStratum and
+// getManagerComparison.sampleMostCaptained. Single TRUNCATE+INSERT inside
+// a transaction so readers always see a consistent snapshot — no partial
+// state where some captains/GWs are missing.
+//
+// Exported so backfillStratumCaptainPicks.ts can run the same operation
+// out-of-band (e.g. immediately after deploying the schema, before the
+// next populate cron tick).
+export const rebuildStratumCaptainPicks = async (): Promise<void> => {
+  await prisma.$transaction([
+    prisma.$executeRawUnsafe(`TRUNCATE stratum_captain_picks_gw`),
+    prisma.$executeRawUnsafe(`
+      INSERT INTO stratum_captain_picks_gw
+        (stratum, gw, captain_element, captain_multiplier, picks, active_picks)
+      SELECT
+        ms.stratum,
+        mp.gw,
+        mp.captain_element,
+        mp.captain_multiplier,
+        COUNT(*)::int                                                     AS picks,
+        COUNT(*) FILTER (WHERE ms.rejected_reason IS NULL)::int           AS active_picks
+      FROM manager_picks mp
+      JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+      WHERE mp.captain_element IS NOT NULL
+        AND mp.captain_multiplier IS NOT NULL
+      GROUP BY ms.stratum, mp.gw, mp.captain_element, mp.captain_multiplier
+    `),
+  ]);
+};
+
 export const populateManagers = async (
   governorConfig?: Partial<GovernorConfig>,
 ): Promise<void> => {
@@ -717,6 +797,29 @@ export const populateManagers = async (
         governor,
         stats,
       });
+    }
+
+    // Refresh the per-(stratum, gw, captain) aggregate table once at the end
+    // of the run. This is the same heavy GROUP BY that the read paths in
+    // getTeamImpact.fetchCaptainRatesInStratum and
+    // getManagerComparison.sampleMostCaptained run today — done here once
+    // per cron cycle (~30 min cadence) instead of per request. ~17k bucket
+    // rows; ~2–4s on the prod CX23. Skip on no-op cycles.
+    if (stats.processed > 0 && !governor.shouldAbort) {
+      const rebuildStarted = Date.now();
+      try {
+        await rebuildStratumCaptainPicks();
+        console.info(
+          `[populateManagers] stratum_captain_picks_gw rebuilt in ${Math.round((Date.now() - rebuildStarted) / 1000)}s`,
+        );
+      } catch (err) {
+        // Rebuild failure shouldn't fail the cron — readers fall back to
+        // the previous snapshot. Log loudly so it's caught in pm2 tail.
+        console.error(
+          "[populateManagers] stratum_captain_picks_gw rebuild failed:",
+          (err as Error).message,
+        );
+      }
     }
 
     console.info(

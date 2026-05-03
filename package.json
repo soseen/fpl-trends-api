@@ -17,6 +17,8 @@
     "backfill-nonactive-history": "tsx src/database/backfillNonActiveHistory.ts",
     "backfill-picks": "tsx src/database/backfillPicks.ts",
     "backfill-cumulative": "tsx src/database/backfillManagerCumulative.ts",
+    "backfill-stratum-captain-picks": "tsx src/database/backfillStratumCaptainPicks.ts",
+    "check-local-state": "tsx src/database/checkLocalState.ts",
     "reset-season": "tsx src/database/resetSeason.ts",
     "migrate": "npx prisma migrate deploy"
   },

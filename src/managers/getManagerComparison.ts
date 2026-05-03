@@ -1,8 +1,7 @@
 import { prisma } from "../database/client.js";
 import { fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
-import { fetchEntryEventPicks, summarizePicks } from "./fetchPicks.js";
-import { delay } from "../utils.js";
+import { resolvePicks, captainPicksFromResolved } from "./resolvePicks.js";
 
 type ChipPlay = { chip_name: string; num_played: number };
 
@@ -10,31 +9,6 @@ export type ComparisonStat = {
   user: number;
   average: number | null;
   top10k_average: number | null;
-  top100k_average: number | null;
-};
-
-// Sample-side rates for one half-season slice. Each value is a fraction
-// (0..1) of sampled managers in that stratum who played the chip in this
-// slice of the requested range.
-export type ChipHalfStat = {
-  average: number | null;
-  top10k_average: number | null;
-  top100k_average: number | null;
-};
-
-// Chip stat with first-half / second-half breakdown. Each chip type comes
-// in two copies per season (one in GW1–19, one in GW20–38), so the UI
-// renders them as two side-by-side bars whenever the requested range
-// spans the GW20 reset.
-//
-// `h1` / `h2` are null for the half the range doesn't overlap — caller
-// uses that as the signal to render a single bar.
-//
-// `user` is the raw count of chips the user played in range (0, 1, or 2).
-export type ChipUsageStat = {
-  user: number;
-  h1: ChipHalfStat | null;
-  h2: ChipHalfStat | null;
 };
 
 export type CaptainSummary = {
@@ -44,16 +18,6 @@ export type CaptainSummary = {
   average_player_name: string | null;
   top10k_player_id: number | null;
   top10k_player_name: string | null;
-  top100k_player_id: number | null;
-  top100k_player_name: string | null;
-};
-
-type StratumFilter = "active" | "stratum1" | "stratum1or2";
-
-const stratumClauseFor = (f: StratumFilter): string => {
-  if (f === "stratum1") return `AND ms.stratum = 1`;
-  if (f === "stratum1or2") return `AND ms.stratum IN (1, 2)`;
-  return ``;
 };
 
 export type ManagerComparisonResponse = {
@@ -62,16 +26,20 @@ export type ManagerComparisonResponse = {
   end_gw: number;
   total_points: ComparisonStat;
   transfers: ComparisonStat;
-  // Chips have a first-half / second-half breakdown — see ChipUsageStat.
-  wildcards: ChipUsageStat;
-  free_hits: ChipUsageStat;
-  bench_boosts: ChipUsageStat;
+  // Chip stats: user is 0 or 1 (played within range or not). Average is the
+  // fraction of FPL managers (0..1) who played that chip in the range.
+  wildcards: ComparisonStat;
+  free_hits: ComparisonStat;
+  bench_boosts: ComparisonStat;
   hits: ComparisonStat;
   bench_points: ComparisonStat;
   // Sum of (captained_player_points × (multiplier − 1)) across the range.
   // Ignores GWs where the captain ended up benched (multiplier 0). Top-10k
-  // and overall averages are direct measurements from `manager_picks`
-  // joined to `history`.
+  // and overall averages come from the cumulative_captain_bonus delta over
+  // the matching stratum partition — no per-row LATERAL join at request
+  // time. Coverage depends on how much of the sample has picks ingested
+  // (LEFT JOIN; missing picks contribute 0 — see populateManagers
+  // rebuildCumulativeForEntry).
   captain_bonus: ComparisonStat;
   // Mean per-GW points (range total / GWs played). For sample averages this
   // is computed per-manager then averaged.
@@ -99,19 +67,6 @@ const sumChipPlays = (
   return entry?.num_played ?? 0;
 };
 
-// Per-GW points for a footballer across all fixtures in that round (covers
-// double-GWs). Returns 0 if the player has no `history` rows for the round.
-const footballerGwPoints = async (
-  footballerId: number,
-  gw: number,
-): Promise<number> => {
-  const rows = await prisma.history.findMany({
-    where: { footballer_id: footballerId, round: gw },
-    select: { total_points: true },
-  });
-  return rows.reduce((acc, r) => acc + r.total_points, 0);
-};
-
 // Look up player web_name for display. Returns null if footballer not found.
 const footballerName = async (id: number | null): Promise<string | null> => {
   if (id === null) return null;
@@ -122,209 +77,131 @@ const footballerName = async (id: number | null): Promise<string | null> => {
   return f?.web_name ?? null;
 };
 
-// Compute the user's captain bonus by fetching their picks per GW from FPL,
-// then summing each captained player's GW points × (multiplier − 1).
-// Also returns the most-frequently-captained element id across the range.
-//
-// Parallel fetches in batches — 38 sequential calls would exceed the
-// frontend's 8s timeout. FPL handles modest parallelism fine; one batch
-// per ~150ms in practice.
-const PICKS_BATCH_SIZE = 6;
-
-const userCaptainStats = async (
-  entryId: number,
-  startGw: number,
-  endGw: number,
-): Promise<{ bonus: number; mostCaptainedElement: number | null }> => {
-  const gws: number[] = [];
-  for (let g = startGw; g <= endGw; g++) gws.push(g);
-
-  type PickResult = {
+// Compute the user's captain bonus from a set of resolved captain picks
+// joined to the footballers' history table. One round-trip — UNNEST of
+// parallel arrays of (captain_element, gw) gives us the per-GW points
+// for every captained player without N+1 lookups.
+const userCaptainBonusFromPicks = async (
+  captains: Array<{
     gw: number;
-    captain_element: number | null;
-    captain_multiplier: number | null;
-  };
-  const results: PickResult[] = [];
-
-  for (let i = 0; i < gws.length; i += PICKS_BATCH_SIZE) {
-    const batch = gws.slice(i, i + PICKS_BATCH_SIZE);
-    const batchResults = await Promise.all(
-      batch.map(async (gw): Promise<PickResult | null> => {
-        try {
-          const payload = await fetchEntryEventPicks(entryId, gw);
-          const { captain_element, captain_multiplier } = summarizePicks(
-            payload.picks ?? [],
-          );
-          return { gw, captain_element, captain_multiplier };
-        } catch {
-          return null;
-        }
-      }),
-    );
-    for (const r of batchResults) {
-      if (r) results.push(r);
-    }
-    if (i + PICKS_BATCH_SIZE < gws.length) await delay(60);
-  }
-
-  // Captain bonus from successful picks. Run the GW-point lookups in
-  // parallel — they hit our local DB so they're cheap.
-  const bonusContribs = await Promise.all(
-    results
-      .filter(
-        (
-          r,
-        ): r is PickResult & {
-          captain_element: number;
-          captain_multiplier: number;
-        } =>
-          r.captain_element !== null &&
-          r.captain_multiplier !== null &&
-          r.captain_multiplier > 1,
-      )
-      .map(async (r) => {
-        const pts = await footballerGwPoints(r.captain_element, r.gw);
-        return pts * (r.captain_multiplier - 1);
-      }),
-  );
-  const bonus = bonusContribs.reduce((acc, n) => acc + n, 0);
-
-  const captainCounts = new Map<number, number>();
-  for (const r of results) {
-    if (r.captain_element !== null) {
-      captainCounts.set(
-        r.captain_element,
-        (captainCounts.get(r.captain_element) ?? 0) + 1,
-      );
-    }
-  }
-
-  let mostCaptainedElement: number | null = null;
-  let max = 0;
-  for (const [el, count] of captainCounts.entries()) {
-    if (count > max) {
-      max = count;
-      mostCaptainedElement = el;
-    }
-  }
-  return { bonus, mostCaptainedElement };
-};
-
-// Sample-side captain bonus average across stratum filter. Returns null if
-// no sample. `coverageThresholdSampleSize` lets the caller decide whether
-// to surface the result or null it out for partial backfills.
-const sampleCaptainBonusAvg = async (
-  startGw: number,
-  endGw: number,
-  stratumFilter: StratumFilter,
-): Promise<{ avg: number | null; sample_size: number }> => {
-  const stratumClause = stratumClauseFor(stratumFilter);
+    captain_element: number;
+    captain_multiplier: number;
+  }>,
+): Promise<number> => {
+  if (captains.length === 0) return 0;
+  const elements = captains.map((c) => c.captain_element);
+  const gws = captains.map((c) => c.gw);
   const rows = await prisma.$queryRawUnsafe<
-    Array<{ avg_bonus: number | null; sample_size: number }>
+    Array<{ captain_element: number; gw: number; pts: number }>
   >(
     `
-    SELECT
-      AVG(t.bonus_per_manager)::float AS avg_bonus,
-      COUNT(*)::int AS sample_size
-    FROM (
-      SELECT mp.entry_id,
-        SUM(
-          COALESCE(gw_pts.pts, 0)
-          * GREATEST(COALESCE(mp.captain_multiplier, 1) - 1, 0)
-        )::float AS bonus_per_manager
-      FROM manager_picks mp
-      JOIN manager_summary ms ON ms.entry_id = mp.entry_id
-      LEFT JOIN LATERAL (
-        SELECT SUM(h.total_points)::int AS pts
-        FROM history h
-        WHERE h.footballer_id = mp.captain_element AND h.round = mp.gw
-      ) gw_pts ON TRUE
-      WHERE mp.gw BETWEEN $1 AND $2
-        AND ms.rejected_reason IS NULL
-        ${stratumClause}
-      GROUP BY mp.entry_id
-    ) t
-  `,
-    startGw,
-    endGw,
+    SELECT pairs.captain_element, pairs.gw, COALESCE(SUM(h.total_points), 0)::int AS pts
+    FROM unnest($1::int[], $2::int[]) AS pairs(captain_element, gw)
+    LEFT JOIN history h
+      ON h.footballer_id = pairs.captain_element AND h.round = pairs.gw
+    GROUP BY pairs.captain_element, pairs.gw
+    `,
+    elements,
+    gws,
   );
-  const row = rows[0];
-  return {
-    avg: row?.avg_bonus ?? null,
-    sample_size: row?.sample_size ?? 0,
-  };
+  const ptsByKey = new Map<string, number>();
+  for (const r of rows) ptsByKey.set(`${r.captain_element}:${r.gw}`, r.pts);
+
+  let bonus = 0;
+  for (const c of captains) {
+    const pts = ptsByKey.get(`${c.captain_element}:${c.gw}`) ?? 0;
+    bonus += pts * (c.captain_multiplier - 1);
+  }
+  return bonus;
 };
 
-// Most-captained element across the range under the given filter.
+// Most-captained element in [startGw, endGw] under the given filter,
+// served by the pre-aggregated stratum_captain_picks_gw table. The table
+// is rebuilt at the end of every populateManagers run (see
+// rebuildStratumCaptainPicks). Returns null if no captain rows in range.
+//
+// `stratumFilter`:
+//   - "active" → all strata (1, 2, 3), active subset only.
+//   - "stratum1" → stratum 1 only, active subset only.
 const sampleMostCaptained = async (
   startGw: number,
   endGw: number,
-  stratumFilter: StratumFilter,
+  stratumFilter: "active" | "stratum1",
 ): Promise<number | null> => {
-  const stratumClause = stratumClauseFor(stratumFilter);
+  const stratumClause =
+    stratumFilter === "stratum1"
+      ? `AND stratum = 1`
+      : `AND stratum IN (1, 2, 3)`;
   const rows = await prisma.$queryRawUnsafe<
     Array<{ captain_element: number; picks: number }>
   >(
     `
-    SELECT mp.captain_element, COUNT(*)::int AS picks
-    FROM manager_picks mp
-    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
-    WHERE mp.gw BETWEEN $1 AND $2
-      AND ms.rejected_reason IS NULL
-      AND mp.captain_element IS NOT NULL
+    SELECT captain_element, SUM(active_picks)::int AS picks
+    FROM stratum_captain_picks_gw
+    WHERE gw BETWEEN $1 AND $2
       ${stratumClause}
-    GROUP BY mp.captain_element
+    GROUP BY captain_element
     ORDER BY picks DESC
     LIMIT 1
-  `,
+    `,
     startGw,
     endGw,
   );
   return rows[0]?.captain_element ?? null;
 };
 
-// Per-stratum aggregate: average per-manager total points, transfers, hits,
-// bench points, GW score, plus chip usage split by season half from
-// manager_picks. Each chip type has two copies per season — one usable
-// in GW1–19, one after the GW20 reset — so the per-half breakdown is
-// what UI bars actually want to display.
-const SEASON_FIRST_HALF_LAST_GW = 19;
+// Per-stratum sample aggregates: averages of total_points, transfers,
+// hits, bench, captain_bonus, gw_score; chip rates for the stratum;
+// coverage flags for transfers/hits/bench (gates the response when too
+// few sampled managers have data in the range).
+//
+// Single SQL query against manager_cumulative — DISTINCT ON (entry_id)
+// ORDER BY gw DESC pulls each entry's running total at the latest in-range
+// GW (c_end) and at the latest pre-range GW (c_start). Subtraction inside
+// the SELECT yields per-entity range deltas; AVG/COUNT/SUM_CASE roll them
+// up. No GROUP BY over manager_history at request time — the heavy work
+// happens once in `rebuildCumulativeForEntry` (per-entry, on populate
+// visit) and `backfillManagerCumulative` (one-off bootstrap).
+//
+// `gws_played` lets `avg_gw_score` use per-manager (range_total /
+// gws_played_in_range) instead of (range_total / nominal_range_width),
+// matching the previous implementation that averaged each manager's
+// `mh.points` per row.
 const sampleStratumAggregates = async (
   startGw: number,
   endGw: number,
-  stratumFilter: StratumFilter,
+  stratumFilter: "active" | "stratum1",
 ): Promise<{
   avg_total_points: number | null;
   avg_transfers: number | null;
   avg_hits: number | null;
   avg_bench: number | null;
+  avg_captain_bonus: number | null;
   avg_gw_score: number | null;
-  // Per-half rates: fraction of sampled managers in this stratum who played
-  // that chip in the given half slice of the requested range. Null when
-  // the requested range doesn't overlap that half (caller short-circuits).
-  wildcards_h1_rate: number | null;
-  wildcards_h2_rate: number | null;
-  free_hits_h1_rate: number | null;
-  free_hits_h2_rate: number | null;
-  bench_boosts_h1_rate: number | null;
-  bench_boosts_h2_rate: number | null;
+  wildcards_rate: number | null;
+  free_hits_rate: number | null;
+  bench_boosts_rate: number | null;
   sample_size: number;
   with_hits_data: number;
   with_bench_data: number;
   with_transfers_data: number;
-  picks_sample_size: number;
 }> => {
-  const stratumClause = stratumClauseFor(stratumFilter);
+  const stratumClause =
+    stratumFilter === "stratum1"
+      ? `AND stratum = 1`
+      : `AND stratum IN (1, 2, 3)`;
 
-  // Aggregate per-entry then average across entries. Covers total points,
-  // transfers, hits, bench, and GW score — all from manager_history.
-  const histRows = await prisma.$queryRawUnsafe<
+  const rows = await prisma.$queryRawUnsafe<
     Array<{
       avg_total_points: number | null;
       avg_transfers: number | null;
       avg_hits: number | null;
       avg_bench: number | null;
+      avg_captain_bonus: number | null;
       avg_gw_score: number | null;
+      wildcards_rate: number | null;
+      free_hits_rate: number | null;
+      bench_boosts_rate: number | null;
       sample_size: number;
       with_hits_data: number;
       with_bench_data: number;
@@ -332,99 +209,91 @@ const sampleStratumAggregates = async (
     }>
   >(
     `
-    SELECT
-      AVG(total_points)::float AS avg_total_points,
-      AVG(transfers)::float    AS avg_transfers,
-      AVG(hits)::float         AS avg_hits,
-      AVG(bench)::float        AS avg_bench,
-      AVG(gw_score)::float     AS avg_gw_score,
-      COUNT(*)::int            AS sample_size,
-      SUM(CASE WHEN has_hits THEN 1 ELSE 0 END)::int AS with_hits_data,
-      SUM(CASE WHEN has_bench THEN 1 ELSE 0 END)::int AS with_bench_data,
-      SUM(CASE WHEN has_transfers THEN 1 ELSE 0 END)::int AS with_transfers_data
-    FROM (
-      SELECT
-        mh.entry_id,
-        SUM(mh.points)::int AS total_points,
-        SUM(COALESCE(mh.event_transfers, 0))::int AS transfers,
-        (SUM(COALESCE(mh.event_transfers_cost, 0)) / 4.0)::float AS hits,
-        SUM(COALESCE(mh.points_on_bench, 0))::int AS bench,
-        AVG(mh.points)::float AS gw_score,
-        BOOL_OR(mh.event_transfers IS NOT NULL)      AS has_transfers,
-        BOOL_OR(mh.event_transfers_cost IS NOT NULL) AS has_hits,
-        BOOL_OR(mh.points_on_bench IS NOT NULL)      AS has_bench
-      FROM manager_history mh
-      JOIN manager_summary ms ON ms.entry_id = mh.entry_id
-      WHERE mh.gw BETWEEN $1 AND $2
-        AND ms.rejected_reason IS NULL
+    WITH c_end AS (
+      SELECT DISTINCT ON (entry_id)
+             entry_id, cumulative_points, cumulative_transfers,
+             cumulative_hits_cost, cumulative_bench, cumulative_captain_bonus,
+             gws_played,
+             chip_wildcard_h1, chip_wildcard_h2,
+             chip_freehit_h1,  chip_freehit_h2,
+             chip_bboost_h1,   chip_bboost_h2,
+             has_transfers, has_hits, has_bench
+      FROM manager_cumulative
+      WHERE rejected_reason IS NULL
         ${stratumClause}
-      GROUP BY mh.entry_id
-    ) t
-  `,
-    startGw,
-    endGw,
-  );
-
-  const histRow = histRows[0];
-
-  // Chip rates split by season half. Rate = distinct managers in stratum
-  // who played that chip in the half-slice of the requested range,
-  // divided by total sampled managers (anyone with picks data in range).
-  // 100% therefore reads as "every sampled manager played their available
-  // copy of this chip in this half."
-  const chipRows = await prisma.$queryRawUnsafe<
-    Array<{
-      wildcards_h1: number;
-      wildcards_h2: number;
-      free_hits_h1: number;
-      free_hits_h2: number;
-      bench_boosts_h1: number;
-      bench_boosts_h2: number;
-      sample_size: number;
-    }>
-  >(
-    `
+        AND gw BETWEEN $1 AND $2
+      ORDER BY entry_id, gw DESC
+    ),
+    c_start AS (
+      SELECT DISTINCT ON (entry_id)
+             entry_id, cumulative_points, cumulative_transfers,
+             cumulative_hits_cost, cumulative_bench, cumulative_captain_bonus,
+             gws_played,
+             chip_wildcard_h1, chip_wildcard_h2,
+             chip_freehit_h1,  chip_freehit_h2,
+             chip_bboost_h1,   chip_bboost_h2,
+             has_transfers, has_hits, has_bench
+      FROM manager_cumulative
+      WHERE rejected_reason IS NULL
+        ${stratumClause}
+        AND gw < $1
+      ORDER BY entry_id, gw DESC
+    ),
+    deltas AS (
+      SELECT
+        e.cumulative_points        - COALESCE(s.cumulative_points,        0) AS d_points,
+        e.cumulative_transfers     - COALESCE(s.cumulative_transfers,     0) AS d_transfers,
+        e.cumulative_hits_cost     - COALESCE(s.cumulative_hits_cost,     0) AS d_hits_cost,
+        e.cumulative_bench         - COALESCE(s.cumulative_bench,         0) AS d_bench,
+        e.cumulative_captain_bonus - COALESCE(s.cumulative_captain_bonus, 0) AS d_captain_bonus,
+        e.gws_played               - COALESCE(s.gws_played,               0) AS d_gws,
+        (e.chip_wildcard_h1 AND NOT COALESCE(s.chip_wildcard_h1, false))
+          OR (e.chip_wildcard_h2 AND NOT COALESCE(s.chip_wildcard_h2, false)) AS played_wildcard,
+        (e.chip_freehit_h1 AND NOT COALESCE(s.chip_freehit_h1, false))
+          OR (e.chip_freehit_h2 AND NOT COALESCE(s.chip_freehit_h2, false))   AS played_freehit,
+        (e.chip_bboost_h1 AND NOT COALESCE(s.chip_bboost_h1, false))
+          OR (e.chip_bboost_h2 AND NOT COALESCE(s.chip_bboost_h2, false))     AS played_bboost,
+        (e.has_transfers AND NOT COALESCE(s.has_transfers, false)) AS got_transfers_data,
+        (e.has_hits      AND NOT COALESCE(s.has_hits,      false)) AS got_hits_data,
+        (e.has_bench     AND NOT COALESCE(s.has_bench,     false)) AS got_bench_data
+      FROM c_end e
+      LEFT JOIN c_start s USING (entry_id)
+    )
     SELECT
-      COUNT(DISTINCT CASE WHEN mp.active_chip = 'wildcard' AND mp.gw <= $3 THEN mp.entry_id END)::int AS wildcards_h1,
-      COUNT(DISTINCT CASE WHEN mp.active_chip = 'wildcard' AND mp.gw >  $3 THEN mp.entry_id END)::int AS wildcards_h2,
-      COUNT(DISTINCT CASE WHEN mp.active_chip = 'freehit'  AND mp.gw <= $3 THEN mp.entry_id END)::int AS free_hits_h1,
-      COUNT(DISTINCT CASE WHEN mp.active_chip = 'freehit'  AND mp.gw >  $3 THEN mp.entry_id END)::int AS free_hits_h2,
-      COUNT(DISTINCT CASE WHEN mp.active_chip = 'bboost'   AND mp.gw <= $3 THEN mp.entry_id END)::int AS bench_boosts_h1,
-      COUNT(DISTINCT CASE WHEN mp.active_chip = 'bboost'   AND mp.gw >  $3 THEN mp.entry_id END)::int AS bench_boosts_h2,
-      COUNT(DISTINCT mp.entry_id)::int AS sample_size
-    FROM manager_picks mp
-    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
-    WHERE mp.gw BETWEEN $1 AND $2
-      AND ms.rejected_reason IS NULL
-      ${stratumClause}
-  `,
+      AVG(d_points)::float                                AS avg_total_points,
+      AVG(d_transfers)::float                             AS avg_transfers,
+      AVG(d_hits_cost / 4.0)::float                       AS avg_hits,
+      AVG(d_bench)::float                                 AS avg_bench,
+      AVG(d_captain_bonus)::float                         AS avg_captain_bonus,
+      AVG(d_points::float / NULLIF(d_gws, 0))::float      AS avg_gw_score,
+      AVG(CASE WHEN played_wildcard THEN 1.0 ELSE 0.0 END)::float AS wildcards_rate,
+      AVG(CASE WHEN played_freehit  THEN 1.0 ELSE 0.0 END)::float AS free_hits_rate,
+      AVG(CASE WHEN played_bboost   THEN 1.0 ELSE 0.0 END)::float AS bench_boosts_rate,
+      COUNT(*)::int                                                AS sample_size,
+      SUM(CASE WHEN got_hits_data      THEN 1 ELSE 0 END)::int     AS with_hits_data,
+      SUM(CASE WHEN got_bench_data     THEN 1 ELSE 0 END)::int     AS with_bench_data,
+      SUM(CASE WHEN got_transfers_data THEN 1 ELSE 0 END)::int     AS with_transfers_data
+    FROM deltas
+    `,
     startGw,
     endGw,
-    SEASON_FIRST_HALF_LAST_GW,
   );
 
-  const chipRow = chipRows[0];
-  const picksSampleSize = chipRow?.sample_size ?? 0;
-  const rateOrNull = (count: number | undefined): number | null =>
-    picksSampleSize > 0 ? (count ?? 0) / picksSampleSize : null;
-
+  const row = rows[0];
   return {
-    avg_total_points: histRow?.avg_total_points ?? null,
-    avg_transfers: histRow?.avg_transfers ?? null,
-    avg_hits: histRow?.avg_hits ?? null,
-    avg_bench: histRow?.avg_bench ?? null,
-    avg_gw_score: histRow?.avg_gw_score ?? null,
-    wildcards_h1_rate: rateOrNull(chipRow?.wildcards_h1),
-    wildcards_h2_rate: rateOrNull(chipRow?.wildcards_h2),
-    free_hits_h1_rate: rateOrNull(chipRow?.free_hits_h1),
-    free_hits_h2_rate: rateOrNull(chipRow?.free_hits_h2),
-    bench_boosts_h1_rate: rateOrNull(chipRow?.bench_boosts_h1),
-    bench_boosts_h2_rate: rateOrNull(chipRow?.bench_boosts_h2),
-    sample_size: histRow?.sample_size ?? 0,
-    with_hits_data: histRow?.with_hits_data ?? 0,
-    with_bench_data: histRow?.with_bench_data ?? 0,
-    with_transfers_data: histRow?.with_transfers_data ?? 0,
-    picks_sample_size: picksSampleSize,
+    avg_total_points: row?.avg_total_points ?? null,
+    avg_transfers: row?.avg_transfers ?? null,
+    avg_hits: row?.avg_hits ?? null,
+    avg_bench: row?.avg_bench ?? null,
+    avg_captain_bonus: row?.avg_captain_bonus ?? null,
+    avg_gw_score: row?.avg_gw_score ?? null,
+    wildcards_rate: row?.wildcards_rate ?? null,
+    free_hits_rate: row?.free_hits_rate ?? null,
+    bench_boosts_rate: row?.bench_boosts_rate ?? null,
+    sample_size: row?.sample_size ?? 0,
+    with_hits_data: row?.with_hits_data ?? 0,
+    with_bench_data: row?.with_bench_data ?? 0,
+    with_transfers_data: row?.with_transfers_data ?? 0,
   };
 };
 
@@ -471,25 +340,27 @@ export const getManagerComparison = async (
   const userGwScore =
     eventsInRange.length > 0 ? userTotalPoints / eventsInRange.length : 0;
 
-  // Count chips played by the user in the range. Each chip-type gets two
-  // copies per season — one in the first half (GW1–19), one after the
-  // mid-season reset (GW20–38) — so this can be 0, 1, or 2 for ranges
-  // spanning the reset point. Backend reports the raw count; the UI
-  // decides how to surface it (e.g. "X / Y" or a filled bar).
   const chipsPlayedInRange = (history.chips ?? []).filter(
     (c) => c.event >= startGw && c.event <= endGw,
   );
-  const userWildcard = chipsPlayedInRange.filter(
+  const userWildcard = chipsPlayedInRange.some(
     (c) => c.name === CHIP_NAME_WILDCARD,
-  ).length;
-  const userFreeHit = chipsPlayedInRange.filter(
+  )
+    ? 1
+    : 0;
+  const userFreeHit = chipsPlayedInRange.some(
     (c) => c.name === CHIP_NAME_FREEHIT,
-  ).length;
-  const userBenchBoost = chipsPlayedInRange.filter(
+  )
+    ? 1
+    : 0;
+  const userBenchBoost = chipsPlayedInRange.some(
     (c) => c.name === CHIP_NAME_BBOOST,
-  ).length;
+  )
+    ? 1
+    : 0;
 
-  // ---- Per-event aggregates from our DB (cheap; one query covers 1–38 rows).
+  // ---- Per-event aggregates from our DB (whole-population averages from
+  // FPL's own per-GW counts; orthogonal to the sampled stratum stats).
   const events = await prisma.events.findMany({
     where: { id: { gte: startGw, lte: endGw }, finished: true },
     select: {
@@ -500,75 +371,39 @@ export const getManagerComparison = async (
       chip_plays: true,
     },
   });
+  const finishedGws = events.map((e) => e.id).sort((a, b) => a - b);
 
   let avgTotalPoints = 0;
   let avgTransfersTotal = 0;
-  // Event-level chip rates split by season half. Each is summed across
-  // events that fall in the requested range and the relevant half slice.
-  // For non-spanning ranges only one half accumulates anything.
-  const chipHalfRates = {
-    wildcard_h1: 0,
-    wildcard_h2: 0,
-    freehit_h1: 0,
-    freehit_h2: 0,
-    bboost_h1: 0,
-    bboost_h2: 0,
-  };
+  let avgWildcardRate = 0;
+  let avgFreeHitRate = 0;
+  let avgBenchBoostRate = 0;
 
   for (const ev of events) {
     avgTotalPoints += ev.average_entry_score;
     if (ev.ranked_count > 0) {
       avgTransfersTotal += ev.transfers_made / ev.ranked_count;
       const cp = ev.chip_plays as ChipPlay[] | null;
-      const isH1 = ev.id <= SEASON_FIRST_HALF_LAST_GW;
-      const wcKey = isH1 ? "wildcard_h1" : "wildcard_h2";
-      const fhKey = isH1 ? "freehit_h1" : "freehit_h2";
-      const bbKey = isH1 ? "bboost_h1" : "bboost_h2";
-      chipHalfRates[wcKey] +=
-        sumChipPlays(cp, CHIP_NAME_WILDCARD) / ev.ranked_count;
-      chipHalfRates[fhKey] +=
-        sumChipPlays(cp, CHIP_NAME_FREEHIT) / ev.ranked_count;
-      chipHalfRates[bbKey] +=
-        sumChipPlays(cp, CHIP_NAME_BBOOST) / ev.ranked_count;
+      avgWildcardRate += sumChipPlays(cp, CHIP_NAME_WILDCARD) / ev.ranked_count;
+      avgFreeHitRate += sumChipPlays(cp, CHIP_NAME_FREEHIT) / ev.ranked_count;
+      avgBenchBoostRate += sumChipPlays(cp, CHIP_NAME_BBOOST) / ev.ranked_count;
     }
   }
 
-  // Range overlap with each half. Used to null out the side that doesn't
-  // apply so the UI can show a single bar instead of an empty second bar.
-  const overlapsH1 = startGw <= SEASON_FIRST_HALF_LAST_GW;
-  const overlapsH2 = endGw > SEASON_FIRST_HALF_LAST_GW;
-  const buildChipStat = (
-    user: number,
-    avgH1: number,
-    avgH2: number,
-    top10kH1: number | null,
-    top10kH2: number | null,
-    top100kH1: number | null,
-    top100kH2: number | null,
-  ): ChipUsageStat => ({
-    user,
-    h1: overlapsH1
-      ? {
-          average: avgH1,
-          top10k_average: top10kH1,
-          top100k_average: top100kH1,
-        }
-      : null,
-    h2: overlapsH2
-      ? {
-          average: avgH2,
-          top10k_average: top10kH2,
-          top100k_average: top100kH2,
-        }
-      : null,
-  });
-
-  // ---- Sample-side per-stratum aggregates (active + top-10k + top-100k).
-  const [activeAgg, top10kAgg, top100kAgg] = await Promise.all([
-    sampleStratumAggregates(startGw, endGw, "active"),
-    sampleStratumAggregates(startGw, endGw, "stratum1"),
-    sampleStratumAggregates(startGw, endGw, "stratum1or2"),
-  ]);
+  // ---- Sample-side per-stratum aggregates (active + top-10k) and most
+  // captained, plus user picks resolution. All in parallel — sample
+  // queries run on indexed cumulative tables (sub-second), most-captained
+  // hits the tiny stratum_captain_picks_gw table (ms), and resolvePicks
+  // dedups the FPL picks fetch with team-impact when both endpoints fire
+  // simultaneously from the frontend.
+  const [activeAgg, top10kAgg, activeMost, top10kMost, userPicks] =
+    await Promise.all([
+      sampleStratumAggregates(startGw, endGw, "active"),
+      sampleStratumAggregates(startGw, endGw, "stratum1"),
+      sampleMostCaptained(startGw, endGw, "active"),
+      sampleMostCaptained(startGw, endGw, "stratum1"),
+      resolvePicks(entryId, finishedGws),
+    ]);
 
   const avgHits = gateOnCoverage(
     activeAgg.avg_hits,
@@ -597,49 +432,49 @@ export const getManagerComparison = async (
     top10kAgg.sample_size,
   );
 
-  const avgHitsTop100k = gateOnCoverage(
-    top100kAgg.avg_hits,
-    top100kAgg.with_hits_data,
-    top100kAgg.sample_size,
+  // ---- User captain bonus + most captained, derived from the resolved
+  // picks. Every is_captain row already carries the post-autosub
+  // multiplier; filter to multiplier > 1 (captain doubled) and join
+  // with `history` for the captain's GW points in one query.
+  const userCaptains = captainPicksFromResolved(userPicks, finishedGws);
+  const userCaptainsForBonus = userCaptains.filter(
+    (
+      c,
+    ): c is {
+      gw: number;
+      captain_element: number;
+      captain_multiplier: number;
+    } =>
+      c.captain_element !== null &&
+      c.captain_multiplier !== null &&
+      c.captain_multiplier > 1,
   );
-  const avgBenchTop100k = gateOnCoverage(
-    top100kAgg.avg_bench,
-    top100kAgg.with_bench_data,
-    top100kAgg.sample_size,
-  );
+  const userCaptainBonus =
+    await userCaptainBonusFromPicks(userCaptainsForBonus);
 
-  // ---- Captain bonus + most captained.
-  // User-side captain stats run in parallel with the sample-side queries
-  // because the FPL picks fetches are the slowest leg.
-  const [
-    userCaptain,
-    activeBonus,
-    top10kBonus,
-    top100kBonus,
-    activeMost,
-    top10kMost,
-    top100kMost,
-  ] = await Promise.all([
-    userCaptainStats(entryId, startGw, endGw),
-    sampleCaptainBonusAvg(startGw, endGw, "active"),
-    sampleCaptainBonusAvg(startGw, endGw, "stratum1"),
-    sampleCaptainBonusAvg(startGw, endGw, "stratum1or2"),
-    sampleMostCaptained(startGw, endGw, "active"),
-    sampleMostCaptained(startGw, endGw, "stratum1"),
-    sampleMostCaptained(startGw, endGw, "stratum1or2"),
+  const captainCounts = new Map<number, number>();
+  for (const c of userCaptains) {
+    if (c.captain_element !== null) {
+      captainCounts.set(
+        c.captain_element,
+        (captainCounts.get(c.captain_element) ?? 0) + 1,
+      );
+    }
+  }
+  let userMostCaptainedElement: number | null = null;
+  let max = 0;
+  for (const [el, count] of captainCounts.entries()) {
+    if (count > max) {
+      max = count;
+      userMostCaptainedElement = el;
+    }
+  }
+
+  const [userMostName, activeMostName, top10kMostName] = await Promise.all([
+    footballerName(userMostCaptainedElement),
+    footballerName(activeMost),
+    footballerName(top10kMost),
   ]);
-
-  const captainAveragePartial =
-    activeBonus.sample_size === 0 ||
-    activeBonus.sample_size < activeAgg.sample_size * COVERAGE_THRESHOLD;
-
-  const [userMostName, activeMostName, top10kMostName, top100kMostName] =
-    await Promise.all([
-      footballerName(userCaptain.mostCaptainedElement),
-      footballerName(activeMost),
-      footballerName(top10kMost),
-      footballerName(top100kMost),
-    ]);
 
   return {
     entry_id: entryId,
@@ -649,84 +484,71 @@ export const getManagerComparison = async (
       user: userTotalPoints,
       average: avgTotalPoints,
       top10k_average: top10kAgg.avg_total_points,
-      top100k_average: top100kAgg.avg_total_points,
     },
     transfers: {
       user: userTransfers,
-      // Prefer the per-manager average from manager_history (real distribution
-      // across the sample) when coverage is sufficient; fall back to the
-      // event-level rate otherwise.
+      // Prefer the per-manager average from the cumulative sample (real
+      // distribution across managers) when coverage is sufficient; fall
+      // back to the event-level rate otherwise.
       average: avgTransfersFromHistory ?? avgTransfersTotal,
       top10k_average: top10kAgg.avg_transfers,
-      top100k_average: top100kAgg.avg_transfers,
     },
-    wildcards: buildChipStat(
-      userWildcard,
-      chipHalfRates.wildcard_h1,
-      chipHalfRates.wildcard_h2,
-      top10kAgg.wildcards_h1_rate,
-      top10kAgg.wildcards_h2_rate,
-      top100kAgg.wildcards_h1_rate,
-      top100kAgg.wildcards_h2_rate,
-    ),
-    free_hits: buildChipStat(
-      userFreeHit,
-      chipHalfRates.freehit_h1,
-      chipHalfRates.freehit_h2,
-      top10kAgg.free_hits_h1_rate,
-      top10kAgg.free_hits_h2_rate,
-      top100kAgg.free_hits_h1_rate,
-      top100kAgg.free_hits_h2_rate,
-    ),
-    bench_boosts: buildChipStat(
-      userBenchBoost,
-      chipHalfRates.bboost_h1,
-      chipHalfRates.bboost_h2,
-      top10kAgg.bench_boosts_h1_rate,
-      top10kAgg.bench_boosts_h2_rate,
-      top100kAgg.bench_boosts_h1_rate,
-      top100kAgg.bench_boosts_h2_rate,
-    ),
+    wildcards: {
+      user: userWildcard,
+      average: avgWildcardRate,
+      top10k_average: top10kAgg.wildcards_rate,
+    },
+    free_hits: {
+      user: userFreeHit,
+      average: avgFreeHitRate,
+      top10k_average: top10kAgg.free_hits_rate,
+    },
+    bench_boosts: {
+      user: userBenchBoost,
+      average: avgBenchBoostRate,
+      top10k_average: top10kAgg.bench_boosts_rate,
+    },
     hits: {
       user: userHits,
       average: avgHits,
       top10k_average: avgHitsTop10k,
-      top100k_average: avgHitsTop100k,
     },
     bench_points: {
       user: userBench,
       average: avgBench,
       top10k_average: avgBenchTop10k,
-      top100k_average: avgBenchTop100k,
     },
     captain_bonus: {
-      user: userCaptain.bonus,
-      average: activeBonus.avg,
-      top10k_average: top10kBonus.avg,
-      top100k_average: top100kBonus.avg,
+      user: userCaptainBonus,
+      average: activeAgg.avg_captain_bonus,
+      top10k_average: top10kAgg.avg_captain_bonus,
     },
     avg_gw_score: {
       user: userGwScore,
       average: activeAgg.avg_gw_score,
       top10k_average: top10kAgg.avg_gw_score,
-      top100k_average: top100kAgg.avg_gw_score,
     },
     most_captained: {
-      user_player_id: userCaptain.mostCaptainedElement,
+      user_player_id: userMostCaptainedElement,
       user_player_name: userMostName,
       average_player_id: activeMost,
       average_player_name: activeMostName,
       top10k_player_id: top10kMost,
       top10k_player_name: top10kMostName,
-      top100k_player_id: top100kMost,
-      top100k_player_name: top100kMostName,
     },
     notes: {
       hits_average_partial:
         avgHits !== null && activeAgg.with_hits_data < activeAgg.sample_size,
       bench_average_partial:
         avgBench !== null && activeAgg.with_bench_data < activeAgg.sample_size,
-      captain_average_partial: captainAveragePartial,
+      // Captain bonus accuracy in the new path is bounded by picks coverage
+      // in the sample. cumulative_captain_bonus accumulates 0 for GWs
+      // without picks ingested (LEFT JOIN), so the average converges as
+      // backfillPicks fills in historical picks. Flagged as partial when
+      // the user's own picks resolution wasn't complete (a stricter signal
+      // than the previous sample-size heuristic — the user can see for
+      // themselves that some of their own picks weren't fetched).
+      captain_average_partial: userPicks.incomplete,
     },
   };
 };

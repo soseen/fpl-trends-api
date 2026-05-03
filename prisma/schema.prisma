@@ -316,17 +316,19 @@ model manager_pick_elements {
   @@index([entry_id, gw])
 }
 
-// Per-(entry_id, gw) running total of manager_history.points up to and
-// including that GW. Maintained by populateManagers.processEntry on every
-// visit; backfilled once via backfillManagerCumulative.ts.
+// Per-(entry_id, gw) running totals up to and including that GW.
+// Maintained by populateManagers.processEntry on every visit; backfilled
+// once via backfillManagerCumulative.ts.
 //
-// Lets stratumCounts (getRangeRank.ts) and computeRankPerPoint
-// (getTeamImpact.ts) compute a manager's range total as
+// Lets stratumCounts (getRangeRank.ts), computeRankPerPoint and
+// sampleStratumAggregates (getManagerComparison.ts) compute manager-side
+// range stats as
 //   cumulative[end_gw] − cumulative[start_gw − 1]
 // — two indexed lookups per entry instead of GROUP BY over the full
 // manager_history scan. With this in place we can drop the SAMPLE_DIVISOR_S3
 // sub-sample and use the full ~625k S3 sample, lifting range-rank precision
-// by ~5×.
+// by ~5×, and replace the per-call manager_history GROUP BY in the
+// comparison endpoint entirely.
 //
 // Semantic invariant: emit one row per (entry_id, gw) where manager_history
 // has a row for that pair — no synthetic anchor rows, no rows for GWs the
@@ -335,24 +337,70 @@ model manager_pick_elements {
 //
 // stratum and rejected_reason are denormalised from manager_summary so the
 // hot query needs no join. Keep them in sync: every processEntry rebuild
-// rewrites them along with cumulative_points.
+// rewrites them along with the cumulative columns.
+//
+// chip_*_h1 / chip_*_h2 split: each FPL chip can be played at most twice
+// per season — once before the second-half boundary (CHIP_HALVES_BOUNDARY),
+// once after. Two booleans per chip let any (start, end) range answer
+// "did the user play this chip in the range" via XOR of the c_end and
+// c_start halves; a single boolean would mis-detect ranges that contain
+// the second play but not the first.
 model manager_cumulative {
-  entry_id          Int
-  gw                Int
-  cumulative_points Int     // SUM(history.points) over [1..gw], net of hits
-  stratum           Int     // denormalised from manager_summary
-  rejected_reason   String? @db.VarChar(20) // denormalised; null = active
+  entry_id                 Int
+  gw                       Int
+  cumulative_points        Int     // SUM(history.points)              over [1..gw], net of hits
+  cumulative_transfers     Int     @default(0) // SUM(event_transfers)
+  cumulative_hits_cost     Int     @default(0) // SUM(event_transfers_cost) — divide by 4 for hits count
+  cumulative_bench         Int     @default(0) // SUM(points_on_bench)
+  cumulative_captain_bonus Int     @default(0) // SUM(captain_pts × (multiplier − 1))
+  gws_played               Int     @default(0) // COUNT(*) — for avg_gw_score over a range
+  chip_wildcard_h1         Boolean @default(false) // wildcard played in [1..min(gw, CHIP_HALVES_BOUNDARY)]
+  chip_wildcard_h2         Boolean @default(false) // wildcard played in (CHIP_HALVES_BOUNDARY..gw]
+  chip_freehit_h1          Boolean @default(false)
+  chip_freehit_h2          Boolean @default(false)
+  chip_bboost_h1           Boolean @default(false)
+  chip_bboost_h2           Boolean @default(false)
+  has_transfers            Boolean @default(false) // BOOL_OR(event_transfers IS NOT NULL)      — coverage gate
+  has_hits                 Boolean @default(false) // BOOL_OR(event_transfers_cost IS NOT NULL) — coverage gate
+  has_bench                Boolean @default(false) // BOOL_OR(points_on_bench IS NOT NULL)      — coverage gate
+  stratum                  Int     // denormalised from manager_summary
+  rejected_reason          String? @db.VarChar(20) // denormalised; null = active
 
   manager manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
 
   @@id([entry_id, gw])
   @@index([stratum, gw]) // c_start (range-rank): WHERE stratum=X AND gw<Y is a contiguous range
-  @@index([stratum, rejected_reason, gw]) // c_start (rank-killer): same pattern, active-only
-  // c_end for both stratumCounts and computeRankPerPoint: DISTINCT ON
-  // (entry_id) ORDER BY entry_id, gw DESC over a stratum partition. Without
-  // this index PG picks the primary key (entry_id, gw) and post-filters
+  @@index([stratum, rejected_reason, gw]) // c_start (active-only path): same pattern with rejected_reason filter
+  // c_end for stratumCounts, computeRankPerPoint and sampleStratumAggregates:
+  // DISTINCT ON (entry_id) ORDER BY entry_id, gw DESC over a stratum partition.
+  // Without this index PG picks the primary key (entry_id, gw) and post-filters
   // stratum, scanning the full table and Incremental-Sorting 12M+ rows.
   // With it, PG range-scans the stratum partition in entry-then-gw-DESC
   // order, no sort needed.
   @@index([stratum, entry_id, gw(sort: Desc)])
+}
+
+// Per-(stratum, gw, captain_element, captain_multiplier) pick counts.
+// Truncated and rebuilt at the end of each populateManagers run as a single
+// GROUP-BY over manager_picks ⨝ manager_summary. Tiny table (~3 strata × 38
+// GWs × ~50 distinct captains × ~3 multipliers ≈ <17k rows total) — fits in
+// shared_buffers and replaces the per-request GROUP BY in
+// fetchCaptainRatesInStratum (getTeamImpact.ts) and sampleMostCaptained
+// (getManagerComparison.ts).
+//
+// `picks` is the raw count over all (entry, gw) rows in stratum;
+// `active_picks` is the count where manager_summary.rejected_reason IS NULL
+// (the active subset used for sample-derived stats). Storing both lets
+// callers pick the filter without re-scanning.
+model stratum_captain_picks_gw {
+  stratum            Int
+  gw                 Int
+  captain_element    Int
+  captain_multiplier Int      // 0 = captain benched, 2 = standard captain, 3 = triple captain
+  picks              Int      // count of (entry, gw) rows in stratum with this combo
+  active_picks       Int      // count where rejected_reason IS NULL
+  last_rebuilt       DateTime @updatedAt
+
+  @@id([stratum, gw, captain_element, captain_multiplier])
+  @@index([stratum, gw])
 }

@@ -8,7 +8,11 @@ import { getTeamsData } from "./teams/getTeamsData.js";
 import { getBasicInfo } from "./fetch.js";
 import { getEvents } from "./events/getEvents.js";
 import { populateDatabase } from "./database/populateDatabase.js";
-import { cachedJson, invalidateCache } from "./cache/responseCache.js";
+import {
+  cachedJson,
+  cachedManagerJson,
+  invalidateCache,
+} from "./cache/responseCache.js";
 import { getManagerSummary } from "./managers/getManagerSummary.js";
 import { getRangeRank } from "./managers/getRangeRank.js";
 import { getManagerTrajectory } from "./managers/getManagerTrajectory.js";
@@ -170,8 +174,9 @@ app.get("/api/manager/:id/range-rank", async (req: Request, res: Response) => {
     return;
   }
   try {
-    const data = await getRangeRank(id, start, end);
-    res.status(200).json(data);
+    await cachedManagerJson(req, res, "range-rank", id, start, end, () =>
+      getRangeRank(id, start, end),
+    );
   } catch (error: unknown) {
     const status = (error as { response?: { status?: number } }).response
       ?.status;
@@ -203,8 +208,9 @@ app.get("/api/manager/:id/team-impact", async (req: Request, res: Response) => {
     return;
   }
   try {
-    const data = await getTeamImpact(id, start, end);
-    res.status(200).json(data);
+    await cachedManagerJson(req, res, "team-impact", id, start, end, () =>
+      getTeamImpact(id, start, end),
+    );
   } catch (error: unknown) {
     const status = (error as { response?: { status?: number } }).response
       ?.status;
@@ -236,8 +242,9 @@ app.get("/api/manager/:id/comparison", async (req: Request, res: Response) => {
     return;
   }
   try {
-    const data = await getManagerComparison(id, start, end);
-    res.status(200).json(data);
+    await cachedManagerJson(req, res, "comparison", id, start, end, () =>
+      getManagerComparison(id, start, end),
+    );
   } catch (error: unknown) {
     const status = (error as { response?: { status?: number } }).response
       ?.status;
