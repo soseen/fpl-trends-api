@@ -1,8 +1,7 @@
 import { prisma } from "../database/client.js";
 import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
-import { fetchEntryEventPicks } from "./fetchPicks.js";
 import { netPointsForEvent } from "./activityFilter.js";
-import { delay } from "../utils.js";
+import { resolvePicks } from "./resolvePicks.js";
 
 // ----------------------------------------------------------------------------
 // Public response types. Mirrored on the frontend in
@@ -125,10 +124,6 @@ export type TeamImpactResponse = {
 const STRATUM_A_MAX = 10_000;
 const STRATUM_B_MAX = 100_000;
 
-// Match the batching used by getManagerComparison.userCaptainStats so we
-// don't burst the FPL API harder than the comparison endpoint already does.
-const PICKS_BATCH_SIZE = 6;
-
 // EO computed from sample is unstable below this many picks rows for a GW.
 // When triggered we drop captain/TC uplift and use global ownership only.
 const SMALL_SAMPLE_THRESHOLD = 50;
@@ -155,135 +150,6 @@ const RANK_DENSITY_HALF_WINDOW = 25;
 // ----------------------------------------------------------------------------
 // Helpers
 // ----------------------------------------------------------------------------
-
-type PickRow = {
-  entry_id: number;
-  gw: number;
-  element_id: number;
-  position: number;
-  multiplier: number;
-  is_captain: boolean;
-  is_vice: boolean;
-};
-
-// Read what we already have persisted for this entry+range. Uses raw SQL
-// because the new `manager_pick_elements` model is not yet in the
-// generated Prisma client (DLL locked on Windows in dev).
-const readPersistedPicks = async (
-  entryId: number,
-  startGw: number,
-  endGw: number,
-): Promise<PickRow[]> => {
-  return prisma.$queryRawUnsafe<PickRow[]>(
-    `
-    SELECT entry_id, gw, element_id, position, multiplier, is_captain, is_vice
-    FROM manager_pick_elements
-    WHERE entry_id = $1 AND gw BETWEEN $2 AND $3
-    `,
-    entryId,
-    startGw,
-    endGw,
-  );
-};
-
-const persistPicks = async (
-  entryId: number,
-  gw: number,
-  picks: ReadonlyArray<{
-    element: number;
-    position: number;
-    multiplier: number;
-    is_captain: boolean;
-    is_vice_captain: boolean;
-  }>,
-): Promise<void> => {
-  if (picks.length === 0) return;
-  // Build one INSERT with N tuples. ON CONFLICT DO NOTHING means a re-fetch
-  // is cheap and idempotent.
-  const values: unknown[] = [];
-  const tuples = picks.map((p, i) => {
-    const base = i * 7;
-    values.push(
-      entryId,
-      gw,
-      p.element,
-      p.position,
-      p.multiplier,
-      p.is_captain,
-      p.is_vice_captain,
-    );
-    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`;
-  });
-  await prisma.$executeRawUnsafe(
-    `
-    INSERT INTO manager_pick_elements
-      (entry_id, gw, element_id, position, multiplier, is_captain, is_vice)
-    VALUES ${tuples.join(", ")}
-    ON CONFLICT (entry_id, gw, element_id) DO NOTHING
-    `,
-    ...values,
-  );
-};
-
-// Resolve the user's full XV for every finished GW in [startGw, endGw],
-// preferring our DB cache and falling back to the FPL API in batches of
-// PICKS_BATCH_SIZE for any uncached GWs. Persists newly-fetched picks.
-//
-// Returns the full set of pick rows plus a flag indicating whether any
-// requested GW failed to resolve.
-const resolvePicks = async (
-  entryId: number,
-  finishedGws: number[],
-): Promise<{ picks: PickRow[]; incomplete: boolean }> => {
-  if (finishedGws.length === 0) return { picks: [], incomplete: false };
-
-  const startGw = Math.min(...finishedGws);
-  const endGw = Math.max(...finishedGws);
-  const persisted = await readPersistedPicks(entryId, startGw, endGw);
-
-  const cachedGws = new Set(persisted.map((r) => r.gw));
-  const missingGws = finishedGws.filter((g) => !cachedGws.has(g));
-
-  let incomplete = false;
-  const fetched: PickRow[] = [];
-
-  for (let i = 0; i < missingGws.length; i += PICKS_BATCH_SIZE) {
-    const batch = missingGws.slice(i, i + PICKS_BATCH_SIZE);
-    const results = await Promise.all(
-      batch.map(async (gw) => {
-        try {
-          const payload = await fetchEntryEventPicks(entryId, gw);
-          return { gw, picks: payload.picks ?? [] };
-        } catch {
-          return null;
-        }
-      }),
-    );
-    for (const r of results) {
-      if (!r) {
-        incomplete = true;
-        continue;
-      }
-      // Persist (non-blocking persist would be nice but we keep it simple
-      // and consistent with the rest of the codebase).
-      await persistPicks(entryId, r.gw, r.picks);
-      for (const p of r.picks) {
-        fetched.push({
-          entry_id: entryId,
-          gw: r.gw,
-          element_id: p.element,
-          position: p.position,
-          multiplier: p.multiplier,
-          is_captain: p.is_captain,
-          is_vice: p.is_vice_captain,
-        });
-      }
-    }
-    if (i + PICKS_BATCH_SIZE < missingGws.length) await delay(60);
-  }
-
-  return { picks: [...persisted, ...fetched], incomplete };
-};
 
 type FootballerInfo = {
   id: number;
@@ -541,8 +407,13 @@ const fetchPlayerMatches = async (
   return map;
 };
 
-// Captain / TC rates per (player, gw) within stratum, sample-derived.
-// Returns map keyed `${player_id}:${gw}` plus per-GW sample sizes.
+// Captain / TC rates per (player, gw) within stratum, served by the
+// pre-aggregated `stratum_captain_picks_gw` table (rebuilt at the end of
+// every populateManagers run via `rebuildStratumCaptainPicks`). Replaces
+// two GROUP-BYs over the full stratum slice of `manager_picks` — both
+// reads here are PK index lookups against ~17k rows total.
+//
+// Returns rates keyed `${player_id}:${gw}` plus per-GW active sample size.
 const fetchCaptainRatesInStratum = async (
   stratum: number | null,
   startGw: number,
@@ -555,21 +426,18 @@ const fetchCaptainRatesInStratum = async (
   const perGwSampleSize = new Map<number, number>();
   if (stratum === null) return { rates, perGwSampleSize };
 
-  const stratumClause = `AND ms.stratum = $3`;
-
-  // Sample size per GW = distinct managers in stratum with a manager_picks
-  // row that GW.
+  // Sample size per GW = sum of active_picks (across all captain/multiplier
+  // combos) for that stratum and GW. Active = rejected_reason IS NULL,
+  // matching the previous read filter.
   const sampleRows = await prisma.$queryRawUnsafe<
     Array<{ gw: number; sample_size: number }>
   >(
     `
-    SELECT mp.gw, COUNT(DISTINCT mp.entry_id)::int AS sample_size
-    FROM manager_picks mp
-    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
-    WHERE mp.gw BETWEEN $1 AND $2
-      AND ms.rejected_reason IS NULL
-      ${stratumClause}
-    GROUP BY mp.gw
+    SELECT gw, SUM(active_picks)::int AS sample_size
+    FROM stratum_captain_picks_gw
+    WHERE gw BETWEEN $1 AND $2
+      AND stratum = $3
+    GROUP BY gw
     `,
     startGw,
     endGw,
@@ -586,14 +454,10 @@ const fetchCaptainRatesInStratum = async (
     }>
   >(
     `
-    SELECT mp.gw, mp.captain_element, mp.captain_multiplier, COUNT(*)::int AS n
-    FROM manager_picks mp
-    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
-    WHERE mp.gw BETWEEN $1 AND $2
-      AND ms.rejected_reason IS NULL
-      AND mp.captain_element IS NOT NULL
-      ${stratumClause}
-    GROUP BY mp.gw, mp.captain_element, mp.captain_multiplier
+    SELECT gw, captain_element, captain_multiplier, active_picks AS n
+    FROM stratum_captain_picks_gw
+    WHERE gw BETWEEN $1 AND $2
+      AND stratum = $3
     `,
     startGw,
     endGw,
@@ -613,14 +477,6 @@ const fetchCaptainRatesInStratum = async (
   }
   return { rates, perGwSampleSize };
 };
-
-// Read-path feature flag mirrors getRangeRank.ts. When true, the density
-// SQL reads from manager_cumulative; otherwise it falls back to the legacy
-// GROUP BY over manager_history. The same flag controls both call sites
-// because the underlying tables share a maintenance lifecycle and rolling
-// only one over would leave the two estimators inconsistent (range_rank
-// pulled from one source, rank_per_point from another).
-const USE_CUMULATIVE_TABLE = process.env["USE_CUMULATIVE_TABLE"] === "true";
 
 // rank_per_point coefficient at the user's range total.
 //
@@ -642,105 +498,37 @@ const computeRankPerPoint = async (
   const lo = userRangeTotal - RANK_DENSITY_HALF_WINDOW;
   const hi = userRangeTotal + RANK_DENSITY_HALF_WINDOW;
 
-  let rows: Array<{
-    neighbours: number;
-    probes_with_history: number;
-    avg_total: number | null;
-  }>;
-
-  if (USE_CUMULATIVE_TABLE) {
-    // Loose-index-scan via recursive CTE — see the long comment in
-    // getRangeRank.ts:stratumCounts for why naive DISTINCT ON over the full
-    // partition is ~4 s on prod even with the right index. Same idiom here.
-    // The `rejected_reason IS NULL` predicate uses the
-    // (stratum, rejected_reason, gw) index for c_start; for c_end the
-    // (stratum, entry_id, gw DESC) index covers the recursive seek and
-    // PG post-filters rejected_reason on each one-row hit (cheap because
-    // each iteration emits one row).
-    rows = await prisma.$queryRaw<typeof rows>`
-      WITH RECURSIVE c_end AS (
-        (
-          SELECT entry_id, cumulative_points
-          FROM manager_cumulative
-          WHERE stratum = ${stratum}
-            AND rejected_reason IS NULL
-            AND gw BETWEEN ${startGw} AND ${endGw}
-          ORDER BY entry_id, gw DESC
-          LIMIT 1
-        )
-        UNION ALL
-        SELECT n.entry_id, n.cumulative_points
-        FROM c_end e
-        CROSS JOIN LATERAL (
-          SELECT entry_id, cumulative_points
-          FROM manager_cumulative
-          WHERE stratum = ${stratum}
-            AND rejected_reason IS NULL
-            AND gw BETWEEN ${startGw} AND ${endGw}
-            AND entry_id > e.entry_id
-          ORDER BY entry_id, gw DESC
-          LIMIT 1
-        ) n
-      ),
-      c_start AS (
-        (
-          SELECT entry_id, cumulative_points
-          FROM manager_cumulative
-          WHERE stratum = ${stratum}
-            AND rejected_reason IS NULL
-            AND gw < ${startGw}
-          ORDER BY entry_id, gw DESC
-          LIMIT 1
-        )
-        UNION ALL
-        SELECT n.entry_id, n.cumulative_points
-        FROM c_start s
-        CROSS JOIN LATERAL (
-          SELECT entry_id, cumulative_points
-          FROM manager_cumulative
-          WHERE stratum = ${stratum}
-            AND rejected_reason IS NULL
-            AND gw < ${startGw}
-            AND entry_id > s.entry_id
-          ORDER BY entry_id, gw DESC
-          LIMIT 1
-        ) n
-      )
-      SELECT
-        COUNT(*) FILTER (WHERE total BETWEEN ${lo} AND ${hi})::int AS neighbours,
-        COUNT(*)::int                                              AS probes_with_history,
-        AVG(total)::float                                          AS avg_total
-      FROM (
-        SELECT c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0) AS total
-        FROM c_end
-        LEFT JOIN c_start USING (entry_id)
-      ) t
-    `;
-  } else {
-    rows = await prisma.$queryRawUnsafe<typeof rows>(
-      `
-      WITH manager_totals AS (
-        SELECT mh.entry_id, SUM(mh.points)::int AS total
-        FROM manager_history mh
-        JOIN manager_summary ms ON ms.entry_id = mh.entry_id
-        WHERE mh.gw BETWEEN $1 AND $2
-          AND ms.stratum = $3
-          AND ms.rejected_reason IS NULL
-        GROUP BY mh.entry_id
-      )
-      SELECT
-        COUNT(*) FILTER (WHERE total BETWEEN $4 AND $5)::int AS neighbours,
-        COUNT(*)::int AS probes_with_history,
-        AVG(total)::float AS avg_total
-      FROM manager_totals
-      `,
-      startGw,
-      endGw,
-      stratum,
-      lo,
-      hi,
-    );
-  }
+  const rows = await prisma.$queryRaw<
+    Array<{
+      neighbours: number;
+      probes_with_history: number;
+      avg_total: number | null;
+    }>
+  >`
+    WITH c_end AS (
+      SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
+      FROM manager_cumulative
+      WHERE stratum = ${stratum}
+        AND gw BETWEEN ${startGw} AND ${endGw}
+      ORDER BY entry_id, gw DESC
+    ),
+    c_start AS (
+      SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
+      FROM manager_cumulative
+      WHERE stratum = ${stratum}
+        AND gw < ${startGw}
+      ORDER BY entry_id, gw DESC
+    )
+    SELECT
+      COUNT(*) FILTER (WHERE total BETWEEN ${lo} AND ${hi})::int AS neighbours,
+      COUNT(*)::int                                              AS probes_with_history,
+      AVG(total)::float                                          AS avg_total
+    FROM (
+      SELECT c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0) AS total
+      FROM c_end
+      LEFT JOIN c_start USING (entry_id)
+    ) t
+  `;
   const row = rows[0];
   if (!row || row.probes_with_history === 0) {
     return { rank_per_point: null, stratum_avg: null };

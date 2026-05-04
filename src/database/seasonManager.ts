@@ -177,6 +177,17 @@ export async function wipeAllSeasonData(): Promise<void> {
   await prisma.manager_summary.deleteMany();
   console.info("   ✓ manager_summary cleared");
 
+  // stratum_captain_picks_gw is denormalised aggregate state, not FK-linked
+  // to manager_summary, so it doesn't cascade. Truncate it explicitly so a
+  // new-season populate doesn't read stale buckets from the previous one.
+  // Raw SQL (rather than `prisma.stratum_captain_picks_gw.deleteMany()`)
+  // because the generated Prisma client may not yet include the new model
+  // on hosts where `prisma generate` couldn't run (Windows dev DLL lock,
+  // or first-deploy ordering issues). Same pattern getTeamImpact uses for
+  // `manager_pick_elements`.
+  await prisma.$executeRawUnsafe(`TRUNCATE stratum_captain_picks_gw`);
+  console.info("   ✓ stratum_captain_picks_gw cleared");
+
   // Delete cached data files
   const filesToDelete = [RAW_BOOTSTRAP_STATIC_FILE, RAW_FOOTBALLERS_FILE];
 

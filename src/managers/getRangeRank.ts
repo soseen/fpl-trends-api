@@ -67,150 +67,50 @@ const pickStratum = (
   return null;
 };
 
-// Read-path feature flag for the cumulative-table rewrite. When true,
-// stratumCounts and computeRankPerPoint read from manager_cumulative
-// instead of GROUP-BY-ing manager_history. Lets us flip back without a
-// redeploy if live latency surprises after the switch. Plan to remove
-// once the new path has been clean for a day in prod.
-const USE_CUMULATIVE_TABLE = process.env["USE_CUMULATIVE_TABLE"] === "true";
-
-// Legacy stratum-3 sub-sample. The old path GROUP-BYs manager_history,
-// which scans ~21M rows for full-season S3 — slow enough that we filter
-// to `entry_id % 30 = 0` (~21k probes). That sub-sample IS the precision
-// floor running the crawl longer cannot break: noise scales 1/√n, so
-// using 21k of 625k probes inflates std-dev by √30 ≈ 5.5×.
-//
-// The new path (manager_cumulative) avoids the GROUP BY entirely — two
-// indexed lookups per entry, no row-scan-vs-precision trade-off — so we
-// can use the full sample. Kept here only for the legacy fallback path.
-const SAMPLE_DIVISOR_S3 = 30;
-
 // Returns both `higher` (managers in the stratum whose summed range points
 // >= threshold) and `probes_with_history` (managers in the stratum with at
-// least one manager_history row in [startGw, endGw]) in a single SQL
+// least one manager_cumulative row in [startGw, endGw]) in a single SQL
 // round-trip.
 //
-// New path (USE_CUMULATIVE_TABLE=true): reads manager_cumulative and uses
-// DISTINCT ON (entry_id) ORDER BY gw DESC to pull each entry's running
-// total at the latest in-range GW, then subtracts the latest pre-range
-// row (or 0 if entry joined inside the range). Entries with no in-range
-// row drop, exactly matching the legacy "probes with history in range"
-// semantic.
-//
-// Legacy path: the comment block at SAMPLE_DIVISOR_S3 explains why the
-// stratum-3 sub-sample exists. Both paths include inactive/trolling
-// managers in the denominator — they DO have manager_history rows; only
-// `fetch_failed` probes naturally drop out.
+// DISTINCT ON (entry_id) ORDER BY gw DESC pulls each entry's running total
+// at the latest in-range GW (c_end), then subtracts the latest pre-range
+// row (c_start, COALESCE to 0 if the entry joined inside the range).
+// Entries with no in-range row drop, exactly matching the "probes with
+// history in range" semantic. Includes inactive/trolling managers in the
+// denominator — they DO have manager_cumulative rows; only `fetch_failed`
+// probes naturally drop out.
 const stratumCounts = async (
   stratum: 1 | 2 | 3,
   startGw: number,
   endGw: number,
   threshold: number,
 ): Promise<{ higher: number; probesWithHistory: number }> => {
-  if (USE_CUMULATIVE_TABLE) {
-    // Loose-index-scan rewrite. Naive `DISTINCT ON (entry_id) ... ORDER BY
-    // gw DESC` over the (stratum=N, gw IN range) partition reads ALL rows
-    // (~13M for S3 full-season) and lets Unique pick one per group — that
-    // takes ~4 s even with the data fully cached and the right index,
-    // because the bottleneck is the 13M row stream itself.
-    //
-    // Recursive-CTE form: walk distinct entry_ids one at a time. Each
-    // iteration is a single B-tree probe on
-    // (stratum, entry_id > previous, gw DESC) returning ONE row — so the
-    // total work is ~400k lookups rather than 13M row reads. PostgreSQL
-    // doesn't have native skip-scan; this is the standard idiom.
-    //
-    // The ORDER BY in the recursive arm IS load-bearing: with the
-    // (stratum, entry_id, gw DESC) index PG plans it as a single seek,
-    // not a scan-and-sort.
-    const rows = await prisma.$queryRaw<
-      Array<{ higher: number; probes_with_history: number }>
-    >`
-      WITH RECURSIVE c_end AS (
-        (
-          SELECT entry_id, cumulative_points
-          FROM manager_cumulative
-          WHERE stratum = ${stratum}
-            AND gw BETWEEN ${startGw} AND ${endGw}
-          ORDER BY entry_id, gw DESC
-          LIMIT 1
-        )
-        UNION ALL
-        SELECT n.entry_id, n.cumulative_points
-        FROM c_end e
-        CROSS JOIN LATERAL (
-          SELECT entry_id, cumulative_points
-          FROM manager_cumulative
-          WHERE stratum = ${stratum}
-            AND gw BETWEEN ${startGw} AND ${endGw}
-            AND entry_id > e.entry_id
-          ORDER BY entry_id, gw DESC
-          LIMIT 1
-        ) n
-      ),
-      c_start AS (
-        (
-          SELECT entry_id, cumulative_points
-          FROM manager_cumulative
-          WHERE stratum = ${stratum}
-            AND gw < ${startGw}
-          ORDER BY entry_id, gw DESC
-          LIMIT 1
-        )
-        UNION ALL
-        SELECT n.entry_id, n.cumulative_points
-        FROM c_start s
-        CROSS JOIN LATERAL (
-          SELECT entry_id, cumulative_points
-          FROM manager_cumulative
-          WHERE stratum = ${stratum}
-            AND gw < ${startGw}
-            AND entry_id > s.entry_id
-          ORDER BY entry_id, gw DESC
-          LIMIT 1
-        ) n
-      )
-      SELECT
-        COUNT(*) FILTER (WHERE s >= ${threshold})::int AS higher,
-        COUNT(*)::int                                  AS probes_with_history
-      FROM (
-        SELECT c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0) AS s
-        FROM c_end
-        LEFT JOIN c_start USING (entry_id)
-      ) t
-    `;
-    const row = rows[0];
-    return {
-      higher: row?.higher ?? 0,
-      probesWithHistory: row?.probes_with_history ?? 0,
-    };
-  }
-
-  const subSampleClause =
-    stratum === 3 ? `AND mh.entry_id % ${SAMPLE_DIVISOR_S3} = 0` : ``;
-  const rows = await prisma.$queryRawUnsafe<
+  const rows = await prisma.$queryRaw<
     Array<{ higher: number; probes_with_history: number }>
-  >(
-    `
-    WITH manager_totals AS (
-      SELECT mh.entry_id, SUM(mh.points)::int AS s
-      FROM manager_history mh
-      JOIN manager_summary ms ON ms.entry_id = mh.entry_id
-      WHERE mh.gw BETWEEN $1 AND $2
-        AND ms.stratum = $3
-        ${subSampleClause}
-      GROUP BY mh.entry_id
+  >`
+    WITH c_end AS (
+      SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
+      FROM manager_cumulative
+      WHERE stratum = ${stratum}
+        AND gw BETWEEN ${startGw} AND ${endGw}
+      ORDER BY entry_id, gw DESC
+    ),
+    c_start AS (
+      SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
+      FROM manager_cumulative
+      WHERE stratum = ${stratum}
+        AND gw < ${startGw}
+      ORDER BY entry_id, gw DESC
     )
     SELECT
-      COUNT(*) FILTER (WHERE s >= $4)::int AS higher,
-      COUNT(*)::int AS probes_with_history
-    FROM manager_totals
-    `,
-    startGw,
-    endGw,
-    stratum,
-    threshold,
-  );
+      COUNT(*) FILTER (WHERE s >= ${threshold})::int AS higher,
+      COUNT(*)::int                                  AS probes_with_history
+    FROM (
+      SELECT c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0) AS s
+      FROM c_end
+      LEFT JOIN c_start USING (entry_id)
+    ) t
+  `;
   const row = rows[0];
   return {
     higher: row?.higher ?? 0,

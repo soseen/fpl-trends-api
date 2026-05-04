@@ -8,12 +8,17 @@ import { getTeamsData } from "./teams/getTeamsData.js";
 import { getBasicInfo } from "./fetch.js";
 import { getEvents } from "./events/getEvents.js";
 import { populateDatabase } from "./database/populateDatabase.js";
-import { cachedJson, invalidateCache } from "./cache/responseCache.js";
+import {
+  cachedJson,
+  cachedManagerJson,
+  invalidateCache,
+} from "./cache/responseCache.js";
 import { getManagerSummary } from "./managers/getManagerSummary.js";
 import { getRangeRank } from "./managers/getRangeRank.js";
 import { getManagerTrajectory } from "./managers/getManagerTrajectory.js";
 import { getManagerComparison } from "./managers/getManagerComparison.js";
 import { getTeamImpact } from "./managers/getTeamImpact.js";
+import { getManagerTransfers } from "./managers/getManagerTransfers.js";
 
 const app = express();
 const PORT = parseInt(process.env["PORT"] as string) || 3000;
@@ -170,8 +175,9 @@ app.get("/api/manager/:id/range-rank", async (req: Request, res: Response) => {
     return;
   }
   try {
-    const data = await getRangeRank(id, start, end);
-    res.status(200).json(data);
+    await cachedManagerJson(req, res, "range-rank", id, start, end, () =>
+      getRangeRank(id, start, end),
+    );
   } catch (error: unknown) {
     const status = (error as { response?: { status?: number } }).response
       ?.status;
@@ -203,8 +209,9 @@ app.get("/api/manager/:id/team-impact", async (req: Request, res: Response) => {
     return;
   }
   try {
-    const data = await getTeamImpact(id, start, end);
-    res.status(200).json(data);
+    await cachedManagerJson(req, res, "team-impact", id, start, end, () =>
+      getTeamImpact(id, start, end),
+    );
   } catch (error: unknown) {
     const status = (error as { response?: { status?: number } }).response
       ?.status;
@@ -214,6 +221,40 @@ app.get("/api/manager/:id/team-impact", async (req: Request, res: Response) => {
     }
     console.error(`Error computing team impact for ${id}:`, error);
     res.status(500).json({ error: "Failed to compute team impact." });
+  }
+});
+
+app.get("/api/manager/:id/transfers", async (req: Request, res: Response) => {
+  const id = parseEntryId(req.params["id"] ?? "");
+  if (id === null) {
+    res.status(400).json({ error: "Invalid FPL ID." });
+    return;
+  }
+  const start = Number(req.query["start"]);
+  const end = Number(req.query["end"]);
+  if (
+    !Number.isInteger(start) ||
+    !Number.isInteger(end) ||
+    start < 1 ||
+    end < start ||
+    end > 38
+  ) {
+    res.status(400).json({ error: "Invalid gameweek range." });
+    return;
+  }
+  try {
+    await cachedManagerJson(req, res, "transfers", id, start, end, () =>
+      getManagerTransfers(id, start, end),
+    );
+  } catch (error: unknown) {
+    const status = (error as { response?: { status?: number } }).response
+      ?.status;
+    if (status === 404) {
+      res.status(404).json({ error: "Manager not found." });
+      return;
+    }
+    console.error(`Error computing transfers for ${id}:`, error);
+    res.status(500).json({ error: "Failed to compute transfers." });
   }
 });
 
@@ -236,8 +277,9 @@ app.get("/api/manager/:id/comparison", async (req: Request, res: Response) => {
     return;
   }
   try {
-    const data = await getManagerComparison(id, start, end);
-    res.status(200).json(data);
+    await cachedManagerJson(req, res, "comparison", id, start, end, () =>
+      getManagerComparison(id, start, end),
+    );
   } catch (error: unknown) {
     const status = (error as { response?: { status?: number } }).response
       ?.status;
