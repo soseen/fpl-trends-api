@@ -105,13 +105,19 @@ export const sampleAvgPtsPerTransfer = async (
   endGw: number,
   stratumFilter: "active" | "stratum1",
 ): Promise<SampleTransferNet> => {
-  // For "active" mode include all of stratum 1+2 plus a 1-in-8 sample of
-  // stratum 3 (entry_id % 8 = 0). For "stratum1" mode it's just stratum 1
-  // (~10k entries — small enough not to need sampling).
+  // For "active" mode include all of stratum 1+2 plus a 1-in-32 sample of
+  // stratum 3 (entry_id % 32 = 0). The narrower sample (vs. 1/8 used in
+  // stratumCounts/computeRankPerPoint) is a per-query trade-off: each
+  // transfer triggers two scalar subqueries against `history`, so the
+  // total work scales with sampled-transfer count, not sampled-manager
+  // count. 1/32 keeps the cold-cache budget under ~3 s; the sample mean
+  // remains unbiased.
+  // For "stratum1" mode it's just stratum 1 (~10k entries — small enough
+  // not to need sampling).
   const stratumClause =
     stratumFilter === "stratum1"
       ? `AND ms.stratum = 1`
-      : `AND (ms.stratum IN (1, 2) OR (ms.stratum = 3 AND ms.entry_id % 8 = 0))`;
+      : `AND (ms.stratum IN (1, 2) OR (ms.stratum = 3 AND ms.entry_id % 32 = 0))`;
 
   // Per-manager net + count via scalar subqueries on history (small,
   // PK-indexed — ~30 k rows per season). The previous version filtered
