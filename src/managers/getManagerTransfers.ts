@@ -25,16 +25,19 @@ export type TransferImpactPlayer = {
   code: number;
   team_code: number;
   element_type: number; // 1=GK, 2=DEF, 3=MID, 4=FWD
-  // Points contributed in the window:
-  //   IN side  → multiplier-aware: SUM over [transfer.gw, endGw] of
-  //              (pick_multiplier_for_gw × history.total_points_for_gw).
-  //              Captures what the player actually did for the user
-  //              (benched = 0 contribution; captained = 2× points; etc.).
-  //   OUT side → raw: SUM of history.total_points across the window.
-  //              Approximates "what we'd have got if we'd kept them" by
-  //              assuming a normal start. The user accepted this
-  //              approximation because we genuinely can't know whether
-  //              a player would have been started/benched/captained.
+  // Points contributed in the per-pair comparison window:
+  //   Window  = [transfer.gw, lastOwnedGw] for normal transfers, where
+  //             lastOwnedGw is the GW before the IN player was next
+  //             transferred OUT (or endGw if still owned). For Free Hit
+  //             transfers the window is [fhGw, fhGw] (single GW).
+  //   IN side → multiplier-aware: SUM of (pick_mult × history.points)
+  //             across the window. Captures what the player actually did
+  //             for the user (benched = 0; captained = 2×; etc.).
+  //   OUT side → 0 if the OUT player was benched in the prev-GW (their
+  //             last owned GW before this transfer), otherwise raw SUM
+  //             of history.points across the window. The bench-suppress
+  //             rule fixes the wildcard case where bench-warmers were
+  //             being credited as if they'd have played.
   points_in_window: number;
 };
 
@@ -44,10 +47,11 @@ export type TransferImpactPair = {
   net_points: number; // in.points_in_window − out.points_in_window
 };
 
-// One per GW in which the manager made (kept) transfers, OR played a chip.
-// Bench-boost GWs render as a special card: pairs is empty and
-// `bench_boost_points` is the headline figure. Chip GWs (wildcard / free
-// hit / 3xc / manager) render normally with the chip badge in the header.
+// One per GW in which the manager made (kept) transfers. Chip GWs render
+// normally with the chip badge in the header. Solo Bench Boost GWs (no
+// transfers) are dropped; BB+transfers GWs render their pairs normally
+// and the BB chip badge is purely informational (bench points are not
+// folded into the gain because BB is prepared for, not a transfer effect).
 export type TransferImpactEvent = {
   gw: number;
   pairs: TransferImpactPair[];
@@ -60,11 +64,6 @@ export type TransferImpactEvent = {
   // gross_net_points − hits_cost. Headline for the event card.
   combined_net_points: number;
   chip: ActiveChip;
-  // Only set when chip === "bboost". The points scored by the user's
-  // bench in this GW; replaces the pair-comparison view because the
-  // "what would the previous team's bench have scored" comparison is
-  // unfair (BB GWs are always prepared with a strong bench).
-  bench_boost_points: number | null;
 };
 
 export type ManagerTransfersResponse = {
@@ -74,8 +73,8 @@ export type ManagerTransfersResponse = {
   events: TransferImpactEvent[]; // sorted by gw desc
   // Number of "real" transfers in range (after ghost filter).
   total_transfers: number;
-  // Sum of combined_net_points across events (so hits and bench-boost
-  // adjustments are included). The frontend's headline number.
+  // Sum of combined_net_points across events (so hits are included).
+  // The frontend's headline number.
   total_net_points: number;
   // null when total_transfers === 0.
   avg_net_per_transfer: number | null;
@@ -162,7 +161,7 @@ const buildFinalXvMap = (picks: ReadonlyArray<PickRow>): FinalXvMap => {
 };
 
 // IN-player points: per-GW multiplier-aware. The window is
-// [transfer.gw, endGw]; for GWs where the player isn't in the user's
+// [transfer.gw, windowEnd]; for GWs where the player isn't in the user's
 // squad the multiplier map yields 0 and the contribution is 0
 // (matches the "they're no longer ours, can't score for us" semantics
 // for transfers-out-of-squad later in the range).
@@ -171,10 +170,10 @@ const inPointsInWindow = (
   multipliers: MultiplierMap,
   playerId: number,
   fromGw: number,
-  endGw: number,
+  windowEnd: number,
 ): number => {
   let total = 0;
-  for (let gw = fromGw; gw <= endGw; gw += 1) {
+  for (let gw = fromGw; gw <= windowEnd; gw += 1) {
     const pts = perRound.get(`${playerId}:${gw}`) ?? 0;
     if (pts === 0) continue;
     const mult = multipliers.get(gw)?.get(playerId) ?? 0;
@@ -183,21 +182,91 @@ const inPointsInWindow = (
   return total;
 };
 
-// OUT-player points: raw across the window. Assumes a default multiplier
-// of 1 — the user can't truly know whether they'd have started/benched/
-// captained the OUT player, and asking the data to guess would be
-// misleading. Stays as-is from the v1 implementation.
+// OUT-player points: raw across the window when the player was started
+// in the prev-GW; 0 otherwise. The bench-suppress rule fixes the
+// wildcard case where bench-warmers were being credited as if they'd
+// have played. Captaincy is NOT preserved on the OUT side (binary 0/raw
+// only) — captaincy is a per-week decision and extending it through a
+// multi-GW window would overstate.
 const outPointsInWindow = (
   perRound: Map<string, number>,
   playerId: number,
   fromGw: number,
-  endGw: number,
+  windowEnd: number,
+  prevStarted: boolean,
 ): number => {
+  if (!prevStarted) return 0;
   let total = 0;
-  for (let gw = fromGw; gw <= endGw; gw += 1) {
+  for (let gw = fromGw; gw <= windowEnd; gw += 1) {
     total += perRound.get(`${playerId}:${gw}`) ?? 0;
   }
   return total;
+};
+
+// For each transfer (player B in at GW X), compute the GW B was last
+// owned: the GW before B was next transferred OUT in a non-FH GW (or
+// `endGw` if B is still owned). For FH transfers, lastOwnedGw is always
+// the FH GW itself — players come back next GW.
+//
+// Skipping FH-OUT events while scanning is critical: a FH-OUT is
+// ephemeral (the player returns to the underlying squad next GW), not
+// a real ownership end. Treating it as one would shorten the ownership
+// window of every player held through a FH.
+const buildLastOwnedGwMap = (
+  realTransfers: ReadonlyArray<TransferRow>,
+  fhGws: ReadonlySet<number>,
+  endGw: number,
+): Map<string, number> => {
+  const result = new Map<string, number>();
+  for (const t of realTransfers) {
+    const key = `${t.in_element}:${t.gw}`;
+    if (fhGws.has(t.gw)) {
+      result.set(key, t.gw);
+      continue;
+    }
+    let lastOwned = endGw;
+    for (const t2 of realTransfers) {
+      if (t2.gw <= t.gw) continue;
+      if (fhGws.has(t2.gw)) continue;
+      if (t2.out_element !== t.in_element) continue;
+      lastOwned = t2.gw - 1;
+      break;
+    }
+    result.set(key, lastOwned);
+  }
+  return result;
+};
+
+// For each transfer (player A out at GW X), determine whether A was
+// "started" in the most recent prior non-FH GW where A was in the
+// underlying squad. Returns a Set of `${out_element}:${gw}` keys for
+// transfers where the OUT side should contribute raw points; transfers
+// not in the set get OUT = 0.
+//
+// Walking back past FH GWs is intentional: a FH GW shows the FH XV (not
+// the underlying squad), so the OUT player typically isn't present and
+// would erroneously suppress points. Default to "started" when no prior
+// owned GW exists (very first GW or always-FH-prior).
+const buildPrevStartedSet = (
+  realTransfers: ReadonlyArray<TransferRow>,
+  multipliers: MultiplierMap,
+  finalXv: FinalXvMap,
+  fhGws: ReadonlySet<number>,
+): Set<string> => {
+  const result = new Set<string>();
+  for (const t of realTransfers) {
+    const key = `${t.out_element}:${t.gw}`;
+    let prevMult: number | null = null;
+    for (let g = t.gw - 1; g >= 1; g -= 1) {
+      if (fhGws.has(g)) continue;
+      const xv = finalXv.get(g);
+      if (!xv?.has(t.out_element)) continue;
+      prevMult = multipliers.get(g)?.get(t.out_element) ?? 0;
+      break;
+    }
+    if (prevMult === null || prevMult > 0) result.add(key);
+  }
+  return result;
 };
 
 // ----------------------------------------------------------------------------
@@ -230,17 +299,16 @@ export const getManagerTransfers = async (
     (t: TransferRow) => t.gw >= startGw && t.gw <= endGw,
   );
 
-  // Build per-GW chip + hits + bench lookup from the FPL history payload.
-  // `history.chips` lists every chip played with its event GW. `history.current`
-  // has per-GW points_on_bench and event_transfers_cost.
-  type GwMeta = { chip: ActiveChip; hits_cost: number; bench: number };
+  // Build per-GW chip + hits lookup from the FPL history payload.
+  // `history.chips` lists every chip played with its event GW.
+  // `history.current` has per-GW event_transfers_cost.
+  type GwMeta = { chip: ActiveChip; hits_cost: number };
   const gwMeta = new Map<number, GwMeta>();
   for (const ev of history.current ?? []) {
     if (ev.event >= startGw && ev.event <= endGw) {
       gwMeta.set(ev.event, {
         chip: null,
         hits_cost: ev.event_transfers_cost ?? 0,
-        bench: ev.points_on_bench ?? 0,
       });
     }
   }
@@ -263,22 +331,17 @@ export const getManagerTransfers = async (
     return xv ? xv.has(t.in_element) : false;
   });
 
-  // Identify bench-boost GWs up-front. We hide pair comparisons for these
-  // (the user's spec: "obviously the previous team will have a much worse
-  // bench") and surface bench points instead.
-  const bbGws = new Set<number>();
-  for (const [gw, meta] of gwMeta) {
-    if (meta.chip === "bboost") bbGws.add(gw);
+  // Identify Free Hit GWs — needed for both the per-pair window logic
+  // (FH transfers compare a single GW) and the bench-suppress rule
+  // (walk past FH GWs when finding the prev-GW XV).
+  const fhGws = new Set<number>();
+  for (const [gw, m] of gwMeta) {
+    if (m.chip === "freehit") fhGws.add(gw);
   }
 
-  // Build the event list. We iterate every GW that has either real
-  // transfers OR a bench-boost (BB events stand alone even with no
-  // transfers, because the bench points are still worth showing).
   const eventByGw = new Map<number, TransferImpactEvent>();
 
   // Pre-fetch metadata + history points for every player we'll display.
-  // BB GWs contribute no players, so `playerIds` is built from filtered
-  // realTransfers only.
   const playerIds = new Set<number>();
   for (const t of realTransfers) {
     playerIds.add(t.in_element);
@@ -297,8 +360,15 @@ export const getManagerTransfers = async (
     fetchHistoryPointsByRound(Array.from(playerIds), minTransferGw, endGw),
   ]);
 
-  // First, scaffold an event for every GW that needs one (BB or has real
-  // transfers). Use a placeholder pairs list; we'll fill in below.
+  // Compute per-pair windowing once up-front so the inner loop is O(n).
+  const lastOwnedGwMap = buildLastOwnedGwMap(realTransfers, fhGws, endGw);
+  const prevStarted = buildPrevStartedSet(
+    realTransfers,
+    multipliers,
+    finalXv,
+    fhGws,
+  );
+
   const ensureEvent = (gw: number): TransferImpactEvent => {
     let ev = eventByGw.get(gw);
     if (!ev) {
@@ -310,36 +380,33 @@ export const getManagerTransfers = async (
         hits_cost: m?.hits_cost ?? 0,
         combined_net_points: 0,
         chip: m?.chip ?? null,
-        bench_boost_points: null,
       };
       eventByGw.set(gw, ev);
     }
     return ev;
   };
 
-  for (const gw of bbGws) {
-    const ev = ensureEvent(gw);
-    ev.bench_boost_points = gwMeta.get(gw)?.bench ?? 0;
-    // Bench-boost GW: the headline is bench points, not transfer net.
-    // Hits cost is dropped on BB GWs by the user's spec — keep it at 0
-    // so combined matches the bench number cleanly. (Hits taken on a BB
-    // GW are unusual but possible; we deliberately don't muddy the
-    // bench-points display with them.)
-    ev.hits_cost = 0;
-    ev.gross_net_points = 0;
-    ev.combined_net_points = ev.bench_boost_points;
-  }
-
   for (const t of realTransfers) {
-    if (bbGws.has(t.gw)) continue; // BB GW: no pair comparison
+    const isFh = fhGws.has(t.gw);
+    const windowEnd = isFh
+      ? t.gw
+      : (lastOwnedGwMap.get(`${t.in_element}:${t.gw}`) ?? endGw);
+    const wasStarted = prevStarted.has(`${t.out_element}:${t.gw}`);
+
     const inPts = inPointsInWindow(
       perRound,
       multipliers,
       t.in_element,
       t.gw,
-      endGw,
+      windowEnd,
     );
-    const outPts = outPointsInWindow(perRound, t.out_element, t.gw, endGw);
+    const outPts = outPointsInWindow(
+      perRound,
+      t.out_element,
+      t.gw,
+      windowEnd,
+      wasStarted,
+    );
     const pair: TransferImpactPair = {
       player_in: toPlayer(t.in_element, meta.get(t.in_element), inPts),
       player_out: toPlayer(t.out_element, meta.get(t.out_element), outPts),
@@ -351,32 +418,19 @@ export const getManagerTransfers = async (
     ev.combined_net_points = ev.gross_net_points - ev.hits_cost;
   }
 
-  // Drop scaffolded events that ended up empty (e.g. a non-BB chip GW
-  // with no real transfers — shouldn't happen, but defensive).
+  // Drop empty events (defensive — only chip-only GWs with no real
+  // transfers would land here, and we don't want to surface them).
   for (const [gw, ev] of eventByGw) {
-    if (ev.pairs.length === 0 && ev.bench_boost_points === null) {
-      eventByGw.delete(gw);
-    }
+    if (ev.pairs.length === 0) eventByGw.delete(gw);
   }
 
   const events = Array.from(eventByGw.values()).sort((a, b) => b.gw - a.gw);
 
-  // Headline total: sum of all events' combined_net. Includes:
-  //   - transfer pair gains/losses (multiplier-aware, ghost-filtered)
-  //   - hits subtracted (combined = gross − hits)
-  //   - bench-boost bench points (in lieu of pair comparison)
+  // Headline total: sum of all events' combined_net (gross − hits).
+  // BB-only events are gone; BB+transfers events contribute their pair
+  // sums minus any hits, identical to non-chip GWs.
   const totalNet = events.reduce((acc, ev) => acc + ev.combined_net_points, 0);
-
-  // Avg per transfer is a different thing — it's "how good were my
-  // swaps". BB events aren't swaps, so they're excluded from both
-  // numerator and denominator: dividing chip-bench points by transfer
-  // count would give a misleading rate.
-  const transferEvents = events.filter((ev) => ev.chip !== "bboost");
-  const transferNet = transferEvents.reduce(
-    (acc, ev) => acc + ev.combined_net_points,
-    0,
-  );
-  const transferCount = realTransfers.filter((t) => !bbGws.has(t.gw)).length;
+  const transferCount = realTransfers.length;
 
   return {
     entry_id: entryId,
@@ -385,8 +439,7 @@ export const getManagerTransfers = async (
     events,
     total_transfers: transferCount,
     total_net_points: totalNet,
-    avg_net_per_transfer:
-      transferCount > 0 ? transferNet / transferCount : null,
+    avg_net_per_transfer: transferCount > 0 ? totalNet / transferCount : null,
     incomplete: resolved.incomplete,
   };
 };

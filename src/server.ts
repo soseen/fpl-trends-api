@@ -45,7 +45,7 @@ const corsOptions = {
   origin:
     process.env["NODE_ENV"] === "production"
       ? allowedOrigins
-      : [...allowedOrigins, "http://localhost:5000"],
+      : [...allowedOrigins, "http://localhost:5000", "http://localhost:5050"],
   methods: ["GET", "POST"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: true,
