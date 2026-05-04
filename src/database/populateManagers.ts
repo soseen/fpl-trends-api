@@ -9,10 +9,7 @@ import {
   fetchLeagueStandingsPage,
   OVERALL_LEAGUE_ID,
 } from "../managers/fetchManager.js";
-import {
-  classifyManager,
-  netPointsForEvent,
-} from "../managers/activityFilter.js";
+import { netPointsForEvent } from "../managers/activityFilter.js";
 import {
   fetchEntryEventPicks,
   summarizePicks,
@@ -246,9 +243,7 @@ const withGovernor = async <T>(
 };
 
 type ProcessOutcome =
-  | "active"
-  | "inactive"
-  | "trolling"
+  | "ingested"
   | "fetch_failed"
   | "skipped"
   | "out_of_stratum";
@@ -256,9 +251,7 @@ type ProcessOutcome =
 type Stats = {
   pagesProcessed: number;
   processed: number;
-  active: number;
-  inactive: number;
-  trolling: number;
+  ingested: number;
   fetchFailed: number;
   skipped: number;
   outOfStratum: number;
@@ -267,9 +260,7 @@ type Stats = {
 const newStats = (): Stats => ({
   pagesProcessed: 0,
   processed: 0,
-  active: 0,
-  inactive: 0,
-  trolling: 0,
+  ingested: 0,
   fetchFailed: 0,
   skipped: 0,
   outOfStratum: 0,
@@ -277,9 +268,7 @@ const newStats = (): Stats => ({
 
 const recordOutcome = (stats: Stats, o: ProcessOutcome): void => {
   stats.processed += 1;
-  if (o === "active") stats.active += 1;
-  else if (o === "inactive") stats.inactive += 1;
-  else if (o === "trolling") stats.trolling += 1;
+  if (o === "ingested") stats.ingested += 1;
   else if (o === "fetch_failed") stats.fetchFailed += 1;
   else if (o === "skipped") stats.skipped += 1;
   else if (o === "out_of_stratum") stats.outOfStratum += 1;
@@ -304,13 +293,17 @@ const processEntry = async (
     history = await withGovernor(governor, () => fetchEntryHistory(entryId));
   } catch {
     if (governor.shouldAbort) throw new Error("governor_aborted");
+    // Record the visit even on fetch failure so we don't retry every cron
+    // tick — last_checked_gw=currentGw skips this entry until the next GW
+    // transition. Equivalent to the old "rejected_reason='fetch_failed'"
+    // marker but without the column: an entry with a manager_summary row
+    // but no manager_history rows is naturally absent from sample queries.
     await prisma.manager_summary.upsert({
       where: { entry_id: entryId },
       update: {
         overall_rank: overallRank,
         total_points: totalPoints,
         stratum,
-        rejected_reason: "fetch_failed",
         last_checked_gw: currentGw,
       },
       create: {
@@ -318,15 +311,11 @@ const processEntry = async (
         overall_rank: overallRank,
         total_points: totalPoints,
         stratum,
-        rejected_reason: "fetch_failed",
         last_checked_gw: currentGw,
       },
     });
     return "fetch_failed";
   }
-
-  const klass = classifyManager(history, currentGw);
-  const rejectedReason = klass === "active" ? null : klass;
 
   await prisma.manager_summary.upsert({
     where: { entry_id: entryId },
@@ -334,7 +323,6 @@ const processEntry = async (
       overall_rank: overallRank,
       total_points: totalPoints,
       stratum,
-      rejected_reason: rejectedReason,
       last_checked_gw: currentGw,
     },
     create: {
@@ -342,14 +330,14 @@ const processEntry = async (
       overall_rank: overallRank,
       total_points: totalPoints,
       stratum,
-      rejected_reason: rejectedReason,
       last_checked_gw: currentGw,
     },
   });
 
-  // Write per-GW history for every classification. Range-rank queries need
-  // inactive/troll managers' real early-GW scores; comparison-average queries
-  // can still filter them out via `manager_summary.rejected_reason IS NULL`.
+  // Write per-GW history for every manager — no activity classification.
+  // Inactive / trolling / "abnormal" managers are valid sample data; the
+  // old rejected_reason filter excluded them from rank-density math, but
+  // we now treat the full sample as-is (lighter ingest, simpler reads).
   for (const ev of history.current ?? []) {
     await prisma.manager_history.upsert({
       where: { entry_id_gw: { entry_id: entryId, gw: ev.event } },
@@ -373,7 +361,7 @@ const processEntry = async (
   // Rebuild manager_cumulative for this entry. range-rank's hot query
   // (stratumCounts) reads cumulative_points instead of GROUP-BY-ing
   // manager_history every call — see getRangeRank.ts.
-  await rebuildCumulativeForEntry(entryId, stratum, rejectedReason);
+  await rebuildCumulativeForEntry(entryId, stratum);
 
   // Picks ingestion: fill in any (entry_id, gw) we don't already have for
   // finished GWs. This is the steady-state path; bulk backfill lives in
@@ -389,7 +377,7 @@ const processEntry = async (
   // covers the common case (no work for an entry visited this same GW).
   await ingestTransfersForEntry(entryId, governor);
 
-  return klass;
+  return "ingested";
 };
 
 // Boundary GW between FPL chip halves. Each chip can be played at most once
@@ -408,8 +396,8 @@ const CHIP_HALVES_BOUNDARY = 19;
 // Re-querying manager_history rather than computing from `history.current`
 // is intentional: if FPL ever returns a smaller payload than what we've
 // already persisted (we never delete history rows), the DB query is
-// canonical. Stratum and rejected_reason are denormalised onto every row
-// so the read path needs no manager_summary join.
+// canonical. Stratum is denormalised onto every row so the read path
+// needs no manager_summary join.
 //
 // Captain bonus joins manager_picks for the entry and the footballers'
 // `history` table for the captained player's GW points. For GWs where
@@ -421,7 +409,6 @@ const CHIP_HALVES_BOUNDARY = 19;
 const rebuildCumulativeForEntry = async (
   entryId: number,
   stratum: 1 | 2 | 3,
-  rejectedReason: string | null,
 ): Promise<void> => {
   await prisma.$transaction(async (tx) => {
     await tx.$executeRaw`DELETE FROM manager_cumulative WHERE entry_id = ${entryId}`;
@@ -435,7 +422,7 @@ const rebuildCumulativeForEntry = async (
          chip_freehit_h1,  chip_freehit_h2,
          chip_bboost_h1,   chip_bboost_h2,
          has_transfers, has_hits, has_bench,
-         stratum, rejected_reason)
+         stratum)
       SELECT
         base.entry_id, base.gw,
         (SUM(base.points)                            OVER w)::int AS cumulative_points,
@@ -451,16 +438,16 @@ const rebuildCumulativeForEntry = async (
         -- constraint on the chip columns. Coercing to FALSE pre-aggregate
         -- keeps the read-path semantics correct (an entry with no picks for
         -- the GW didn't play that chip) and the column non-null.
-        BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw <= $4, false)) OVER w AS chip_wildcard_h1,
-        BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw  > $4, false)) OVER w AS chip_wildcard_h2,
-        BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw <= $4, false)) OVER w AS chip_freehit_h1,
-        BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw  > $4, false)) OVER w AS chip_freehit_h2,
-        BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw <= $4, false)) OVER w AS chip_bboost_h1,
-        BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw  > $4, false)) OVER w AS chip_bboost_h2,
+        BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw <= $3, false)) OVER w AS chip_wildcard_h1,
+        BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw  > $3, false)) OVER w AS chip_wildcard_h2,
+        BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw <= $3, false)) OVER w AS chip_freehit_h1,
+        BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw  > $3, false)) OVER w AS chip_freehit_h2,
+        BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw <= $3, false)) OVER w AS chip_bboost_h1,
+        BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw  > $3, false)) OVER w AS chip_bboost_h2,
         BOOL_OR(base.event_transfers      IS NOT NULL) OVER w AS has_transfers,
         BOOL_OR(base.event_transfers_cost IS NOT NULL) OVER w AS has_hits,
         BOOL_OR(base.points_on_bench      IS NOT NULL) OVER w AS has_bench,
-        $2, $3
+        $2
       FROM (
         SELECT
           mh.entry_id, mh.gw, mh.points,
@@ -487,7 +474,6 @@ const rebuildCumulativeForEntry = async (
       `,
       entryId,
       stratum,
-      rejectedReason,
       CHIP_HALVES_BOUNDARY,
     );
   });
@@ -746,19 +732,73 @@ export const rebuildStratumCaptainPicks = async (): Promise<void> => {
     prisma.$executeRawUnsafe(`TRUNCATE stratum_captain_picks_gw`),
     prisma.$executeRawUnsafe(`
       INSERT INTO stratum_captain_picks_gw
-        (stratum, gw, captain_element, captain_multiplier, picks, active_picks)
+        (stratum, gw, captain_element, captain_multiplier, picks, last_rebuilt)
       SELECT
         ms.stratum,
         mp.gw,
         mp.captain_element,
         mp.captain_multiplier,
-        COUNT(*)::int                                                     AS picks,
-        COUNT(*) FILTER (WHERE ms.rejected_reason IS NULL)::int           AS active_picks
+        COUNT(*)::int AS picks,
+        NOW()         AS last_rebuilt
       FROM manager_picks mp
       JOIN manager_summary ms ON ms.entry_id = mp.entry_id
       WHERE mp.captain_element IS NOT NULL
         AND mp.captain_multiplier IS NOT NULL
       GROUP BY ms.stratum, mp.gw, mp.captain_element, mp.captain_multiplier
+    `),
+  ]);
+};
+
+// Rebuild the (stratum, gw) running-stats table used by
+// getManagerComparison.sampleStratumAggregates. Single TRUNCATE+INSERT
+// inside a transaction so readers always see a consistent snapshot — no
+// partial state where some (stratum, gw) buckets are missing.
+//
+// Tiny output: 3 strata × ≤38 GWs = ≤114 rows. The expensive part is the
+// GROUP BY over manager_cumulative (~75M rows on prod) — typically ~30–60s
+// on the prod CX23. This runs once per cron cycle (15 min cadence), not
+// per request, which is the entire point: the per-request DISTINCT ON
+// over the same partition is what was costing 15–25 s on cold cache.
+//
+// Exported so backfillStratumGwRunningStats.ts can run the same operation
+// out-of-band (e.g. immediately after applying the schema migration so
+// the new read path has a populated table to read from before the next
+// 15-minute populate tick).
+export const rebuildStratumGwRunningStats = async (): Promise<void> => {
+  await prisma.$transaction([
+    prisma.$executeRawUnsafe(`TRUNCATE stratum_gw_running_stats`),
+    prisma.$executeRawUnsafe(`
+      INSERT INTO stratum_gw_running_stats
+        (stratum, gw, sample_size,
+         sum_cum_points, sum_cum_transfers, sum_cum_hits_cost,
+         sum_cum_bench, sum_cum_captain_bonus, sum_gws_played,
+         count_with_transfers, count_with_hits, count_with_bench,
+         cum_wildcards_h1, cum_wildcards_h2,
+         cum_freehits_h1,  cum_freehits_h2,
+         cum_bboosts_h1,   cum_bboosts_h2,
+         last_rebuilt)
+      SELECT
+        mc.stratum,
+        mc.gw,
+        COUNT(*)::int                                              AS sample_size,
+        SUM(mc.cumulative_points)::bigint                          AS sum_cum_points,
+        SUM(mc.cumulative_transfers)::bigint                       AS sum_cum_transfers,
+        SUM(mc.cumulative_hits_cost)::bigint                       AS sum_cum_hits_cost,
+        SUM(mc.cumulative_bench)::bigint                           AS sum_cum_bench,
+        SUM(mc.cumulative_captain_bonus)::bigint                   AS sum_cum_captain_bonus,
+        SUM(mc.gws_played)::bigint                                 AS sum_gws_played,
+        COUNT(*) FILTER (WHERE mc.has_transfers)::int              AS count_with_transfers,
+        COUNT(*) FILTER (WHERE mc.has_hits)::int                   AS count_with_hits,
+        COUNT(*) FILTER (WHERE mc.has_bench)::int                  AS count_with_bench,
+        COUNT(*) FILTER (WHERE mc.chip_wildcard_h1)::int           AS cum_wildcards_h1,
+        COUNT(*) FILTER (WHERE mc.chip_wildcard_h2)::int           AS cum_wildcards_h2,
+        COUNT(*) FILTER (WHERE mc.chip_freehit_h1)::int            AS cum_freehits_h1,
+        COUNT(*) FILTER (WHERE mc.chip_freehit_h2)::int            AS cum_freehits_h2,
+        COUNT(*) FILTER (WHERE mc.chip_bboost_h1)::int             AS cum_bboosts_h1,
+        COUNT(*) FILTER (WHERE mc.chip_bboost_h2)::int             AS cum_bboosts_h2,
+        NOW()                                                      AS last_rebuilt
+      FROM manager_cumulative mc
+      GROUP BY mc.stratum, mc.gw
     `),
   ]);
 };
@@ -877,20 +917,38 @@ export const populateManagers = async (
     // of the run. This is the same heavy GROUP BY that the read paths in
     // getTeamImpact.fetchCaptainRatesInStratum and
     // getManagerComparison.sampleMostCaptained run today — done here once
-    // per cron cycle (~30 min cadence) instead of per request. ~17k bucket
-    // rows; ~2–4s on the prod CX23. Skip on no-op cycles.
+    // per cron cycle instead of per request. ~17k bucket rows; ~2–4s on
+    // the prod CX23. Skip on no-op cycles.
+    //
+    // Same pattern for stratum_gw_running_stats — the per-(stratum, gw)
+    // aggregate served from sampleStratumAggregates. ~114 rows output;
+    // expensive GROUP BY over manager_cumulative happens here, not per
+    // request. ~30–60s on prod.
     if (stats.processed > 0 && !governor.shouldAbort) {
-      const rebuildStarted = Date.now();
+      const captainStarted = Date.now();
       try {
         await rebuildStratumCaptainPicks();
         console.info(
-          `[populateManagers] stratum_captain_picks_gw rebuilt in ${Math.round((Date.now() - rebuildStarted) / 1000)}s`,
+          `[populateManagers] stratum_captain_picks_gw rebuilt in ${Math.round((Date.now() - captainStarted) / 1000)}s`,
         );
       } catch (err) {
         // Rebuild failure shouldn't fail the cron — readers fall back to
         // the previous snapshot. Log loudly so it's caught in pm2 tail.
         console.error(
           "[populateManagers] stratum_captain_picks_gw rebuild failed:",
+          (err as Error).message,
+        );
+      }
+
+      const runningStarted = Date.now();
+      try {
+        await rebuildStratumGwRunningStats();
+        console.info(
+          `[populateManagers] stratum_gw_running_stats rebuilt in ${Math.round((Date.now() - runningStarted) / 1000)}s`,
+        );
+      } catch (err) {
+        console.error(
+          "[populateManagers] stratum_gw_running_stats rebuild failed:",
           (err as Error).message,
         );
       }

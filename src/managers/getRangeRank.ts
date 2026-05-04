@@ -76,41 +76,54 @@ const pickStratum = (
 // at the latest in-range GW (c_end), then subtracts the latest pre-range
 // row (c_start, COALESCE to 0 if the entry joined inside the range).
 // Entries with no in-range row drop, exactly matching the "probes with
-// history in range" semantic. Includes inactive/trolling managers in the
-// denominator — they DO have manager_cumulative rows; only `fetch_failed`
-// probes naturally drop out.
+// history in range" semantic.
+//
+// Stratum 3 is sub-sampled at 1-in-8 (entry_id % 8 = 0) to bound the
+// DISTINCT ON sort. The sample mean is unbiased regardless of sample
+// density; sampling just trades a small std-dev inflation for a roughly
+// 8× reduction in per-request work. Strata 1 and 2 are small enough that
+// no sampling is needed.
 const stratumCounts = async (
   stratum: 1 | 2 | 3,
   startGw: number,
   endGw: number,
   threshold: number,
 ): Promise<{ higher: number; probesWithHistory: number }> => {
-  const rows = await prisma.$queryRaw<
+  const subSampleClause = stratum === 3 ? `AND entry_id % 8 = 0` : ``;
+  const rows = await prisma.$queryRawUnsafe<
     Array<{ higher: number; probes_with_history: number }>
-  >`
+  >(
+    `
     WITH c_end AS (
       SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
       FROM manager_cumulative
-      WHERE stratum = ${stratum}
-        AND gw BETWEEN ${startGw} AND ${endGw}
+      WHERE stratum = $1
+        AND gw BETWEEN $2 AND $3
+        ${subSampleClause}
       ORDER BY entry_id, gw DESC
     ),
     c_start AS (
       SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
       FROM manager_cumulative
-      WHERE stratum = ${stratum}
-        AND gw < ${startGw}
+      WHERE stratum = $1
+        AND gw < $2
+        ${subSampleClause}
       ORDER BY entry_id, gw DESC
     )
     SELECT
-      COUNT(*) FILTER (WHERE s >= ${threshold})::int AS higher,
-      COUNT(*)::int                                  AS probes_with_history
+      COUNT(*) FILTER (WHERE s >= $4)::int AS higher,
+      COUNT(*)::int                        AS probes_with_history
     FROM (
       SELECT c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0) AS s
       FROM c_end
       LEFT JOIN c_start USING (entry_id)
     ) t
-  `;
+    `,
+    stratum,
+    startGw,
+    endGw,
+    threshold,
+  );
   const row = rows[0];
   return {
     higher: row?.higher ?? 0,

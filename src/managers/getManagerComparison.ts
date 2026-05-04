@@ -132,8 +132,8 @@ const userCaptainBonusFromPicks = async (
 // rebuildStratumCaptainPicks). Returns null if no captain rows in range.
 //
 // `stratumFilter`:
-//   - "active" → all strata (1, 2, 3), active subset only.
-//   - "stratum1" → stratum 1 only, active subset only.
+//   - "active" → all strata (1, 2, 3), full sample.
+//   - "stratum1" → stratum 1 only.
 const sampleMostCaptained = async (
   startGw: number,
   endGw: number,
@@ -147,7 +147,7 @@ const sampleMostCaptained = async (
     Array<{ captain_element: number; picks: number }>
   >(
     `
-    SELECT captain_element, SUM(active_picks)::int AS picks
+    SELECT captain_element, SUM(picks)::int AS picks
     FROM stratum_captain_picks_gw
     WHERE gw BETWEEN $1 AND $2
       ${stratumClause}
@@ -162,22 +162,21 @@ const sampleMostCaptained = async (
 };
 
 // Per-stratum sample aggregates: averages of total_points, transfers,
-// hits, bench, captain_bonus, gw_score; chip rates for the stratum;
-// coverage flags for transfers/hits/bench (gates the response when too
-// few sampled managers have data in the range).
+// hits, bench, captain_bonus, gw_score; chip rates; coverage counts.
 //
-// Single SQL query against manager_cumulative — DISTINCT ON (entry_id)
-// ORDER BY gw DESC pulls each entry's running total at the latest in-range
-// GW (c_end) and at the latest pre-range GW (c_start). Subtraction inside
-// the SELECT yields per-entity range deltas; AVG/COUNT/SUM_CASE roll them
-// up. No GROUP BY over manager_history at request time — the heavy work
-// happens once in `rebuildCumulativeForEntry` (per-entry, on populate
-// visit) and `backfillManagerCumulative` (one-off bootstrap).
+// Reads from `stratum_gw_running_stats`, the per-(stratum, gw) running
+// totals rebuilt at the end of every populateManagers cron tick (see
+// `rebuildStratumGwRunningStats`). Range queries collapse to two-row
+// lookups: subtract the row at gw=startGw−1 from the row at gw=endGw,
+// then divide by the sample size at gw=endGw for averages.
 //
-// `gws_played` lets `avg_gw_score` use per-manager (range_total /
-// gws_played_in_range) instead of (range_total / nominal_range_width),
-// matching the previous implementation that averaged each manager's
-// `mh.points` per row.
+// Replaces the per-request DISTINCT ON over ~750k stratum-3 rows that
+// was costing 15–25 s on cold cache. Read cost here is O(strata) — at
+// most six rows touched per call, indexed lookups, sub-millisecond.
+//
+// `stratumFilter`:
+//   - "active" → all strata (1, 2, 3) summed.
+//   - "stratum1" → stratum 1 only (the top-10k comparator).
 const sampleStratumAggregates = async (
   startGw: number,
   endGw: number,
@@ -197,114 +196,206 @@ const sampleStratumAggregates = async (
   with_bench_data: number;
   with_transfers_data: number;
 }> => {
-  const stratumClause =
-    stratumFilter === "stratum1"
-      ? `AND stratum = 1`
-      : `AND (stratum IN (1, 2) OR (stratum = 3 AND entry_id % 8 = 0))`;
+  const strata = stratumFilter === "stratum1" ? [1] : [1, 2, 3];
+  // Bind the IN-list as a Postgres int[] so the parameter count is
+  // independent of stratum cardinality.
+  const stratumArr = strata;
 
+  // Two lookups, summed across the requested strata, for end_gw and
+  // start_gw - 1 respectively. start row is null for ranges starting at
+  // GW 1 (no prior row), and we COALESCE all of its running fields to 0.
+  // sample_size for the range is sample_size at end_gw — managers active
+  // at end_gw are the population the averages are normalised against.
   const rows = await prisma.$queryRawUnsafe<
     Array<{
-      avg_total_points: number | null;
-      avg_transfers: number | null;
-      avg_hits: number | null;
-      avg_bench: number | null;
-      avg_captain_bonus: number | null;
-      avg_gw_score: number | null;
-      wildcards_rate: number | null;
-      free_hits_rate: number | null;
-      bench_boosts_rate: number | null;
-      sample_size: number;
-      with_hits_data: number;
-      with_bench_data: number;
-      with_transfers_data: number;
+      sum_e_points: bigint | null;
+      sum_e_transfers: bigint | null;
+      sum_e_hits_cost: bigint | null;
+      sum_e_bench: bigint | null;
+      sum_e_captain_bonus: bigint | null;
+      sum_e_gws_played: bigint | null;
+      sum_s_points: bigint | null;
+      sum_s_transfers: bigint | null;
+      sum_s_hits_cost: bigint | null;
+      sum_s_bench: bigint | null;
+      sum_s_captain_bonus: bigint | null;
+      sum_s_gws_played: bigint | null;
+      e_sample_size: number | null;
+      e_with_transfers: number | null;
+      e_with_hits: number | null;
+      e_with_bench: number | null;
+      e_wildcards_h1: number | null;
+      e_wildcards_h2: number | null;
+      e_freehits_h1: number | null;
+      e_freehits_h2: number | null;
+      e_bboosts_h1: number | null;
+      e_bboosts_h2: number | null;
+      s_wildcards_h1: number | null;
+      s_wildcards_h2: number | null;
+      s_freehits_h1: number | null;
+      s_freehits_h2: number | null;
+      s_bboosts_h1: number | null;
+      s_bboosts_h2: number | null;
     }>
   >(
     `
-    WITH c_end AS (
-      SELECT DISTINCT ON (entry_id)
-             entry_id, cumulative_points, cumulative_transfers,
-             cumulative_hits_cost, cumulative_bench, cumulative_captain_bonus,
-             gws_played,
-             chip_wildcard_h1, chip_wildcard_h2,
-             chip_freehit_h1,  chip_freehit_h2,
-             chip_bboost_h1,   chip_bboost_h2,
-             has_transfers, has_hits, has_bench
-      FROM manager_cumulative
-      WHERE rejected_reason IS NULL
-        ${stratumClause}
-        AND gw BETWEEN $1 AND $2
-      ORDER BY entry_id, gw DESC
-    ),
-    c_start AS (
-      SELECT DISTINCT ON (entry_id)
-             entry_id, cumulative_points, cumulative_transfers,
-             cumulative_hits_cost, cumulative_bench, cumulative_captain_bonus,
-             gws_played,
-             chip_wildcard_h1, chip_wildcard_h2,
-             chip_freehit_h1,  chip_freehit_h2,
-             chip_bboost_h1,   chip_bboost_h2,
-             has_transfers, has_hits, has_bench
-      FROM manager_cumulative
-      WHERE rejected_reason IS NULL
-        ${stratumClause}
-        AND gw < $1
-      ORDER BY entry_id, gw DESC
-    ),
-    deltas AS (
+    WITH e AS (
       SELECT
-        e.cumulative_points        - COALESCE(s.cumulative_points,        0) AS d_points,
-        e.cumulative_transfers     - COALESCE(s.cumulative_transfers,     0) AS d_transfers,
-        e.cumulative_hits_cost     - COALESCE(s.cumulative_hits_cost,     0) AS d_hits_cost,
-        e.cumulative_bench         - COALESCE(s.cumulative_bench,         0) AS d_bench,
-        e.cumulative_captain_bonus - COALESCE(s.cumulative_captain_bonus, 0) AS d_captain_bonus,
-        e.gws_played               - COALESCE(s.gws_played,               0) AS d_gws,
-        (e.chip_wildcard_h1 AND NOT COALESCE(s.chip_wildcard_h1, false))
-          OR (e.chip_wildcard_h2 AND NOT COALESCE(s.chip_wildcard_h2, false)) AS played_wildcard,
-        (e.chip_freehit_h1 AND NOT COALESCE(s.chip_freehit_h1, false))
-          OR (e.chip_freehit_h2 AND NOT COALESCE(s.chip_freehit_h2, false))   AS played_freehit,
-        (e.chip_bboost_h1 AND NOT COALESCE(s.chip_bboost_h1, false))
-          OR (e.chip_bboost_h2 AND NOT COALESCE(s.chip_bboost_h2, false))     AS played_bboost,
-        (e.has_transfers AND NOT COALESCE(s.has_transfers, false)) AS got_transfers_data,
-        (e.has_hits      AND NOT COALESCE(s.has_hits,      false)) AS got_hits_data,
-        (e.has_bench     AND NOT COALESCE(s.has_bench,     false)) AS got_bench_data
-      FROM c_end e
-      LEFT JOIN c_start s USING (entry_id)
+        SUM(sum_cum_points)::bigint        AS sum_points,
+        SUM(sum_cum_transfers)::bigint     AS sum_transfers,
+        SUM(sum_cum_hits_cost)::bigint     AS sum_hits_cost,
+        SUM(sum_cum_bench)::bigint         AS sum_bench,
+        SUM(sum_cum_captain_bonus)::bigint AS sum_captain_bonus,
+        SUM(sum_gws_played)::bigint        AS sum_gws_played,
+        SUM(sample_size)::int              AS sample_size,
+        SUM(count_with_transfers)::int     AS with_transfers,
+        SUM(count_with_hits)::int          AS with_hits,
+        SUM(count_with_bench)::int         AS with_bench,
+        SUM(cum_wildcards_h1)::int         AS wildcards_h1,
+        SUM(cum_wildcards_h2)::int         AS wildcards_h2,
+        SUM(cum_freehits_h1)::int          AS freehits_h1,
+        SUM(cum_freehits_h2)::int          AS freehits_h2,
+        SUM(cum_bboosts_h1)::int           AS bboosts_h1,
+        SUM(cum_bboosts_h2)::int           AS bboosts_h2
+      FROM stratum_gw_running_stats
+      WHERE gw = $2 AND stratum = ANY($3::int[])
+    ),
+    s AS (
+      SELECT
+        SUM(sum_cum_points)::bigint        AS sum_points,
+        SUM(sum_cum_transfers)::bigint     AS sum_transfers,
+        SUM(sum_cum_hits_cost)::bigint     AS sum_hits_cost,
+        SUM(sum_cum_bench)::bigint         AS sum_bench,
+        SUM(sum_cum_captain_bonus)::bigint AS sum_captain_bonus,
+        SUM(sum_gws_played)::bigint        AS sum_gws_played,
+        SUM(cum_wildcards_h1)::int         AS wildcards_h1,
+        SUM(cum_wildcards_h2)::int         AS wildcards_h2,
+        SUM(cum_freehits_h1)::int          AS freehits_h1,
+        SUM(cum_freehits_h2)::int          AS freehits_h2,
+        SUM(cum_bboosts_h1)::int           AS bboosts_h1,
+        SUM(cum_bboosts_h2)::int           AS bboosts_h2
+      FROM stratum_gw_running_stats
+      WHERE gw = $1 - 1 AND stratum = ANY($3::int[])
     )
     SELECT
-      AVG(d_points)::float                                AS avg_total_points,
-      AVG(d_transfers)::float                             AS avg_transfers,
-      AVG(d_hits_cost / 4.0)::float                       AS avg_hits,
-      AVG(d_bench)::float                                 AS avg_bench,
-      AVG(d_captain_bonus)::float                         AS avg_captain_bonus,
-      AVG(d_points::float / NULLIF(d_gws, 0))::float      AS avg_gw_score,
-      AVG(CASE WHEN played_wildcard THEN 1.0 ELSE 0.0 END)::float AS wildcards_rate,
-      AVG(CASE WHEN played_freehit  THEN 1.0 ELSE 0.0 END)::float AS free_hits_rate,
-      AVG(CASE WHEN played_bboost   THEN 1.0 ELSE 0.0 END)::float AS bench_boosts_rate,
-      COUNT(*)::int                                                AS sample_size,
-      SUM(CASE WHEN got_hits_data      THEN 1 ELSE 0 END)::int     AS with_hits_data,
-      SUM(CASE WHEN got_bench_data     THEN 1 ELSE 0 END)::int     AS with_bench_data,
-      SUM(CASE WHEN got_transfers_data THEN 1 ELSE 0 END)::int     AS with_transfers_data
-    FROM deltas
+      e.sum_points                                AS sum_e_points,
+      e.sum_transfers                             AS sum_e_transfers,
+      e.sum_hits_cost                             AS sum_e_hits_cost,
+      e.sum_bench                                 AS sum_e_bench,
+      e.sum_captain_bonus                         AS sum_e_captain_bonus,
+      e.sum_gws_played                            AS sum_e_gws_played,
+      s.sum_points                                AS sum_s_points,
+      s.sum_transfers                             AS sum_s_transfers,
+      s.sum_hits_cost                             AS sum_s_hits_cost,
+      s.sum_bench                                 AS sum_s_bench,
+      s.sum_captain_bonus                         AS sum_s_captain_bonus,
+      s.sum_gws_played                            AS sum_s_gws_played,
+      e.sample_size                               AS e_sample_size,
+      e.with_transfers                            AS e_with_transfers,
+      e.with_hits                                 AS e_with_hits,
+      e.with_bench                                AS e_with_bench,
+      e.wildcards_h1                              AS e_wildcards_h1,
+      e.wildcards_h2                              AS e_wildcards_h2,
+      e.freehits_h1                               AS e_freehits_h1,
+      e.freehits_h2                               AS e_freehits_h2,
+      e.bboosts_h1                                AS e_bboosts_h1,
+      e.bboosts_h2                                AS e_bboosts_h2,
+      s.wildcards_h1                              AS s_wildcards_h1,
+      s.wildcards_h2                              AS s_wildcards_h2,
+      s.freehits_h1                               AS s_freehits_h1,
+      s.freehits_h2                               AS s_freehits_h2,
+      s.bboosts_h1                                AS s_bboosts_h1,
+      s.bboosts_h2                                AS s_bboosts_h2
+    FROM e CROSS JOIN s
     `,
     startGw,
     endGw,
+    stratumArr,
   );
 
   const row = rows[0];
+  if (!row) {
+    return {
+      avg_total_points: null,
+      avg_transfers: null,
+      avg_hits: null,
+      avg_bench: null,
+      avg_captain_bonus: null,
+      avg_gw_score: null,
+      wildcards_rate: null,
+      free_hits_rate: null,
+      bench_boosts_rate: null,
+      sample_size: 0,
+      with_hits_data: 0,
+      with_bench_data: 0,
+      with_transfers_data: 0,
+    };
+  }
+
+  const sampleSize = row.e_sample_size ?? 0;
+  if (sampleSize === 0) {
+    return {
+      avg_total_points: null,
+      avg_transfers: null,
+      avg_hits: null,
+      avg_bench: null,
+      avg_captain_bonus: null,
+      avg_gw_score: null,
+      wildcards_rate: null,
+      free_hits_rate: null,
+      bench_boosts_rate: null,
+      sample_size: 0,
+      with_hits_data: 0,
+      with_bench_data: 0,
+      with_transfers_data: 0,
+    };
+  }
+
+  const num = (b: bigint | null | undefined): number => Number(b ?? 0n);
+  const sumDelta = (
+    e: bigint | null | undefined,
+    s: bigint | null | undefined,
+  ): number => num(e) - num(s);
+
+  const dPoints = sumDelta(row.sum_e_points, row.sum_s_points);
+  const dTransfers = sumDelta(row.sum_e_transfers, row.sum_s_transfers);
+  const dHitsCost = sumDelta(row.sum_e_hits_cost, row.sum_s_hits_cost);
+  const dBench = sumDelta(row.sum_e_bench, row.sum_s_bench);
+  const dCaptainBonus = sumDelta(
+    row.sum_e_captain_bonus,
+    row.sum_s_captain_bonus,
+  );
+  const dGwsPlayed = sumDelta(row.sum_e_gws_played, row.sum_s_gws_played);
+
+  // Chip "played-in-range" deltas, by half. A chip play is detected at the
+  // earliest GW it appears in the cumulative; the per-half split lets a
+  // range that crosses the GW20 boundary count both halves correctly.
+  const dWildcards =
+    Math.max(0, (row.e_wildcards_h1 ?? 0) - (row.s_wildcards_h1 ?? 0)) +
+    Math.max(0, (row.e_wildcards_h2 ?? 0) - (row.s_wildcards_h2 ?? 0));
+  const dFreehits =
+    Math.max(0, (row.e_freehits_h1 ?? 0) - (row.s_freehits_h1 ?? 0)) +
+    Math.max(0, (row.e_freehits_h2 ?? 0) - (row.s_freehits_h2 ?? 0));
+  const dBboosts =
+    Math.max(0, (row.e_bboosts_h1 ?? 0) - (row.s_bboosts_h1 ?? 0)) +
+    Math.max(0, (row.e_bboosts_h2 ?? 0) - (row.s_bboosts_h2 ?? 0));
+
   return {
-    avg_total_points: row?.avg_total_points ?? null,
-    avg_transfers: row?.avg_transfers ?? null,
-    avg_hits: row?.avg_hits ?? null,
-    avg_bench: row?.avg_bench ?? null,
-    avg_captain_bonus: row?.avg_captain_bonus ?? null,
-    avg_gw_score: row?.avg_gw_score ?? null,
-    wildcards_rate: row?.wildcards_rate ?? null,
-    free_hits_rate: row?.free_hits_rate ?? null,
-    bench_boosts_rate: row?.bench_boosts_rate ?? null,
-    sample_size: row?.sample_size ?? 0,
-    with_hits_data: row?.with_hits_data ?? 0,
-    with_bench_data: row?.with_bench_data ?? 0,
-    with_transfers_data: row?.with_transfers_data ?? 0,
+    avg_total_points: dPoints / sampleSize,
+    avg_transfers: dTransfers / sampleSize,
+    avg_hits: dHitsCost / 4.0 / sampleSize,
+    avg_bench: dBench / sampleSize,
+    avg_captain_bonus: dCaptainBonus / sampleSize,
+    // avg_gw_score: average per-GW score in the range, weighted by sample size
+    // (matches the previous semantics of (range_total / gws_played) averaged).
+    avg_gw_score: dGwsPlayed > 0 ? dPoints / dGwsPlayed : null,
+    wildcards_rate: dWildcards / sampleSize,
+    free_hits_rate: dFreehits / sampleSize,
+    bench_boosts_rate: dBboosts / sampleSize,
+    sample_size: sampleSize,
+    with_hits_data: row.e_with_hits ?? 0,
+    with_bench_data: row.e_with_bench ?? 0,
+    with_transfers_data: row.e_with_transfers ?? 0,
   };
 };
 

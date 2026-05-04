@@ -426,14 +426,14 @@ const fetchCaptainRatesInStratum = async (
   const perGwSampleSize = new Map<number, number>();
   if (stratum === null) return { rates, perGwSampleSize };
 
-  // Sample size per GW = sum of active_picks (across all captain/multiplier
-  // combos) for that stratum and GW. Active = rejected_reason IS NULL,
-  // matching the previous read filter.
+  // Sample size per GW = sum of picks (across all captain/multiplier
+  // combos) for that stratum and GW. The full sample is used now —
+  // there is no longer a separate active subset.
   const sampleRows = await prisma.$queryRawUnsafe<
     Array<{ gw: number; sample_size: number }>
   >(
     `
-    SELECT gw, SUM(active_picks)::int AS sample_size
+    SELECT gw, SUM(picks)::int AS sample_size
     FROM stratum_captain_picks_gw
     WHERE gw BETWEEN $1 AND $2
       AND stratum = $3
@@ -454,7 +454,7 @@ const fetchCaptainRatesInStratum = async (
     }>
   >(
     `
-    SELECT gw, captain_element, captain_multiplier, active_picks AS n
+    SELECT gw, captain_element, captain_multiplier, picks AS n
     FROM stratum_captain_picks_gw
     WHERE gw BETWEEN $1 AND $2
       AND stratum = $3
@@ -498,37 +498,52 @@ const computeRankPerPoint = async (
   const lo = userRangeTotal - RANK_DENSITY_HALF_WINDOW;
   const hi = userRangeTotal + RANK_DENSITY_HALF_WINDOW;
 
-  const rows = await prisma.$queryRaw<
+  // Stratum 3 is sub-sampled at 1-in-8 to bound the DISTINCT ON sort —
+  // mirrors the trick in getRangeRank.stratumCounts. Density is invariant
+  // under uniform sampling: neighbours ÷ population stays the same in
+  // expectation, so the rank-per-point coefficient lands on the same
+  // value (with a slightly wider confidence band).
+  const subSampleClause = stratum === 3 ? `AND entry_id % 8 = 0` : ``;
+  const rows = await prisma.$queryRawUnsafe<
     Array<{
       neighbours: number;
       probes_with_history: number;
       avg_total: number | null;
     }>
-  >`
+  >(
+    `
     WITH c_end AS (
       SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
       FROM manager_cumulative
-      WHERE stratum = ${stratum}
-        AND gw BETWEEN ${startGw} AND ${endGw}
+      WHERE stratum = $1
+        AND gw BETWEEN $2 AND $3
+        ${subSampleClause}
       ORDER BY entry_id, gw DESC
     ),
     c_start AS (
       SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
       FROM manager_cumulative
-      WHERE stratum = ${stratum}
-        AND gw < ${startGw}
+      WHERE stratum = $1
+        AND gw < $2
+        ${subSampleClause}
       ORDER BY entry_id, gw DESC
     )
     SELECT
-      COUNT(*) FILTER (WHERE total BETWEEN ${lo} AND ${hi})::int AS neighbours,
-      COUNT(*)::int                                              AS probes_with_history,
-      AVG(total)::float                                          AS avg_total
+      COUNT(*) FILTER (WHERE total BETWEEN $4 AND $5)::int AS neighbours,
+      COUNT(*)::int                                        AS probes_with_history,
+      AVG(total)::float                                    AS avg_total
     FROM (
       SELECT c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0) AS total
       FROM c_end
       LEFT JOIN c_start USING (entry_id)
     ) t
-  `;
+    `,
+    stratum,
+    startGw,
+    endGw,
+    lo,
+    hi,
+  );
   const row = rows[0];
   if (!row || row.probes_with_history === 0) {
     return { rank_per_point: null, stratum_avg: null };

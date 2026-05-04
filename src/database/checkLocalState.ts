@@ -8,10 +8,9 @@ import { prisma } from "./client.js";
 
 const main = async (): Promise<void> => {
   const summary = await prisma.$queryRaw<
-    Array<{ stratum: number; rows: bigint; rejected: bigint }>
+    Array<{ stratum: number; rows: bigint }>
   >`
-    SELECT stratum, COUNT(*)::bigint AS rows,
-           COUNT(*) FILTER (WHERE rejected_reason IS NOT NULL)::bigint AS rejected
+    SELECT stratum, COUNT(*)::bigint AS rows
     FROM manager_summary
     GROUP BY stratum ORDER BY stratum
   `;
@@ -66,6 +65,14 @@ const main = async (): Promise<void> => {
     GROUP BY stratum ORDER BY stratum
   `;
 
+  const runningStats = await prisma.$queryRaw<
+    Array<{ stratum: number; rows: bigint; total_sample: bigint | null }>
+  >`
+    SELECT stratum, COUNT(*)::bigint AS rows, SUM(sample_size)::bigint AS total_sample
+    FROM stratum_gw_running_stats
+    GROUP BY stratum ORDER BY stratum
+  `;
+
   const events = await prisma.$queryRaw<
     Array<{ finished: bigint; max_gw: number | null }>
   >`
@@ -83,9 +90,7 @@ const main = async (): Promise<void> => {
 
   console.info("\nmanager_summary (sample membership):");
   for (const r of summary) {
-    console.info(
-      `  stratum ${r.stratum}: ${r.rows} managers (${r.rejected} rejected)`,
-    );
+    console.info(`  stratum ${r.stratum}: ${r.rows} managers`);
   }
 
   console.info("\nmanager_history (per-GW points for the sample):");
@@ -128,6 +133,21 @@ const main = async (): Promise<void> => {
     }
   }
 
+  console.info(
+    "\nstratum_gw_running_stats (comparison endpoint pre-aggregate):",
+  );
+  if (runningStats.length === 0) {
+    console.info(
+      "  EMPTY — run `npm run backfill-stratum-running-stats` after schema migration.",
+    );
+  } else {
+    for (const r of runningStats) {
+      console.info(
+        `  stratum ${r.stratum}: ${r.rows} GW buckets, ${r.total_sample ?? 0n} sample-manager-GW pairs`,
+      );
+    }
+  }
+
   console.info("\n=== Diagnosis ===");
   const picksRows = Number(picks[0]?.rows ?? 0n);
   const cumRows = Number(cumulative[0]?.rows ?? 0n);
@@ -162,6 +182,15 @@ const main = async (): Promise<void> => {
     );
   } else {
     console.info("  ✅ stratum_captain_picks_gw populated.");
+  }
+
+  const runningRows = runningStats.reduce((acc, r) => acc + Number(r.rows), 0);
+  if (runningRows === 0) {
+    console.info(
+      "  ❌ stratum_gw_running_stats empty — run `npm run backfill-stratum-running-stats` after manager_cumulative is populated.",
+    );
+  } else {
+    console.info("  ✅ stratum_gw_running_stats populated.");
   }
 
   console.info("");

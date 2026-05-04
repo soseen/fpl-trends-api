@@ -65,7 +65,7 @@ const backfill = async (): Promise<void> => {
          chip_freehit_h1,  chip_freehit_h2,
          chip_bboost_h1,   chip_bboost_h2,
          has_transfers, has_hits, has_bench,
-         stratum, rejected_reason)
+         stratum)
       SELECT
         base.entry_id,
         base.gw,
@@ -93,15 +93,13 @@ const backfill = async (): Promise<void> => {
         BOOL_OR(base.event_transfers      IS NOT NULL) OVER w AS has_transfers,
         BOOL_OR(base.event_transfers_cost IS NOT NULL) OVER w AS has_hits,
         BOOL_OR(base.points_on_bench      IS NOT NULL) OVER w AS has_bench,
-        base.stratum,
-        base.rejected_reason
+        base.stratum
       FROM (
         SELECT
           mh.entry_id, mh.gw, mh.points,
           mh.event_transfers, mh.event_transfers_cost, mh.points_on_bench,
           mp.active_chip,
           ms.stratum,
-          ms.rejected_reason,
           COALESCE(
             CASE
               WHEN mp.captain_multiplier IS NOT NULL AND mp.captain_multiplier > 1 THEN
@@ -136,8 +134,7 @@ const backfill = async (): Promise<void> => {
         has_transfers            = EXCLUDED.has_transfers,
         has_hits                 = EXCLUDED.has_hits,
         has_bench                = EXCLUDED.has_bench,
-        stratum                  = EXCLUDED.stratum,
-        rejected_reason          = EXCLUDED.rejected_reason
+        stratum                  = EXCLUDED.stratum
     `;
     totalRows += rowCount;
     batchCount += 1;

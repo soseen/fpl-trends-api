@@ -59,12 +59,11 @@ const getCurrentFinishedGw = async (): Promise<number> => {
 // stratum then gw. Returns missing pairs only — i.e., the ones we don't
 // have manager_picks rows for already.
 //
-// `rejected_reason IS NULL` filters out fetch_failed / inactive / trolling
-// managers. fetch_failed entry_ids are gone from FPL (banned/deleted) and
-// will return 404 forever — repeatedly hitting them used to trip the
-// governor's consecutive-error abort. Inactive/trolling picks aren't used
-// by any comparison query (those filter on the same flag), so backfilling
-// them is wasted FPL traffic.
+// We no longer filter out previously-404'd entries — the rejected_reason
+// column was dropped to simplify ingest. A small number of dead/banned
+// entries will be re-attempted on each backfill run; the governor's
+// per-call 404 handling absorbs them and the overall waste is bounded
+// (a one-time small constant per stratum, not per-GW).
 const findMissingPairs = async (
   stratum: 1 | 2 | 3,
   currentGw: number,
@@ -78,7 +77,6 @@ const findMissingPairs = async (
       FROM manager_summary ms
       CROSS JOIN gw_series
       WHERE ms.stratum = ${stratum}
-        AND ms.rejected_reason IS NULL
     )
     SELECT c.entry_id, c.gw
     FROM candidates c
@@ -103,27 +101,13 @@ const fetchAndStorePicks = async (
   gw: number,
   governor: RateLimitGovernor,
 ): Promise<void> => {
-  let payload;
-  try {
-    payload = await withGovernor(governor, () =>
-      fetchEntryEventPicks(entryId, gw),
-    );
-  } catch (err) {
-    // 404 = manager deleted / banned by FPL since we last sampled them.
-    // Tag them in manager_summary so the next backfill run's
-    // `findMissingPairs` filter (rejected_reason IS NULL) excludes them
-    // — otherwise we'd burn API calls on the same dead entries forever.
-    // The flag is set per-entry, not per-(entry,gw): one 404 implies
-    // the whole account is gone, so all remaining (entry, gw) pairs
-    // for them are wasted.
-    if (isHttpStatus(err, 404)) {
-      await prisma.manager_summary.update({
-        where: { entry_id: entryId },
-        data: { rejected_reason: "fetch_failed" },
-      });
-    }
-    throw err;
-  }
+  // 404 = manager deleted / banned by FPL since we last sampled them.
+  // We used to flag these on manager_summary.rejected_reason so future
+  // backfill runs skipped them; that column is gone now. The overall
+  // waste is bounded — see findMissingPairs comment.
+  const payload = await withGovernor(governor, () =>
+    fetchEntryEventPicks(entryId, gw),
+  );
   const { captain_element, vice_captain_element, captain_multiplier } =
     summarizePicks(payload.picks ?? []);
   await prisma.manager_picks.upsert({

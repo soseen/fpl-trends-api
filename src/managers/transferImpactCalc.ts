@@ -81,15 +81,19 @@ export const sumPointsInWindow = (
 // Stratum average: AVG(per-manager average) across managers with at
 // least one transfer in range.
 //
-// `stratumFilter` matches the convention in sampleStratumAggregates:
-//   "active" → strata 1, 2, 3 with rejected_reason IS NULL (sample mean
-//              for the broader cohort)
-//   "stratum1" → stratum 1 only with rejected_reason IS NULL (top 10k
-//                comparator)
+// `stratumFilter`:
+//   "active"   → strata 1, 2, 3 (full sample, no activity filter)
+//   "stratum1" → stratum 1 only (top-10k comparator)
 //
 // Returns null when no managers in the stratum have transfers in range.
-// `coverage` is a 0..1 fraction of stratum managers that contributed at
-// least one transfer to the average — gates display via gateOnCoverage.
+// `with_data` is the count of stratum managers that contributed at least
+// one transfer to the average; `stratum_size` is the population the
+// average is normalised against — used by gateOnCoverage.
+//
+// Stratum 3 is sub-sampled (1-in-8 by entry_id) to bound the manager_transfers
+// scan + per-transfer in/out point lookups. The sample mean is unbiased
+// regardless of sample density; sampling just trades a small std-dev
+// inflation for a roughly 8× reduction in per-request work.
 export type SampleTransferNet = {
   avg: number | null;
   with_data: number;
@@ -101,15 +105,18 @@ export const sampleAvgPtsPerTransfer = async (
   endGw: number,
   stratumFilter: "active" | "stratum1",
 ): Promise<SampleTransferNet> => {
+  // For "active" mode include all of stratum 1+2 plus a 1-in-8 sample of
+  // stratum 3 (entry_id % 8 = 0). For "stratum1" mode it's just stratum 1
+  // (~10k entries — small enough not to need sampling).
   const stratumClause =
     stratumFilter === "stratum1"
-      ? `AND mc.stratum = 1`
-      : `AND mc.stratum IN (1, 2, 3)`;
+      ? `AND ms.stratum = 1`
+      : `AND (ms.stratum IN (1, 2) OR (ms.stratum = 3 AND ms.entry_id % 8 = 0))`;
 
-  // Outer subquery: per-manager net + count from manager_transfers ⨝ history.
-  // We use scalar subqueries (CROSS JOIN LATERAL pattern was rejected as
-  // overkill for the small cardinality involved — at most a few hundred
-  // transfers per manager × stratum_size managers).
+  // Per-manager net + count via scalar subqueries on history (small,
+  // PK-indexed — ~30 k rows per season). The previous version filtered
+  // candidate managers via DISTINCT on manager_cumulative; here we filter
+  // directly via manager_summary, avoiding the cumulative scan entirely.
   const rows = await prisma.$queryRawUnsafe<
     Array<{
       avg_pts_per_transfer: number | null;
@@ -118,14 +125,7 @@ export const sampleAvgPtsPerTransfer = async (
     }>
   >(
     `
-    WITH stratum_managers AS (
-      SELECT DISTINCT mc.entry_id
-      FROM manager_cumulative mc
-      WHERE mc.rejected_reason IS NULL
-        ${stratumClause}
-        AND mc.gw BETWEEN $1 AND $2
-    ),
-    per_manager AS (
+    WITH per_manager AS (
       SELECT
         mt.entry_id,
         SUM(
@@ -147,14 +147,19 @@ export const sampleAvgPtsPerTransfer = async (
         )::float AS net,
         COUNT(*)::int AS xfers
       FROM manager_transfers mt
-      JOIN stratum_managers sm ON sm.entry_id = mt.entry_id
+      JOIN manager_summary ms ON ms.entry_id = mt.entry_id
       WHERE mt.gw BETWEEN $1 AND $2
+        ${stratumClause}
       GROUP BY mt.entry_id
     )
     SELECT
       AVG(per_manager.net / NULLIF(per_manager.xfers, 0))::float AS avg_pts_per_transfer,
       COUNT(*)::int AS with_transfers_data,
-      (SELECT COUNT(*)::int FROM stratum_managers) AS stratum_size
+      (
+        SELECT COUNT(*)::int
+        FROM manager_summary ms
+        WHERE TRUE ${stratumClause}
+      ) AS stratum_size
     FROM per_manager
     WHERE per_manager.xfers > 0
     `,
