@@ -649,22 +649,62 @@ const computeRankPerPoint = async (
   }>;
 
   if (USE_CUMULATIVE_TABLE) {
+    // Loose-index-scan via recursive CTE — see the long comment in
+    // getRangeRank.ts:stratumCounts for why naive DISTINCT ON over the full
+    // partition is ~4 s on prod even with the right index. Same idiom here.
+    // The `rejected_reason IS NULL` predicate uses the
+    // (stratum, rejected_reason, gw) index for c_start; for c_end the
+    // (stratum, entry_id, gw DESC) index covers the recursive seek and
+    // PG post-filters rejected_reason on each one-row hit (cheap because
+    // each iteration emits one row).
     rows = await prisma.$queryRaw<typeof rows>`
-      WITH c_end AS (
-        SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
-        FROM manager_cumulative
-        WHERE stratum = ${stratum}
-          AND rejected_reason IS NULL
-          AND gw BETWEEN ${startGw} AND ${endGw}
-        ORDER BY entry_id, gw DESC
+      WITH RECURSIVE c_end AS (
+        (
+          SELECT entry_id, cumulative_points
+          FROM manager_cumulative
+          WHERE stratum = ${stratum}
+            AND rejected_reason IS NULL
+            AND gw BETWEEN ${startGw} AND ${endGw}
+          ORDER BY entry_id, gw DESC
+          LIMIT 1
+        )
+        UNION ALL
+        SELECT n.entry_id, n.cumulative_points
+        FROM c_end e
+        CROSS JOIN LATERAL (
+          SELECT entry_id, cumulative_points
+          FROM manager_cumulative
+          WHERE stratum = ${stratum}
+            AND rejected_reason IS NULL
+            AND gw BETWEEN ${startGw} AND ${endGw}
+            AND entry_id > e.entry_id
+          ORDER BY entry_id, gw DESC
+          LIMIT 1
+        ) n
       ),
       c_start AS (
-        SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
-        FROM manager_cumulative
-        WHERE stratum = ${stratum}
-          AND rejected_reason IS NULL
-          AND gw < ${startGw}
-        ORDER BY entry_id, gw DESC
+        (
+          SELECT entry_id, cumulative_points
+          FROM manager_cumulative
+          WHERE stratum = ${stratum}
+            AND rejected_reason IS NULL
+            AND gw < ${startGw}
+          ORDER BY entry_id, gw DESC
+          LIMIT 1
+        )
+        UNION ALL
+        SELECT n.entry_id, n.cumulative_points
+        FROM c_start s
+        CROSS JOIN LATERAL (
+          SELECT entry_id, cumulative_points
+          FROM manager_cumulative
+          WHERE stratum = ${stratum}
+            AND rejected_reason IS NULL
+            AND gw < ${startGw}
+            AND entry_id > s.entry_id
+          ORDER BY entry_id, gw DESC
+          LIMIT 1
+        ) n
       )
       SELECT
         COUNT(*) FILTER (WHERE total BETWEEN ${lo} AND ${hi})::int AS neighbours,

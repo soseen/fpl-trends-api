@@ -108,22 +108,67 @@ const stratumCounts = async (
   threshold: number,
 ): Promise<{ higher: number; probesWithHistory: number }> => {
   if (USE_CUMULATIVE_TABLE) {
+    // Loose-index-scan rewrite. Naive `DISTINCT ON (entry_id) ... ORDER BY
+    // gw DESC` over the (stratum=N, gw IN range) partition reads ALL rows
+    // (~13M for S3 full-season) and lets Unique pick one per group — that
+    // takes ~4 s even with the data fully cached and the right index,
+    // because the bottleneck is the 13M row stream itself.
+    //
+    // Recursive-CTE form: walk distinct entry_ids one at a time. Each
+    // iteration is a single B-tree probe on
+    // (stratum, entry_id > previous, gw DESC) returning ONE row — so the
+    // total work is ~400k lookups rather than 13M row reads. PostgreSQL
+    // doesn't have native skip-scan; this is the standard idiom.
+    //
+    // The ORDER BY in the recursive arm IS load-bearing: with the
+    // (stratum, entry_id, gw DESC) index PG plans it as a single seek,
+    // not a scan-and-sort.
     const rows = await prisma.$queryRaw<
       Array<{ higher: number; probes_with_history: number }>
     >`
-      WITH c_end AS (
-        SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
-        FROM manager_cumulative
-        WHERE stratum = ${stratum}
-          AND gw BETWEEN ${startGw} AND ${endGw}
-        ORDER BY entry_id, gw DESC
+      WITH RECURSIVE c_end AS (
+        (
+          SELECT entry_id, cumulative_points
+          FROM manager_cumulative
+          WHERE stratum = ${stratum}
+            AND gw BETWEEN ${startGw} AND ${endGw}
+          ORDER BY entry_id, gw DESC
+          LIMIT 1
+        )
+        UNION ALL
+        SELECT n.entry_id, n.cumulative_points
+        FROM c_end e
+        CROSS JOIN LATERAL (
+          SELECT entry_id, cumulative_points
+          FROM manager_cumulative
+          WHERE stratum = ${stratum}
+            AND gw BETWEEN ${startGw} AND ${endGw}
+            AND entry_id > e.entry_id
+          ORDER BY entry_id, gw DESC
+          LIMIT 1
+        ) n
       ),
       c_start AS (
-        SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
-        FROM manager_cumulative
-        WHERE stratum = ${stratum}
-          AND gw < ${startGw}
-        ORDER BY entry_id, gw DESC
+        (
+          SELECT entry_id, cumulative_points
+          FROM manager_cumulative
+          WHERE stratum = ${stratum}
+            AND gw < ${startGw}
+          ORDER BY entry_id, gw DESC
+          LIMIT 1
+        )
+        UNION ALL
+        SELECT n.entry_id, n.cumulative_points
+        FROM c_start s
+        CROSS JOIN LATERAL (
+          SELECT entry_id, cumulative_points
+          FROM manager_cumulative
+          WHERE stratum = ${stratum}
+            AND gw < ${startGw}
+            AND entry_id > s.entry_id
+          ORDER BY entry_id, gw DESC
+          LIMIT 1
+        ) n
       )
       SELECT
         COUNT(*) FILTER (WHERE s >= ${threshold})::int AS higher,

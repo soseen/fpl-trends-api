@@ -29,7 +29,9 @@ Two indexed lookups per entry, no GROUP BY. The full 625k S3 sample fits in the 
 
 3. **Backfill** (one-off): the first time you deploy this, the table is empty and the cron's per-entry maintenance only fills it for entries it visits. The bootstrap script runs a single `INSERT … SELECT … SUM() OVER (PARTITION BY entry_id ORDER BY gw)` window function, batched by `entry_id` in chunks of 10k, populating the whole table from existing `manager_history`.
 
-4. **Read path**: gated behind the `USE_CUMULATIVE_TABLE` env var. When true, both `stratumCounts` and `computeRankPerPoint` use `DISTINCT ON (entry_id) … ORDER BY gw DESC` to pull each entry's running total at the latest in-range GW, then subtract the latest pre-range row (`COALESCE` to 0 if entry joined inside the range). Entries with no in-range row drop, exactly matching the legacy "probes with history in range" semantic.
+4. **Read path**: gated behind the `USE_CUMULATIVE_TABLE` env var. When true, both `stratumCounts` and `computeRankPerPoint` use a **recursive CTE / loose index scan** to pull each entry's running total at the latest in-range GW, then subtract the latest pre-range row (`COALESCE` to 0 if entry joined inside the range). Entries with no in-range row drop, exactly matching the legacy "probes with history in range" semantic.
+
+   The recursive form (`WITH RECURSIVE … UNION ALL … CROSS JOIN LATERAL … LIMIT 1`) is load-bearing: a naive `DISTINCT ON (entry_id) ORDER BY gw DESC` over the (stratum=N, gw IN range) partition reads ALL ~13M rows in stratum 3 and lets `Unique` pick one per group — that's ~4 s on prod even with the data fully cached and the `(stratum, entry_id, gw DESC)` index in place, because the bottleneck is the row stream itself. Recursive CTE walks ~400k distinct entry_ids one at a time, each iteration a single B-tree seek for `entry_id > previous AND gw IN range LIMIT 1`. PostgreSQL has no native skip-scan; this is the standard idiom for it.
 
 ## Semantic invariant
 
