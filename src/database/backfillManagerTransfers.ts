@@ -18,12 +18,24 @@ import { delay } from "../utils.js";
 // once). Mirrors the batching cadence of populateManagers (8 in flight,
 // 60ms inter-batch delay) so we don't burst the FPL API.
 
-const BATCH_SIZE = 8;
-const INTER_BATCH_DELAY_MS = 60;
+const readEnvInt = (key: string, fallback: number, min = 1): number => {
+  const raw = process.env[key];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < min) return fallback;
+  return parsed;
+};
+
+const BATCH_SIZE = readEnvInt("MANAGER_TRANSFER_BACKFILL_BATCH", 8, 1);
+const INTER_BATCH_DELAY_MS = readEnvInt(
+  "MANAGER_TRANSFER_BACKFILL_DELAY_MS",
+  60,
+  0,
+);
 // Cap per run so a single invocation can't exhaust the FPL goodwill or
 // hold the connection pool indefinitely. Re-run until the underlying
 // query returns zero managers.
-const MAX_PER_RUN = 100_000;
+const MAX_PER_RUN = readEnvInt("MANAGER_TRANSFER_BACKFILL_MAX", 100_000, 1);
 
 const fetchPendingEntryIds = async (): Promise<number[]> => {
   const rows = await prisma.$queryRawUnsafe<Array<{ entry_id: number }>>(
@@ -31,7 +43,7 @@ const fetchPendingEntryIds = async (): Promise<number[]> => {
     SELECT entry_id
     FROM manager_summary
     WHERE has_transfer_history = false
-    ORDER BY entry_id
+    ORDER BY md5(entry_id::text)
     LIMIT $1
     `,
     MAX_PER_RUN,

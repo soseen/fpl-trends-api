@@ -2,15 +2,28 @@ import { prisma } from "../database/client.js";
 import { fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks, captainPicksFromResolved } from "./resolvePicks.js";
-import { sampleAvgPtsPerTransfer } from "./transferImpactCalc.js";
 import { computeUserTransferNet } from "./getManagerTransfers.js";
+import { sampleAvgPtsPerTransfer } from "./transferImpactCalc.js";
 
 type ChipPlay = { chip_name: string; num_played: number };
 
 export type ComparisonStat = {
   user: number;
   average: number | null;
+  top100k_average: number | null;
   top10k_average: number | null;
+};
+
+export type ChipHalfStat = {
+  average: number | null;
+  top100k_average: number | null;
+  top10k_average: number | null;
+};
+
+export type ChipUsageStat = {
+  user: number;
+  h1: ChipHalfStat | null;
+  h2: ChipHalfStat | null;
 };
 
 export type CaptainSummary = {
@@ -18,6 +31,8 @@ export type CaptainSummary = {
   user_player_name: string | null;
   average_player_id: number | null;
   average_player_name: string | null;
+  top100k_player_id: number | null;
+  top100k_player_name: string | null;
   top10k_player_id: number | null;
   top10k_player_name: string | null;
 };
@@ -30,9 +45,9 @@ export type ManagerComparisonResponse = {
   transfers: ComparisonStat;
   // Chip stats: user is 0 or 1 (played within range or not). Average is the
   // fraction of FPL managers (0..1) who played that chip in the range.
-  wildcards: ComparisonStat;
-  free_hits: ComparisonStat;
-  bench_boosts: ComparisonStat;
+  wildcards: ChipUsageStat;
+  free_hits: ChipUsageStat;
+  bench_boosts: ChipUsageStat;
   hits: ComparisonStat;
   bench_points: ComparisonStat;
   // Sum of (captained_player_points × (multiplier − 1)) across the range.
@@ -126,41 +141,6 @@ const userCaptainBonusFromPicks = async (
   return bonus;
 };
 
-// Most-captained element in [startGw, endGw] under the given filter,
-// served by the pre-aggregated stratum_captain_picks_gw table. The table
-// is rebuilt at the end of every populateManagers run (see
-// rebuildStratumCaptainPicks). Returns null if no captain rows in range.
-//
-// `stratumFilter`:
-//   - "active" → all strata (1, 2, 3), full sample.
-//   - "stratum1" → stratum 1 only.
-const sampleMostCaptained = async (
-  startGw: number,
-  endGw: number,
-  stratumFilter: "active" | "stratum1",
-): Promise<number | null> => {
-  const stratumClause =
-    stratumFilter === "stratum1"
-      ? `AND stratum = 1`
-      : `AND stratum IN (1, 2, 3)`;
-  const rows = await prisma.$queryRawUnsafe<
-    Array<{ captain_element: number; picks: number }>
-  >(
-    `
-    SELECT captain_element, SUM(picks)::int AS picks
-    FROM stratum_captain_picks_gw
-    WHERE gw BETWEEN $1 AND $2
-      ${stratumClause}
-    GROUP BY captain_element
-    ORDER BY picks DESC
-    LIMIT 1
-    `,
-    startGw,
-    endGw,
-  );
-  return rows[0]?.captain_element ?? null;
-};
-
 // Per-stratum sample aggregates: averages of total_points, transfers,
 // hits, bench, captain_bonus, gw_score; chip rates; coverage counts.
 //
@@ -180,7 +160,7 @@ const sampleMostCaptained = async (
 const sampleStratumAggregates = async (
   startGw: number,
   endGw: number,
-  stratumFilter: "active" | "stratum1",
+  stratumFilter: "active" | "stratum1" | "stratum12",
 ): Promise<{
   avg_total_points: number | null;
   avg_transfers: number | null;
@@ -189,14 +169,26 @@ const sampleStratumAggregates = async (
   avg_captain_bonus: number | null;
   avg_gw_score: number | null;
   wildcards_rate: number | null;
+  wildcards_h1_rate: number | null;
+  wildcards_h2_rate: number | null;
   free_hits_rate: number | null;
+  free_hits_h1_rate: number | null;
+  free_hits_h2_rate: number | null;
   bench_boosts_rate: number | null;
+  bench_boosts_h1_rate: number | null;
+  bench_boosts_h2_rate: number | null;
   sample_size: number;
   with_hits_data: number;
   with_bench_data: number;
   with_transfers_data: number;
+  with_chips_data: number;
 }> => {
-  const strata = stratumFilter === "stratum1" ? [1] : [1, 2, 3];
+  const strata =
+    stratumFilter === "stratum1"
+      ? [1]
+      : stratumFilter === "stratum12"
+        ? [1, 2]
+        : [1, 2, 3];
   // Bind the IN-list as a Postgres int[] so the parameter count is
   // independent of stratum cardinality.
   const stratumArr = strata;
@@ -224,6 +216,7 @@ const sampleStratumAggregates = async (
       e_with_transfers: number | null;
       e_with_hits: number | null;
       e_with_bench: number | null;
+      e_with_chips: number | null;
       e_wildcards_h1: number | null;
       e_wildcards_h2: number | null;
       e_freehits_h1: number | null;
@@ -251,6 +244,7 @@ const sampleStratumAggregates = async (
         SUM(count_with_transfers)::int     AS with_transfers,
         SUM(count_with_hits)::int          AS with_hits,
         SUM(count_with_bench)::int         AS with_bench,
+        SUM(count_with_chips)::int         AS with_chips,
         SUM(cum_wildcards_h1)::int         AS wildcards_h1,
         SUM(cum_wildcards_h2)::int         AS wildcards_h2,
         SUM(cum_freehits_h1)::int          AS freehits_h1,
@@ -294,6 +288,7 @@ const sampleStratumAggregates = async (
       e.with_transfers                            AS e_with_transfers,
       e.with_hits                                 AS e_with_hits,
       e.with_bench                                AS e_with_bench,
+      e.with_chips                                AS e_with_chips,
       e.wildcards_h1                              AS e_wildcards_h1,
       e.wildcards_h2                              AS e_wildcards_h2,
       e.freehits_h1                               AS e_freehits_h1,
@@ -323,12 +318,19 @@ const sampleStratumAggregates = async (
       avg_captain_bonus: null,
       avg_gw_score: null,
       wildcards_rate: null,
+      wildcards_h1_rate: null,
+      wildcards_h2_rate: null,
       free_hits_rate: null,
+      free_hits_h1_rate: null,
+      free_hits_h2_rate: null,
       bench_boosts_rate: null,
+      bench_boosts_h1_rate: null,
+      bench_boosts_h2_rate: null,
       sample_size: 0,
       with_hits_data: 0,
       with_bench_data: 0,
       with_transfers_data: 0,
+      with_chips_data: 0,
     };
   }
 
@@ -342,12 +344,19 @@ const sampleStratumAggregates = async (
       avg_captain_bonus: null,
       avg_gw_score: null,
       wildcards_rate: null,
+      wildcards_h1_rate: null,
+      wildcards_h2_rate: null,
       free_hits_rate: null,
+      free_hits_h1_rate: null,
+      free_hits_h2_rate: null,
       bench_boosts_rate: null,
+      bench_boosts_h1_rate: null,
+      bench_boosts_h2_rate: null,
       sample_size: 0,
       with_hits_data: 0,
       with_bench_data: 0,
       with_transfers_data: 0,
+      with_chips_data: 0,
     };
   }
 
@@ -370,15 +379,36 @@ const sampleStratumAggregates = async (
   // Chip "played-in-range" deltas, by half. A chip play is detected at the
   // earliest GW it appears in the cumulative; the per-half split lets a
   // range that crosses the GW20 boundary count both halves correctly.
-  const dWildcards =
-    Math.max(0, (row.e_wildcards_h1 ?? 0) - (row.s_wildcards_h1 ?? 0)) +
-    Math.max(0, (row.e_wildcards_h2 ?? 0) - (row.s_wildcards_h2 ?? 0));
-  const dFreehits =
-    Math.max(0, (row.e_freehits_h1 ?? 0) - (row.s_freehits_h1 ?? 0)) +
-    Math.max(0, (row.e_freehits_h2 ?? 0) - (row.s_freehits_h2 ?? 0));
-  const dBboosts =
-    Math.max(0, (row.e_bboosts_h1 ?? 0) - (row.s_bboosts_h1 ?? 0)) +
-    Math.max(0, (row.e_bboosts_h2 ?? 0) - (row.s_bboosts_h2 ?? 0));
+  const dWildcardsH1 = Math.max(
+    0,
+    (row.e_wildcards_h1 ?? 0) - (row.s_wildcards_h1 ?? 0),
+  );
+  const dWildcardsH2 = Math.max(
+    0,
+    (row.e_wildcards_h2 ?? 0) - (row.s_wildcards_h2 ?? 0),
+  );
+  const dFreehitsH1 = Math.max(
+    0,
+    (row.e_freehits_h1 ?? 0) - (row.s_freehits_h1 ?? 0),
+  );
+  const dFreehitsH2 = Math.max(
+    0,
+    (row.e_freehits_h2 ?? 0) - (row.s_freehits_h2 ?? 0),
+  );
+  const dBboostsH1 = Math.max(
+    0,
+    (row.e_bboosts_h1 ?? 0) - (row.s_bboosts_h1 ?? 0),
+  );
+  const dBboostsH2 = Math.max(
+    0,
+    (row.e_bboosts_h2 ?? 0) - (row.s_bboosts_h2 ?? 0),
+  );
+  const hasH1 = startGw <= 19;
+  const hasH2 = endGw > 19;
+  const chipSampleSize = row.e_with_chips ?? 0;
+  const chipCoverageOk = chipSampleSize >= captainSampleMinimum(stratumFilter);
+  const chipRate = (played: number): number | null =>
+    chipCoverageOk ? played / chipSampleSize : null;
 
   return {
     avg_total_points: dPoints / sampleSize,
@@ -389,13 +419,20 @@ const sampleStratumAggregates = async (
     // avg_gw_score: average per-GW score in the range, weighted by sample size
     // (matches the previous semantics of (range_total / gws_played) averaged).
     avg_gw_score: dGwsPlayed > 0 ? dPoints / dGwsPlayed : null,
-    wildcards_rate: dWildcards / sampleSize,
-    free_hits_rate: dFreehits / sampleSize,
-    bench_boosts_rate: dBboosts / sampleSize,
+    wildcards_rate: chipRate(dWildcardsH1 + dWildcardsH2),
+    wildcards_h1_rate: hasH1 ? chipRate(dWildcardsH1) : null,
+    wildcards_h2_rate: hasH2 ? chipRate(dWildcardsH2) : null,
+    free_hits_rate: chipRate(dFreehitsH1 + dFreehitsH2),
+    free_hits_h1_rate: hasH1 ? chipRate(dFreehitsH1) : null,
+    free_hits_h2_rate: hasH2 ? chipRate(dFreehitsH2) : null,
+    bench_boosts_rate: chipRate(dBboostsH1 + dBboostsH2),
+    bench_boosts_h1_rate: hasH1 ? chipRate(dBboostsH1) : null,
+    bench_boosts_h2_rate: hasH2 ? chipRate(dBboostsH2) : null,
     sample_size: sampleSize,
     with_hits_data: row.e_with_hits ?? 0,
     with_bench_data: row.e_with_bench ?? 0,
     with_transfers_data: row.e_with_transfers ?? 0,
+    with_chips_data: chipSampleSize,
   };
 };
 
@@ -409,6 +446,133 @@ const gateOnCoverage = (
   if (value === null || sampleSize === 0 || withData === 0) return null;
   const coverage = withData / sampleSize;
   return coverage >= COVERAGE_THRESHOLD ? value : null;
+};
+
+const gateOnMinimumSample = (
+  value: number | null,
+  withData: number,
+  stratumFilter: "active" | "stratum1" | "stratum12",
+): number | null => {
+  if (value === null || withData < captainSampleMinimum(stratumFilter)) {
+    return null;
+  }
+  return value;
+};
+
+const captainSampleMinimum = (
+  stratumFilter: "active" | "stratum1" | "stratum12",
+): number => {
+  if (stratumFilter === "stratum1") return 250;
+  if (stratumFilter === "stratum12") return 1_000;
+  return 1_500;
+};
+
+const sampleCaptainAggregate = async (
+  startGw: number,
+  endGw: number,
+  stratumFilter: "active" | "stratum1" | "stratum12",
+): Promise<{
+  avg_bonus: number | null;
+  most_captained_id: number | null;
+  most_captained_name: string | null;
+  complete_managers: number;
+}> => {
+  const strata =
+    stratumFilter === "stratum1"
+      ? [1]
+      : stratumFilter === "stratum12"
+        ? [1, 2]
+        : [1, 2, 3];
+  const expectedGws = endGw - startGw + 1;
+  const minimum = captainSampleMinimum(stratumFilter);
+
+  const [bonusRows, mostRows] = await Promise.all([
+    prisma.$queryRawUnsafe<
+      Array<{ avg_bonus: number | null; complete_managers: number }>
+    >(
+      `
+      WITH per_manager AS (
+        SELECT
+          mp.entry_id,
+          COUNT(DISTINCT mp.gw)::int AS gws_with_picks,
+          SUM(
+            CASE
+              WHEN mp.captain_multiplier IS NOT NULL
+               AND mp.captain_multiplier > 1
+              THEN COALESCE(h.pts, 0) * (mp.captain_multiplier - 1)
+              ELSE 0
+            END
+          )::float AS captain_bonus
+        FROM manager_picks mp
+        JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+        LEFT JOIN LATERAL (
+          SELECT SUM(total_points)::int AS pts
+          FROM history h
+          WHERE h.footballer_id = mp.captain_element
+            AND h.round = mp.gw
+        ) h ON TRUE
+        WHERE mp.gw BETWEEN $1 AND $2
+          AND ms.stratum = ANY($3::int[])
+        GROUP BY mp.entry_id
+      )
+      SELECT
+        AVG(captain_bonus)::float AS avg_bonus,
+        COUNT(*)::int AS complete_managers
+      FROM per_manager
+      WHERE gws_with_picks = $4
+      `,
+      startGw,
+      endGw,
+      strata,
+      expectedGws,
+    ),
+    prisma.$queryRawUnsafe<Array<{ captain_element: number; picks: number }>>(
+      `
+      WITH complete_managers AS (
+        SELECT mp.entry_id
+        FROM manager_picks mp
+        JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+        WHERE mp.gw BETWEEN $1 AND $2
+          AND ms.stratum = ANY($3::int[])
+        GROUP BY mp.entry_id
+        HAVING COUNT(DISTINCT mp.gw) = $4
+      )
+      SELECT mp.captain_element, COUNT(*)::int AS picks
+      FROM manager_picks mp
+      JOIN complete_managers cm ON cm.entry_id = mp.entry_id
+      WHERE mp.gw BETWEEN $1 AND $2
+        AND mp.captain_element IS NOT NULL
+        AND mp.captain_multiplier IS NOT NULL
+        AND mp.captain_multiplier >= 2
+      GROUP BY mp.captain_element
+      ORDER BY picks DESC
+      LIMIT 1
+      `,
+      startGw,
+      endGw,
+      strata,
+      expectedGws,
+    ),
+  ]);
+
+  const bonusRow = bonusRows[0];
+  const completeManagers = bonusRow?.complete_managers ?? 0;
+  if (completeManagers < minimum) {
+    return {
+      avg_bonus: null,
+      most_captained_id: null,
+      most_captained_name: null,
+      complete_managers: completeManagers,
+    };
+  }
+
+  const mostId = mostRows[0]?.captain_element ?? null;
+  return {
+    avg_bonus: bonusRow?.avg_bonus ?? null,
+    most_captained_id: mostId,
+    most_captained_name: await footballerName(mostId),
+    complete_managers: completeManagers,
+  };
 };
 
 export const getManagerComparison = async (
@@ -445,21 +609,15 @@ export const getManagerComparison = async (
   const chipsPlayedInRange = (history.chips ?? []).filter(
     (c) => c.event >= startGw && c.event <= endGw,
   );
-  const userWildcard = chipsPlayedInRange.some(
+  const userWildcard = chipsPlayedInRange.filter(
     (c) => c.name === CHIP_NAME_WILDCARD,
-  )
-    ? 1
-    : 0;
-  const userFreeHit = chipsPlayedInRange.some(
+  ).length;
+  const userFreeHit = chipsPlayedInRange.filter(
     (c) => c.name === CHIP_NAME_FREEHIT,
-  )
-    ? 1
-    : 0;
-  const userBenchBoost = chipsPlayedInRange.some(
+  ).length;
+  const userBenchBoost = chipsPlayedInRange.filter(
     (c) => c.name === CHIP_NAME_BBOOST,
-  )
-    ? 1
-    : 0;
+  ).length;
 
   // ---- Per-event aggregates from our DB (whole-population averages from
   // FPL's own per-GW counts; orthogonal to the sampled stratum stats).
@@ -477,47 +635,63 @@ export const getManagerComparison = async (
 
   let avgTotalPoints = 0;
   let avgTransfersTotal = 0;
-  let avgWildcardRate = 0;
-  let avgFreeHitRate = 0;
-  let avgBenchBoostRate = 0;
+  let avgWildcardH1Rate = 0;
+  let avgWildcardH2Rate = 0;
+  let avgFreeHitH1Rate = 0;
+  let avgFreeHitH2Rate = 0;
+  let avgBenchBoostH1Rate = 0;
+  let avgBenchBoostH2Rate = 0;
 
   for (const ev of events) {
     avgTotalPoints += ev.average_entry_score;
     if (ev.ranked_count > 0) {
       avgTransfersTotal += ev.transfers_made / ev.ranked_count;
       const cp = ev.chip_plays as ChipPlay[] | null;
-      avgWildcardRate += sumChipPlays(cp, CHIP_NAME_WILDCARD) / ev.ranked_count;
-      avgFreeHitRate += sumChipPlays(cp, CHIP_NAME_FREEHIT) / ev.ranked_count;
-      avgBenchBoostRate += sumChipPlays(cp, CHIP_NAME_BBOOST) / ev.ranked_count;
+      const isH1 = ev.id <= 19;
+      const wcRate = sumChipPlays(cp, CHIP_NAME_WILDCARD) / ev.ranked_count;
+      const fhRate = sumChipPlays(cp, CHIP_NAME_FREEHIT) / ev.ranked_count;
+      const bbRate = sumChipPlays(cp, CHIP_NAME_BBOOST) / ev.ranked_count;
+      if (isH1) {
+        avgWildcardH1Rate += wcRate;
+        avgFreeHitH1Rate += fhRate;
+        avgBenchBoostH1Rate += bbRate;
+      } else {
+        avgWildcardH2Rate += wcRate;
+        avgFreeHitH2Rate += fhRate;
+        avgBenchBoostH2Rate += bbRate;
+      }
     }
   }
 
-  // ---- Sample-side per-stratum aggregates (active + top-10k) and most
-  // captained, plus user picks resolution and user transfer net. All in
-  // parallel — sample queries run on indexed cumulative tables (sub-second),
-  // most-captained hits the tiny stratum_captain_picks_gw table (ms),
-  // resolvePicks dedups the FPL picks fetch with team-impact when both
-  // endpoints fire simultaneously from the frontend, and
-  // computeUserTransferNet shares its FPL fetch with the transfers
-  // endpoint via the in-flight de-dup in resolveTransfers.
+  // ---- Sample-side per-stratum aggregates, plus user picks resolution and
+  // user transfer net. All in parallel: sample queries run on indexed
+  // cumulative/read-model tables, resolvePicks dedups the FPL picks fetch with
+  // team-impact, and computeUserTransferNet shares its FPL fetch with the
+  // transfers endpoint via the in-flight de-dup in resolveTransfers.
   const [
     activeAgg,
+    top100kAgg,
     top10kAgg,
-    activeMost,
-    top10kMost,
+    activeCaptainAgg,
+    top100kCaptainAgg,
+    top10kCaptainAgg,
+    activeXferAgg,
+    top100kXferAgg,
+    top10kXferAgg,
     userPicks,
     userXferNet,
-    activeXferAgg,
-    top10kXferAgg,
   ] = await Promise.all([
     sampleStratumAggregates(startGw, endGw, "active"),
+    sampleStratumAggregates(startGw, endGw, "stratum12"),
     sampleStratumAggregates(startGw, endGw, "stratum1"),
-    sampleMostCaptained(startGw, endGw, "active"),
-    sampleMostCaptained(startGw, endGw, "stratum1"),
+    sampleCaptainAggregate(startGw, endGw, "active"),
+    sampleCaptainAggregate(startGw, endGw, "stratum12"),
+    sampleCaptainAggregate(startGw, endGw, "stratum1"),
+    sampleAvgPtsPerTransfer(startGw, endGw, "active"),
+    sampleAvgPtsPerTransfer(startGw, endGw, "stratum12"),
+    sampleAvgPtsPerTransfer(startGw, endGw, "stratum1"),
     resolvePicks(entryId, finishedGws),
     computeUserTransferNet(entryId, startGw, endGw),
-    sampleAvgPtsPerTransfer(startGw, endGw, "active"),
-    sampleAvgPtsPerTransfer(startGw, endGw, "stratum1"),
   ]);
 
   const avgHits = gateOnCoverage(
@@ -530,12 +704,6 @@ export const getManagerComparison = async (
     activeAgg.with_bench_data,
     activeAgg.sample_size,
   );
-  const avgTransfersFromHistory = gateOnCoverage(
-    activeAgg.avg_transfers,
-    activeAgg.with_transfers_data,
-    activeAgg.sample_size,
-  );
-
   const avgHitsTop10k = gateOnCoverage(
     top10kAgg.avg_hits,
     top10kAgg.with_hits_data,
@@ -546,20 +714,35 @@ export const getManagerComparison = async (
     top10kAgg.with_bench_data,
     top10kAgg.sample_size,
   );
+  const avgHitsTop100k = gateOnCoverage(
+    top100kAgg.avg_hits,
+    top100kAgg.with_hits_data,
+    top100kAgg.sample_size,
+  );
+  const avgBenchTop100k = gateOnCoverage(
+    top100kAgg.avg_bench,
+    top100kAgg.with_bench_data,
+    top100kAgg.sample_size,
+  );
 
   // Coverage gates for the new transfers-per-manager metric. The "active"
   // pool drives the partial-data flag because it's the larger sample —
   // top-10k transfers data fills in faster (smaller stratum) so it's
   // gated separately but doesn't influence the response-level note.
-  const avgPtsPerTransferActive = gateOnCoverage(
+  const avgPtsPerTransferActive = gateOnMinimumSample(
     activeXferAgg.avg,
     activeXferAgg.with_data,
-    activeXferAgg.stratum_size,
+    "active",
   );
-  const avgPtsPerTransferTop10k = gateOnCoverage(
+  const avgPtsPerTransferTop100k = gateOnMinimumSample(
+    top100kXferAgg.avg,
+    top100kXferAgg.with_data,
+    "stratum12",
+  );
+  const avgPtsPerTransferTop10k = gateOnMinimumSample(
     top10kXferAgg.avg,
     top10kXferAgg.with_data,
-    top10kXferAgg.stratum_size,
+    "stratum1",
   );
 
   const userAvgPtsPerTransfer =
@@ -605,11 +788,35 @@ export const getManagerComparison = async (
     }
   }
 
-  const [userMostName, activeMostName, top10kMostName] = await Promise.all([
-    footballerName(userMostCaptainedElement),
-    footballerName(activeMost),
-    footballerName(top10kMost),
-  ]);
+  const userMostName = await footballerName(userMostCaptainedElement);
+
+  const hasH1 = startGw <= 19;
+  const hasH2 = endGw > 19;
+  const chipStat = (
+    user: number,
+    averageH1: number | null,
+    averageH2: number | null,
+    top100kH1: number | null,
+    top100kH2: number | null,
+    top10kH1: number | null,
+    top10kH2: number | null,
+  ): ChipUsageStat => ({
+    user,
+    h1: hasH1
+      ? {
+          average: averageH1,
+          top100k_average: top100kH1,
+          top10k_average: top10kH1,
+        }
+      : null,
+    h2: hasH2
+      ? {
+          average: averageH2,
+          top100k_average: top100kH2,
+          top10k_average: top10kH2,
+        }
+      : null,
+  });
 
   return {
     entry_id: entryId,
@@ -618,6 +825,7 @@ export const getManagerComparison = async (
     total_points: {
       user: userTotalPoints,
       average: avgTotalPoints,
+      top100k_average: top100kAgg.avg_total_points,
       top10k_average: top10kAgg.avg_total_points,
     },
     transfers: {
@@ -625,56 +833,77 @@ export const getManagerComparison = async (
       // Prefer the per-manager average from the cumulative sample (real
       // distribution across managers) when coverage is sufficient; fall
       // back to the event-level rate otherwise.
-      average: avgTransfersFromHistory ?? avgTransfersTotal,
+      average: avgTransfersTotal,
+      top100k_average: top100kAgg.avg_transfers,
       top10k_average: top10kAgg.avg_transfers,
     },
-    wildcards: {
-      user: userWildcard,
-      average: avgWildcardRate,
-      top10k_average: top10kAgg.wildcards_rate,
-    },
-    free_hits: {
-      user: userFreeHit,
-      average: avgFreeHitRate,
-      top10k_average: top10kAgg.free_hits_rate,
-    },
-    bench_boosts: {
-      user: userBenchBoost,
-      average: avgBenchBoostRate,
-      top10k_average: top10kAgg.bench_boosts_rate,
-    },
+    wildcards: chipStat(
+      userWildcard,
+      avgWildcardH1Rate,
+      avgWildcardH2Rate,
+      top100kAgg.wildcards_h1_rate,
+      top100kAgg.wildcards_h2_rate,
+      top10kAgg.wildcards_h1_rate,
+      top10kAgg.wildcards_h2_rate,
+    ),
+    free_hits: chipStat(
+      userFreeHit,
+      avgFreeHitH1Rate,
+      avgFreeHitH2Rate,
+      top100kAgg.free_hits_h1_rate,
+      top100kAgg.free_hits_h2_rate,
+      top10kAgg.free_hits_h1_rate,
+      top10kAgg.free_hits_h2_rate,
+    ),
+    bench_boosts: chipStat(
+      userBenchBoost,
+      avgBenchBoostH1Rate,
+      avgBenchBoostH2Rate,
+      top100kAgg.bench_boosts_h1_rate,
+      top100kAgg.bench_boosts_h2_rate,
+      top10kAgg.bench_boosts_h1_rate,
+      top10kAgg.bench_boosts_h2_rate,
+    ),
     hits: {
       user: userHits,
       average: avgHits,
+      top100k_average: avgHitsTop100k,
       top10k_average: avgHitsTop10k,
     },
     bench_points: {
       user: userBench,
       average: avgBench,
+      top100k_average: avgBenchTop100k,
       top10k_average: avgBenchTop10k,
     },
     captain_bonus: {
       user: userCaptainBonus,
-      average: activeAgg.avg_captain_bonus,
-      top10k_average: top10kAgg.avg_captain_bonus,
+      average: activeCaptainAgg.avg_bonus,
+      top100k_average: top100kCaptainAgg.avg_bonus,
+      top10k_average: top10kCaptainAgg.avg_bonus,
     },
     avg_pts_per_transfer: {
       user: userAvgPtsPerTransfer,
       average: avgPtsPerTransferActive,
+      top100k_average: avgPtsPerTransferTop100k,
       top10k_average: avgPtsPerTransferTop10k,
     },
     avg_gw_score: {
       user: userGwScore,
-      average: activeAgg.avg_gw_score,
+      average:
+        finishedGws.length > 0 ? avgTotalPoints / finishedGws.length : null,
+      top100k_average: top100kAgg.avg_gw_score,
       top10k_average: top10kAgg.avg_gw_score,
     },
     most_captained: {
       user_player_id: userMostCaptainedElement,
       user_player_name: userMostName,
-      average_player_id: activeMost,
-      average_player_name: activeMostName,
-      top10k_player_id: top10kMost,
-      top10k_player_name: top10kMostName,
+      average_player_id: activeCaptainAgg.most_captained_id,
+      average_player_name: activeCaptainAgg.most_captained_name,
+      top100k_player_id: top100kCaptainAgg.most_captained_id,
+      top100k_player_name: top100kCaptainAgg.most_captained_name,
+      top10k_player_id: top10kCaptainAgg.most_captained_id,
+      top10k_player_name: top10kCaptainAgg.most_captained_name,
     },
     notes: {
       hits_average_partial:
@@ -688,7 +917,10 @@ export const getManagerComparison = async (
       // the user's own picks resolution wasn't complete (a stricter signal
       // than the previous sample-size heuristic — the user can see for
       // themselves that some of their own picks weren't fetched).
-      captain_average_partial: userPicks.incomplete,
+      captain_average_partial:
+        userPicks.incomplete ||
+        (activeCaptainAgg.complete_managers > 0 &&
+          activeCaptainAgg.avg_bonus === null),
       // Transfers-per-manager backfill is still trickling in via
       // backfillManagerTransfers / per-visit ingestTransfersForEntry; gate
       // partial when the active stratum's coverage is below the threshold

@@ -23,6 +23,20 @@ import {
 import { delay } from "../utils.js";
 
 // Stratum A: full census of the top 10k. 200 pages × 50 entries.
+const readEnvInt = (key: string, fallback: number, min = 1): number => {
+  const raw = process.env[key];
+  if (!raw) return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed < min) return fallback;
+  return parsed;
+};
+
+const readEnvBool = (key: string, fallback: boolean): boolean => {
+  const raw = process.env[key];
+  if (!raw) return fallback;
+  return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
+};
+
 const STRATUM_A_LAST_PAGE = 200;
 // Stratum B: pages 201–2000. Stride 1 = full census of the 10k–100k cohort
 // (~90k entries per pass). Critically, stride 1 also keeps stratum tags
@@ -69,6 +83,15 @@ const STRATUM_C_PAGE_STRIDE = 20;
 const STRATUM_C_NUM_SLOTS = Math.floor(
   (STRATUM_C_LAST_PAGE - STRATUM_C_FIRST_PAGE + 1) / STRATUM_C_PAGE_STRIDE,
 ); // = 12_500
+const STRATUM_C_TARGET_MANAGERS = readEnvInt(
+  "MANAGER_STRATUM_C_TARGET_MANAGERS",
+  50_000,
+  1_000,
+);
+const STRATUM_C_TARGET_STEPS = Math.min(
+  STRATUM_C_NUM_SLOTS,
+  Math.ceil(STRATUM_C_TARGET_MANAGERS / 50),
+);
 // Coprime to 12_500 (gcd = 1), ratio ≈ 0.618 (golden). Any prime that is
 // neither 2 nor 5 (the prime factors of 12_500) works equally well; 7727
 // happens to be the closest prime to 12_500 × (√5 − 1)/2.
@@ -83,15 +106,24 @@ const stratumCPageForIndex = (idx: number): number => {
 // Per-run safety cap. Cron fires every 15 min; at ~25 req/s sustained this
 // is ~13 min of work per run, leaving slack for governor backoffs and
 // preventing overlap with the next cron.
-const MAX_MANAGERS_PER_RUN = 20000;
+const MAX_MANAGERS_PER_RUN = readEnvInt("MANAGER_MAX_PER_RUN", 20_000, 1_000);
 
 // Budget split when stratum A is still in progress vs done. A is the top
 // 10k (fixed). B with stride 1 has 1800 pages = 90k entries to cover
 // per pass; at 5000/cron that's a full pass every ~4.5 hours, fast enough
 // to keep stratum tags reasonably fresh. C still gets the largest share
 // (extrapolation factor is biggest and new probes are most likely unseen).
-const BUDGET_A_WHILE_RUNNING = 2000;
-const BUDGET_B_WHILE_RUNNING = 5000;
+const BUDGET_A_WHILE_RUNNING = readEnvInt("MANAGER_BUDGET_A", 2_000, 0);
+const BUDGET_B_WHILE_RUNNING = readEnvInt("MANAGER_BUDGET_B", 5_000, 0);
+
+// Optional enrichment. Core rank/comparison reads only need entry history;
+// sample-side picks/transfers are expensive FPL calls and are hidden by the
+// API until a dedicated coverage model exists.
+const INGEST_SAMPLE_PICKS = readEnvBool("MANAGER_INGEST_SAMPLE_PICKS", false);
+const INGEST_SAMPLE_TRANSFERS = readEnvBool(
+  "MANAGER_INGEST_SAMPLE_TRANSFERS",
+  false,
+);
 
 // Concurrency within each batch. Combined with the governor's inter-batch
 // delay (default 300 ms) this gives ~25 req/s sustained.
@@ -100,11 +132,13 @@ const HISTORY_BATCH_SIZE = 8;
 const CURSOR_KEY_A = "manager_ingest_cursor_a";
 const CURSOR_KEY_B = "manager_ingest_cursor_b";
 const CURSOR_KEY_C = "manager_ingest_cursor_c";
+const SAMPLE_GW_KEY = "manager_sample_gw";
 // Bumped when cursor semantics change in a way that pre-existing cursor
 // values would be silently misinterpreted. v1 = raw page number (pre
 // golden-step refactor). v2 = iteration index within a walk's `numSteps`.
+// v3 = bounded per-GW sample: completed walks stay complete until GW changes.
 const CURSOR_FORMAT_KEY = "manager_walk_cursor_version";
-const CURRENT_CURSOR_FORMAT_VERSION = 2;
+const CURRENT_CURSOR_FORMAT_VERSION = 3;
 const LOCKFILE_PATH = path.join(os.tmpdir(), "fpl-populate-managers.lock");
 // Conservative max age — a normal run is ~13 min; anything older than this
 // can only mean the previous owner died without releasing.
@@ -324,6 +358,7 @@ const processEntry = async (
       total_points: totalPoints,
       stratum,
       last_checked_gw: currentGw,
+      has_chip_history: true,
     },
     create: {
       entry_id: entryId,
@@ -331,8 +366,13 @@ const processEntry = async (
       total_points: totalPoints,
       stratum,
       last_checked_gw: currentGw,
+      has_chip_history: true,
     },
   });
+
+  const chipByGw = new Map(
+    (history.chips ?? []).map((chip) => [chip.event, chip.name]),
+  );
 
   // Write per-GW history for every manager — no activity classification.
   // Inactive / trolling / "abnormal" managers are valid sample data; the
@@ -346,6 +386,7 @@ const processEntry = async (
         event_transfers: ev.event_transfers,
         event_transfers_cost: ev.event_transfers_cost,
         points_on_bench: ev.points_on_bench,
+        active_chip: chipByGw.get(ev.event) ?? null,
       },
       create: {
         entry_id: entryId,
@@ -354,28 +395,29 @@ const processEntry = async (
         event_transfers: ev.event_transfers,
         event_transfers_cost: ev.event_transfers_cost,
         points_on_bench: ev.points_on_bench,
+        active_chip: chipByGw.get(ev.event) ?? null,
       },
     });
   }
 
-  // Rebuild manager_cumulative for this entry. range-rank's hot query
-  // (stratumCounts) reads cumulative_points instead of GROUP-BY-ing
-  // manager_history every call — see getRangeRank.ts.
+  // Optional picks ingestion: fill in the latest finished GW for sample-side
+  // captain/chip experiments. Historical depth still belongs to
+  // `backfillPicks.ts`; by default the core sampler skips this extra FPL call.
+  if (INGEST_SAMPLE_PICKS) {
+    await ingestPicksForMissingGws(entryId, currentGw, governor);
+  }
+
+  // Rebuild manager_cumulative for this entry after optional picks are current
+  // so captain-derived running fields are reflected immediately. Chip fields
+  // come from manager_history.active_chip, stored from the history payload.
   await rebuildCumulativeForEntry(entryId, stratum);
 
-  // Picks ingestion: fill in any (entry_id, gw) we don't already have for
-  // finished GWs. This is the steady-state path; bulk backfill lives in
-  // `backfillPicks.ts` so a heavy historic re-fetch can run separately
-  // without blocking the cron.
-  await ingestPicksForMissingGws(entryId, currentGw, governor);
-
-  // Transfers ingestion: one HTTP call per manager, but only on the first
-  // visit (gated by manager_summary.has_transfer_history). Transfers grow
-  // append-only, but mid-season managers will accumulate them — refetch
-  // when last_checked_gw advances so the sample stays current. The
-  // existing skip-on-no-change check at the top of processEntry already
-  // covers the common case (no work for an entry visited this same GW).
-  await ingestTransfersForEntry(entryId, governor);
+  // Optional transfer-log ingestion. The comparison endpoint uses reliable
+  // transfer counts from entry history; transfer logs are only needed for
+  // future sample-side transfer-value experiments.
+  if (INGEST_SAMPLE_TRANSFERS) {
+    await ingestTransfersForEntry(entryId, governor);
+  }
 
   return "ingested";
 };
@@ -431,13 +473,7 @@ const rebuildCumulativeForEntry = async (
         (SUM(COALESCE(base.points_on_bench,      0)) OVER w)::int AS cumulative_bench,
         (SUM(base.captain_bonus)                     OVER w)::int AS cumulative_captain_bonus,
         (COUNT(*)                                    OVER w)::int AS gws_played,
-        -- COALESCE to FALSE: when manager_picks is missing for a (entry, gw),
-        -- active_chip is NULL via LEFT JOIN, and (NULL = 'wildcard') is NULL.
-        -- For h1 (gw <= 19) the AND with TRUE leaves NULL; BOOL_OR over an
-        -- all-NULL partition then returns NULL, which violates the NOT NULL
-        -- constraint on the chip columns. Coercing to FALSE pre-aggregate
-        -- keeps the read-path semantics correct (an entry with no picks for
-        -- the GW didn't play that chip) and the column non-null.
+        -- active_chip comes from entry history. Null means no chip that GW.
         BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw <= $3, false)) OVER w AS chip_wildcard_h1,
         BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw  > $3, false)) OVER w AS chip_wildcard_h2,
         BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw <= $3, false)) OVER w AS chip_freehit_h1,
@@ -452,7 +488,7 @@ const rebuildCumulativeForEntry = async (
         SELECT
           mh.entry_id, mh.gw, mh.points,
           mh.event_transfers, mh.event_transfers_cost, mh.points_on_bench,
-          mp.active_chip,
+          mh.active_chip,
           COALESCE(
             CASE
               WHEN mp.captain_multiplier IS NOT NULL AND mp.captain_multiplier > 1 THEN
@@ -631,7 +667,7 @@ const STRATUM_B_WALK: StratumWalk = {
 
 const STRATUM_C_WALK: StratumWalk = {
   cursorKey: CURSOR_KEY_C,
-  numSteps: STRATUM_C_NUM_SLOTS,
+  numSteps: STRATUM_C_TARGET_STEPS,
   pageOf: stratumCPageForIndex,
   stratum: 3,
 };
@@ -654,7 +690,8 @@ const ingestFromStandings = async ({
   // 0 so a partial-cycle deploy doesn't get stuck in an out-of-range
   // state.
   let idx = await readIntCursor(walk.cursorKey, 0);
-  if (idx < 0 || idx >= walk.numSteps) idx = 0;
+  if (idx < 0) idx = 0;
+  if (idx >= walk.numSteps) return;
 
   while (
     !governor.shouldAbort &&
@@ -712,9 +749,9 @@ const ingestFromStandings = async ({
 
   if (idx >= walk.numSteps) {
     console.info(
-      `[populateManagers] Stratum ${walk.stratum} complete — wrapping cursor to 0.`,
+      `[populateManagers] Stratum ${walk.stratum} complete for this GW.`,
     );
-    await writeIntCursor(walk.cursorKey, 0);
+    await writeIntCursor(walk.cursorKey, walk.numSteps);
   }
 };
 
@@ -773,6 +810,7 @@ export const rebuildStratumGwRunningStats = async (): Promise<void> => {
          sum_cum_points, sum_cum_transfers, sum_cum_hits_cost,
          sum_cum_bench, sum_cum_captain_bonus, sum_gws_played,
          count_with_transfers, count_with_hits, count_with_bench,
+         count_with_chips,
          cum_wildcards_h1, cum_wildcards_h2,
          cum_freehits_h1,  cum_freehits_h2,
          cum_bboosts_h1,   cum_bboosts_h2,
@@ -790,6 +828,7 @@ export const rebuildStratumGwRunningStats = async (): Promise<void> => {
         COUNT(*) FILTER (WHERE mc.has_transfers)::int              AS count_with_transfers,
         COUNT(*) FILTER (WHERE mc.has_hits)::int                   AS count_with_hits,
         COUNT(*) FILTER (WHERE mc.has_bench)::int                  AS count_with_bench,
+        COUNT(*) FILTER (WHERE ms.has_chip_history)::int           AS count_with_chips,
         COUNT(*) FILTER (WHERE mc.chip_wildcard_h1)::int           AS cum_wildcards_h1,
         COUNT(*) FILTER (WHERE mc.chip_wildcard_h2)::int           AS cum_wildcards_h2,
         COUNT(*) FILTER (WHERE mc.chip_freehit_h1)::int            AS cum_freehits_h1,
@@ -798,9 +837,76 @@ export const rebuildStratumGwRunningStats = async (): Promise<void> => {
         COUNT(*) FILTER (WHERE mc.chip_bboost_h2)::int             AS cum_bboosts_h2,
         NOW()                                                      AS last_rebuilt
       FROM manager_cumulative mc
+      JOIN manager_summary ms ON ms.entry_id = mc.entry_id
       GROUP BY mc.stratum, mc.gw
     `),
   ]);
+};
+
+export const rebuildManagerRangeScoreBuckets = async (): Promise<void> => {
+  const sampledGw = await prisma.manager_cumulative.aggregate({
+    _max: { gw: true },
+  });
+  const currentGw = sampledGw._max.gw ?? (await getCurrentFinishedGw());
+  if (currentGw < 1) {
+    await prisma.$executeRawUnsafe(`TRUNCATE manager_range_score_buckets`);
+    return;
+  }
+
+  await prisma.$transaction([
+    prisma.$executeRawUnsafe(`TRUNCATE manager_range_score_buckets`),
+    prisma.$executeRawUnsafe(
+      `
+      INSERT INTO manager_range_score_buckets
+        (stratum, start_gw, end_gw, range_total, managers, last_rebuilt)
+      WITH bounds AS (
+        SELECT s.start_gw, e.end_gw
+        FROM generate_series(1, $1::int) AS s(start_gw)
+        CROSS JOIN LATERAL generate_series(s.start_gw, $1::int) AS e(end_gw)
+      )
+      SELECT
+        c_end.stratum,
+        bounds.start_gw,
+        bounds.end_gw,
+        (c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0))::int
+          AS range_total,
+        COUNT(*)::int AS managers,
+        NOW() AS last_rebuilt
+      FROM bounds
+      JOIN manager_cumulative c_end
+        ON c_end.gw = bounds.end_gw
+      LEFT JOIN manager_cumulative c_start
+        ON c_start.entry_id = c_end.entry_id
+       AND c_start.gw = bounds.start_gw - 1
+      GROUP BY
+        c_end.stratum,
+        bounds.start_gw,
+        bounds.end_gw,
+        c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0)
+      `,
+      currentGw,
+    ),
+  ]);
+};
+
+export const rebuildManagerReadModels = async (): Promise<void> => {
+  const captainStarted = Date.now();
+  await rebuildStratumCaptainPicks();
+  console.info(
+    `[populateManagers] stratum_captain_picks_gw rebuilt in ${Math.round((Date.now() - captainStarted) / 1000)}s`,
+  );
+
+  const runningStarted = Date.now();
+  await rebuildStratumGwRunningStats();
+  console.info(
+    `[populateManagers] stratum_gw_running_stats rebuilt in ${Math.round((Date.now() - runningStarted) / 1000)}s`,
+  );
+
+  const bucketStarted = Date.now();
+  await rebuildManagerRangeScoreBuckets();
+  console.info(
+    `[populateManagers] manager_range_score_buckets rebuilt in ${Math.round((Date.now() - bucketStarted) / 1000)}s`,
+  );
 };
 
 export const populateManagers = async (
@@ -836,13 +942,18 @@ export const populateManagers = async (
     // "step 5000 within the walk"). Reset all three cursors on first
     // run after the format bump so the new walks start fresh.
     const cursorVersion = await readIntCursor(CURSOR_FORMAT_KEY, 0);
-    if (cursorVersion < CURRENT_CURSOR_FORMAT_VERSION) {
+    const sampleGw = await readIntCursor(SAMPLE_GW_KEY, 0);
+    if (
+      cursorVersion < CURRENT_CURSOR_FORMAT_VERSION ||
+      sampleGw !== currentGw
+    ) {
       console.info(
         `[populateManagers] Cursor format ${cursorVersion} → ${CURRENT_CURSOR_FORMAT_VERSION}: resetting walk cursors.`,
       );
       await writeIntCursor(CURSOR_KEY_A, 0);
       await writeIntCursor(CURSOR_KEY_B, 0);
       await writeIntCursor(CURSOR_KEY_C, 0);
+      await writeIntCursor(SAMPLE_GW_KEY, currentGw);
       await writeIntCursor(CURSOR_FORMAT_KEY, CURRENT_CURSOR_FORMAT_VERSION);
     }
 
@@ -859,6 +970,7 @@ export const populateManagers = async (
     // each time A and B finish a pass).
     const aDone = aIdx >= STRATUM_A_WALK.numSteps;
     const bDone = bIdx >= STRATUM_B_WALK.numSteps;
+    const cDone = cIdx >= STRATUM_C_WALK.numSteps;
 
     // Budget allocation: keep A moving while it has work, but always reserve
     // the bulk of the budget for C so the deep tail fills as quickly as
@@ -874,10 +986,10 @@ export const populateManagers = async (
     if (!bDone) {
       budgetB = Math.min(BUDGET_B_WHILE_RUNNING, remainingAfterA);
     }
-    const budgetC = MAX_MANAGERS_PER_RUN - budgetA - budgetB;
+    const budgetC = cDone ? 0 : MAX_MANAGERS_PER_RUN - budgetA - budgetB;
 
     console.info(
-      `[populateManagers] Starting: currentGw ${currentGw}, A idx ${aIdx}/${STRATUM_A_WALK.numSteps} (budget ${budgetA}), B idx ${bIdx}/${STRATUM_B_WALK.numSteps} (budget ${budgetB}), C idx ${cIdx}/${STRATUM_C_WALK.numSteps} (interleaved, budget ${budgetC})`,
+      `[populateManagers] Starting: currentGw ${currentGw}, A idx ${aIdx}/${STRATUM_A_WALK.numSteps} (budget ${budgetA}), B idx ${bIdx}/${STRATUM_B_WALK.numSteps} (budget ${budgetB}), C idx ${cIdx}/${STRATUM_C_WALK.numSteps} (target ${STRATUM_C_TARGET_MANAGERS}, budget ${budgetC}), samplePicks ${INGEST_SAMPLE_PICKS}, sampleTransfers ${INGEST_SAMPLE_TRANSFERS}`,
     );
 
     if (budgetA > 0) {
@@ -913,42 +1025,19 @@ export const populateManagers = async (
       });
     }
 
-    // Refresh the per-(stratum, gw, captain) aggregate table once at the end
-    // of the run. This is the same heavy GROUP BY that the read paths in
-    // getTeamImpact.fetchCaptainRatesInStratum and
-    // getManagerComparison.sampleMostCaptained run today — done here once
-    // per cron cycle instead of per request. ~17k bucket rows; ~2–4s on
-    // the prod CX23. Skip on no-op cycles.
-    //
-    // Same pattern for stratum_gw_running_stats — the per-(stratum, gw)
-    // aggregate served from sampleStratumAggregates. ~114 rows output;
-    // expensive GROUP BY over manager_cumulative happens here, not per
-    // request. ~30–60s on prod.
+    // Refresh all manager analytics read models once at the end of an ingest
+    // run. Request paths read the small snapshots instead of grouping over
+    // manager history/cumulative tables.
     if (stats.processed > 0 && !governor.shouldAbort) {
-      const captainStarted = Date.now();
+      const readModelsStarted = Date.now();
       try {
-        await rebuildStratumCaptainPicks();
+        await rebuildManagerReadModels();
         console.info(
-          `[populateManagers] stratum_captain_picks_gw rebuilt in ${Math.round((Date.now() - captainStarted) / 1000)}s`,
-        );
-      } catch (err) {
-        // Rebuild failure shouldn't fail the cron — readers fall back to
-        // the previous snapshot. Log loudly so it's caught in pm2 tail.
-        console.error(
-          "[populateManagers] stratum_captain_picks_gw rebuild failed:",
-          (err as Error).message,
-        );
-      }
-
-      const runningStarted = Date.now();
-      try {
-        await rebuildStratumGwRunningStats();
-        console.info(
-          `[populateManagers] stratum_gw_running_stats rebuilt in ${Math.round((Date.now() - runningStarted) / 1000)}s`,
+          `[populateManagers] manager read models rebuilt in ${Math.round((Date.now() - readModelsStarted) / 1000)}s`,
         );
       } catch (err) {
         console.error(
-          "[populateManagers] stratum_gw_running_stats rebuild failed:",
+          "[populateManagers] manager read model rebuild failed:",
           (err as Error).message,
         );
       }

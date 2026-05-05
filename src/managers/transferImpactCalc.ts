@@ -97,13 +97,14 @@ export const sumPointsInWindow = (
 export type SampleTransferNet = {
   avg: number | null;
   with_data: number;
+  with_transfers: number;
   stratum_size: number;
 };
 
 export const sampleAvgPtsPerTransfer = async (
   startGw: number,
   endGw: number,
-  stratumFilter: "active" | "stratum1",
+  stratumFilter: "active" | "stratum1" | "stratum12",
 ): Promise<SampleTransferNet> => {
   // For "active" mode include all of stratum 1+2 plus a 1-in-32 sample of
   // stratum 3 (entry_id % 32 = 0). The narrower sample (vs. 1/8 used in
@@ -117,7 +118,9 @@ export const sampleAvgPtsPerTransfer = async (
   const stratumClause =
     stratumFilter === "stratum1"
       ? `AND ms.stratum = 1`
-      : `AND (ms.stratum IN (1, 2) OR (ms.stratum = 3 AND ms.entry_id % 32 = 0))`;
+      : stratumFilter === "stratum12"
+        ? `AND ms.stratum IN (1, 2)`
+        : `AND (ms.stratum IN (1, 2) OR (ms.stratum = 3 AND ms.entry_id % 32 = 0))`;
 
   // Per-manager net + count via scalar subqueries on history (small,
   // PK-indexed — ~30 k rows per season). The previous version filtered
@@ -127,33 +130,34 @@ export const sampleAvgPtsPerTransfer = async (
     Array<{
       avg_pts_per_transfer: number | null;
       with_transfers_data: number;
+      with_transfer_history: number;
       stratum_size: number;
     }>
   >(
     `
-    WITH per_manager AS (
+    WITH point_windows AS (
+      SELECT
+        h.footballer_id,
+        gw_series.gw,
+        SUM(h.total_points)::float AS pts
+      FROM generate_series($1::int, $2::int) AS gw_series(gw)
+      JOIN history h
+        ON h.round BETWEEN gw_series.gw AND $2
+      GROUP BY h.footballer_id, gw_series.gw
+    ),
+    per_manager AS (
       SELECT
         mt.entry_id,
-        SUM(
-          COALESCE(
-            (SELECT SUM(h.total_points)::int
-               FROM history h
-               WHERE h.footballer_id = mt.in_element
-                 AND h.round BETWEEN mt.gw AND $2),
-            0
-          )
-          -
-          COALESCE(
-            (SELECT SUM(h.total_points)::int
-               FROM history h
-               WHERE h.footballer_id = mt.out_element
-                 AND h.round BETWEEN mt.gw AND $2),
-            0
-          )
-        )::float AS net,
+        SUM(COALESCE(in_pts.pts, 0) - COALESCE(out_pts.pts, 0))::float AS net,
         COUNT(*)::int AS xfers
       FROM manager_transfers mt
       JOIN manager_summary ms ON ms.entry_id = mt.entry_id
+      LEFT JOIN point_windows in_pts
+        ON in_pts.footballer_id = mt.in_element
+       AND in_pts.gw = mt.gw
+      LEFT JOIN point_windows out_pts
+        ON out_pts.footballer_id = mt.out_element
+       AND out_pts.gw = mt.gw
       WHERE mt.gw BETWEEN $1 AND $2
         ${stratumClause}
       GROUP BY mt.entry_id
@@ -161,6 +165,11 @@ export const sampleAvgPtsPerTransfer = async (
     SELECT
       AVG(per_manager.net / NULLIF(per_manager.xfers, 0))::float AS avg_pts_per_transfer,
       COUNT(*)::int AS with_transfers_data,
+      (
+        SELECT COUNT(*)::int
+        FROM manager_summary ms
+        WHERE ms.has_transfer_history = true ${stratumClause}
+      ) AS with_transfer_history,
       (
         SELECT COUNT(*)::int
         FROM manager_summary ms
@@ -176,7 +185,8 @@ export const sampleAvgPtsPerTransfer = async (
   const row = rows[0];
   return {
     avg: row?.avg_pts_per_transfer ?? null,
-    with_data: row?.with_transfers_data ?? 0,
+    with_data: row?.with_transfer_history ?? 0,
+    with_transfers: row?.with_transfers_data ?? 0,
     stratum_size: row?.stratum_size ?? 0,
   };
 };

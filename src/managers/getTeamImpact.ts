@@ -2,6 +2,7 @@ import { prisma } from "../database/client.js";
 import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks } from "./resolvePicks.js";
+import { rangeDensityFromBuckets, type Stratum } from "./rangeStats.js";
 
 // ----------------------------------------------------------------------------
 // Public response types. Mirrored on the frontend in
@@ -493,87 +494,16 @@ const computeRankPerPoint = async (
   endGw: number,
   userRangeTotal: number,
 ): Promise<{ rank_per_point: number | null; stratum_avg: number | null }> => {
-  if (stratum === null) return { rank_per_point: null, stratum_avg: null };
-
-  const lo = userRangeTotal - RANK_DENSITY_HALF_WINDOW;
-  const hi = userRangeTotal + RANK_DENSITY_HALF_WINDOW;
-
-  // Stratum 3 is sub-sampled at 1-in-8 to bound the DISTINCT ON sort —
-  // mirrors the trick in getRangeRank.stratumCounts. Density is invariant
-  // under uniform sampling: neighbours ÷ population stays the same in
-  // expectation, so the rank-per-point coefficient lands on the same
-  // value (with a slightly wider confidence band).
-  const subSampleClause = stratum === 3 ? `AND entry_id % 8 = 0` : ``;
-  const rows = await prisma.$queryRawUnsafe<
-    Array<{
-      neighbours: number;
-      probes_with_history: number;
-      avg_total: number | null;
-    }>
-  >(
-    `
-    WITH c_end AS (
-      SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
-      FROM manager_cumulative
-      WHERE stratum = $1
-        AND gw BETWEEN $2 AND $3
-        ${subSampleClause}
-      ORDER BY entry_id, gw DESC
-    ),
-    c_start AS (
-      SELECT DISTINCT ON (entry_id) entry_id, cumulative_points
-      FROM manager_cumulative
-      WHERE stratum = $1
-        AND gw < $2
-        ${subSampleClause}
-      ORDER BY entry_id, gw DESC
-    )
-    SELECT
-      COUNT(*) FILTER (WHERE total BETWEEN $4 AND $5)::int AS neighbours,
-      COUNT(*)::int                                        AS probes_with_history,
-      AVG(total)::float                                    AS avg_total
-    FROM (
-      SELECT c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0) AS total
-      FROM c_end
-      LEFT JOIN c_start USING (entry_id)
-    ) t
-    `,
-    stratum,
+  const density = await rangeDensityFromBuckets(
+    stratum as Stratum | null,
     startGw,
     endGw,
-    lo,
-    hi,
+    userRangeTotal,
+    RANK_DENSITY_HALF_WINDOW,
   );
-  const row = rows[0];
-  if (!row || row.probes_with_history === 0) {
-    return { rank_per_point: null, stratum_avg: null };
-  }
-
-  // Stratum true population — same logic as getRangeRank: use the latest
-  // ranked_count for endGw if available, otherwise fall back to a wide
-  // bound. We don't need exact accuracy here; this is a coefficient for
-  // attribution display, not a primary rank estimate.
-  const ev = await prisma.events.findUnique({
-    where: { id: endGw },
-    select: { ranked_count: true },
-  });
-  const rankedAtEnd = ev?.ranked_count ?? null;
-  let trueSize: number;
-  if (stratum === 1) trueSize = STRATUM_A_MAX;
-  else if (stratum === 2) trueSize = STRATUM_B_MAX - STRATUM_A_MAX;
-  else
-    trueSize = Math.max(
-      (rankedAtEnd ?? STRATUM_B_MAX * 100) - STRATUM_B_MAX,
-      1,
-    );
-
-  const extrapolation = trueSize / row.probes_with_history;
-  const density = row.neighbours / (2 * RANK_DENSITY_HALF_WINDOW);
-  const rank_per_point = density * extrapolation;
-
   return {
-    rank_per_point: rank_per_point > 0 ? rank_per_point : null,
-    stratum_avg: row.avg_total,
+    rank_per_point: density.rankPerPoint,
+    stratum_avg: density.stratumAverage,
   };
 };
 

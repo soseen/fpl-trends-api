@@ -174,6 +174,7 @@ model history {
   footballer                 footballers @relation(fields: [footballer_id], references: [id], onDelete: Cascade)
 
   @@id([footballer_id, fixture_id])
+  @@index([footballer_id, round])
 }
 
 model teams {
@@ -266,6 +267,7 @@ model manager_summary {
   // every cron pass — only on the first visit. Re-set to false on a fetch
   // failure so the next pass retries.
   has_transfer_history Boolean              @default(false)
+  has_chip_history     Boolean              @default(false)
   last_updated         DateTime             @updatedAt
   history              manager_history[]
   picks                manager_picks[]
@@ -281,6 +283,7 @@ model manager_history {
   event_transfers      Int? // count of transfers made in this GW (nullable for pre-migration rows)
   event_transfers_cost Int? // -4 hits cost in this GW (nullable for legacy rows pre-Phase 2 migration)
   points_on_bench      Int? // bench points in this GW (nullable for legacy rows)
+  active_chip          String?         @db.VarChar(20) // wildcard | freehit | bboost | 3xc | manager
   manager              manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
 
   @@id([entry_id, gw])
@@ -351,7 +354,7 @@ model manager_pick_elements {
 model manager_cumulative {
   entry_id                 Int
   gw                       Int
-  cumulative_points        Int     // SUM(history.points)              over [1..gw], net of hits
+  cumulative_points        Int // SUM(history.points)              over [1..gw], net of hits
   cumulative_transfers     Int     @default(0) // SUM(event_transfers)
   cumulative_hits_cost     Int     @default(0) // SUM(event_transfers_cost) — divide by 4 for hits count
   cumulative_bench         Int     @default(0) // SUM(points_on_bench)
@@ -366,7 +369,7 @@ model manager_cumulative {
   has_transfers            Boolean @default(false) // BOOL_OR(event_transfers IS NOT NULL)      — coverage gate
   has_hits                 Boolean @default(false) // BOOL_OR(event_transfers_cost IS NOT NULL) — coverage gate
   has_bench                Boolean @default(false) // BOOL_OR(points_on_bench IS NOT NULL)      — coverage gate
-  stratum                  Int     // denormalised from manager_summary
+  stratum                  Int // denormalised from manager_summary
 
   manager manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
 
@@ -378,15 +381,16 @@ model manager_cumulative {
   // index PG picks the primary key (entry_id, gw) and post-filters stratum,
   // scanning the full table and Incremental-Sorting 12M+ rows.
   @@index([stratum, entry_id, gw(sort: Desc)])
+  // Read-model rebuilds group by exact end GW, then join the start anchor
+  // via the primary key. This index keeps the end-side scan bounded by GW.
+  @@index([gw, stratum, entry_id])
 }
 
 // One row per FPL transfer the manager has ever made (filtered to a range
-// at query time via gw). Sourced from `entry/{id}/transfers/`. Populated:
-//   1. opportunistically when the user queries their own /transfers or
-//      /comparison endpoints (lazy, mirrors resolvePicks.ts);
-//   2. systematically for each sampled manager during populateManagers,
-//      gated by has_transfer_history on manager_summary so we don't
-//      refetch on every cron pass.
+// at query time via gw). Sourced from `entry/{id}/transfers/`. Populated
+// opportunistically when the user queries their own /transfers or /comparison
+// endpoints; sample-wide transfer-log enrichment is optional via
+// MANAGER_INGEST_SAMPLE_TRANSFERS and normally disabled.
 //
 // Used by:
 //   - getManagerTransfers (per-user view, joins to history for points)
@@ -413,14 +417,15 @@ model manager_transfers {
 // GROUP-BY over manager_picks ⨝ manager_summary. Tiny table (~3 strata × 38
 // GWs × ~50 distinct captains × ~3 multipliers ≈ <17k rows total) — fits in
 // shared_buffers and replaces the per-request GROUP BY in
-// fetchCaptainRatesInStratum (getTeamImpact.ts) and sampleMostCaptained
-// (getManagerComparison.ts).
+// fetchCaptainRatesInStratum (getTeamImpact.ts). Sample-side captain/chip
+// comparison stats are hidden unless a dedicated historical picks coverage
+// model is added.
 model stratum_captain_picks_gw {
   stratum            Int
   gw                 Int
   captain_element    Int
-  captain_multiplier Int      // 0 = captain benched, 2 = standard captain, 3 = triple captain
-  picks              Int      // count of (entry, gw) rows in stratum with this combo
+  captain_multiplier Int // 0 = captain benched, 2 = standard captain, 3 = triple captain
+  picks              Int // count of (entry, gw) rows in stratum with this combo
   last_rebuilt       DateTime @updatedAt
 
   @@id([stratum, gw, captain_element, captain_multiplier])
@@ -443,38 +448,56 @@ model stratum_captain_picks_gw {
 // 3 strata × 38 GWs = 114 rows, ~150 bytes each — fits in a single buffer
 // page.
 model stratum_gw_running_stats {
-  stratum                   Int
-  gw                        Int
+  stratum               Int
+  gw                    Int
   // Population at this gw — count of managers in the stratum with a
   // manager_cumulative row at this GW. Use as the divisor when computing
   // range-averages: avg = (sum_at(e) − sum_at(s−1)) / sample_size_at_e.
-  sample_size               Int
+  sample_size           Int
   // Running sums (across all sampled managers in the stratum, of their
   // cumulative_X value at this GW). Range total for [s,e] = sum_at(e) −
   // sum_at(s−1).
-  sum_cum_points            BigInt
-  sum_cum_transfers         BigInt
-  sum_cum_hits_cost         BigInt
-  sum_cum_bench             BigInt
-  sum_cum_captain_bonus     BigInt
-  sum_gws_played            BigInt
+  sum_cum_points        BigInt
+  sum_cum_transfers     BigInt
+  sum_cum_hits_cost     BigInt
+  sum_cum_bench         BigInt
+  sum_cum_captain_bonus BigInt
+  sum_gws_played        BigInt
   // Coverage counts — count of managers whose has_X flag is true at this
   // GW. Lets the read path gate display when too few sampled managers
   // have data in the range (mirrors gateOnCoverage in getManagerComparison).
-  count_with_transfers      Int
-  count_with_hits           Int
-  count_with_bench          Int
+  count_with_transfers  Int
+  count_with_hits       Int
+  count_with_bench      Int
+  count_with_chips      Int      @default(0)
   // Cumulative chip plays through this GW, split by season half. Range
   // chip-rate for [s,e] = (cum_played_at_e − cum_played_at_s−1) /
   // sample_size_at_e. Two halves so a range that spans the boundary picks
   // up either play correctly.
-  cum_wildcards_h1          Int
-  cum_wildcards_h2          Int
-  cum_freehits_h1           Int
-  cum_freehits_h2           Int
-  cum_bboosts_h1            Int
-  cum_bboosts_h2            Int
-  last_rebuilt              DateTime @updatedAt
+  cum_wildcards_h1      Int
+  cum_wildcards_h2      Int
+  cum_freehits_h1       Int
+  cum_freehits_h2       Int
+  cum_bboosts_h1        Int
+  cum_bboosts_h2        Int
+  last_rebuilt          DateTime @updatedAt
 
   @@id([stratum, gw])
+}
+
+// Histogram of manager range totals by stratum and GW range. Rebuilt from
+// manager_cumulative after populateManagers updates the sampled managers.
+// Hot reads use this for range-rank and team-impact rank-density estimates:
+// a request only sums a few score buckets instead of DISTINCT-sorting every
+// sampled manager in the range.
+model manager_range_score_buckets {
+  stratum      Int
+  start_gw     Int
+  end_gw       Int
+  range_total  Int
+  managers     Int
+  last_rebuilt DateTime @updatedAt
+
+  @@id([stratum, start_gw, end_gw, range_total])
+  @@index([start_gw, end_gw, stratum, range_total])
 }

@@ -75,15 +75,7 @@ const backfill = async (): Promise<void> => {
         (SUM(COALESCE(base.points_on_bench,      0)) OVER w)::int AS cumulative_bench,
         (SUM(base.captain_bonus)                     OVER w)::int AS cumulative_captain_bonus,
         (COUNT(*)                                    OVER w)::int AS gws_played,
-        -- COALESCE to FALSE: when manager_picks is missing for a (entry, gw),
-        -- active_chip is NULL via LEFT JOIN, and (NULL = 'wildcard') is NULL.
-        -- For h1 (gw <= 19) the AND with TRUE leaves NULL; BOOL_OR over an
-        -- all-NULL partition then returns NULL, which violates the NOT NULL
-        -- constraint on the chip columns. Coercing to FALSE pre-aggregate
-        -- keeps the read-path semantics correct (no picks => no chip played)
-        -- and the column non-null. Mirrors the same fix in
-        -- populateManagers.rebuildCumulativeForEntry: the two paths must
-        -- write byte-identical rows for any entry.
+        -- active_chip comes from entry history. Null means no chip that GW.
         BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw <= ${CHIP_HALVES_BOUNDARY}, false)) OVER w AS chip_wildcard_h1,
         BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw  > ${CHIP_HALVES_BOUNDARY}, false)) OVER w AS chip_wildcard_h2,
         BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw <= ${CHIP_HALVES_BOUNDARY}, false)) OVER w AS chip_freehit_h1,
@@ -98,7 +90,7 @@ const backfill = async (): Promise<void> => {
         SELECT
           mh.entry_id, mh.gw, mh.points,
           mh.event_transfers, mh.event_transfers_cost, mh.points_on_bench,
-          mp.active_chip,
+          mh.active_chip,
           ms.stratum,
           COALESCE(
             CASE
