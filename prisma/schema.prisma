@@ -321,6 +321,7 @@ model manager_pick_elements {
 
   @@id([entry_id, gw, element_id])
   @@index([entry_id, gw])
+  @@index([gw, element_id])
 }
 
 // Per-(entry_id, gw) running totals up to and including that GW.
@@ -430,6 +431,25 @@ model stratum_captain_picks_gw {
 
   @@id([stratum, gw, captain_element, captain_multiplier])
   @@index([stratum, gw])
+}
+
+// Per-(rank band, gw, player) exposure from sampled managers' full XVs.
+// `effective_multiplier_sum / sample_size` is LiveFPL-style EO: it counts
+// normal starters as 1, captains as 2, triple captains as 3, bench boosts as
+// 1, and ordinary bench players as 0. `squad_picks / sample_size` is kept for
+// display as ownership, but rank attribution uses effective multiplier EO.
+model rank_band_player_exposure_gw {
+  rank_band                Int
+  gw                       Int
+  element_id               Int
+  sample_size              Int
+  squad_picks              Int
+  active_picks             Int
+  effective_multiplier_sum Int
+  last_rebuilt             DateTime @updatedAt
+
+  @@id([rank_band, gw, element_id])
+  @@index([rank_band, gw])
 }
 
 // Per-(stratum, gw) running aggregate stats across the full sample. Each row

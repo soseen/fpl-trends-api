@@ -137,21 +137,28 @@ Cascade delete is set on the `footballers → history`, `footballers → footbal
 
 ## API endpoints
 
-All endpoints are public (no auth). CORS allowlist is configured via `ALLOWED_ORIGINS` env var.
+Read endpoints are intentionally unauthenticated — the data they serve is public FPL data and the app has no user accounts. The privileged `/api/populate` route requires `Authorization: Bearer $ADMIN_TOKEN`. CORS allowlist is configured via `ALLOWED_ORIGINS`. All `/api/*` routes are rate-limited to **60 requests per minute per IP**; exceeding the limit returns `429` with `RateLimit-*` headers.
 
-| Method | Path | Returns |
-|---|---|---|
-| `GET` | `/api/footballersData` | All players with team, history, and fixtures (Prisma `include`) |
-| `GET` | `/api/teamsData` | All teams with `team_history` |
-| `GET` | `/api/totalPlayersCount` | `{ totalPlayers: number }` |
-| `GET` | `/api/eventsData` | Gameweek events |
-| `GET` | `/api/populate` | Triggers a full data refresh from the FPL API |
-| `GET` | `/api/manager/:id/summary` | Manager identity + season totals (proxies `/api/entry/{id}/`) |
-| `GET` | `/api/manager/:id/range-rank?start=X&end=Y` | Estimated rank within GW range (see [Manager rank estimation](#manager-rank-estimation-my-trends)) |
-| `GET` | `/api/manager/:id/trajectory?start=X&end=Y` | Per-GW cumulative rank trajectory for the chart on `/my-trends` |
-| `GET` | `/api/manager/:id/comparison?start=X&end=Y` | Stats vs sample average + top-10k (see [Manager comparison](#manager-comparison-sample-averages--top-10k)) |
+| Method | Path | Auth | Returns |
+|---|---|---|---|
+| `GET` | `/api/health` | — | Liveness + DB ping. `200` if DB reachable, `503` otherwise |
+| `GET` | `/api/footballersData` | — | All players with team, history, and fixtures (Prisma `include`) |
+| `GET` | `/api/teamsData` | — | All teams with `team_history` |
+| `GET` | `/api/totalPlayersCount` | — | `{ totalPlayers: number }` |
+| `GET` | `/api/eventsData` | — | Gameweek events |
+| `GET` | `/api/populate` | **Bearer** | Triggers a full data refresh from the FPL API |
+| `GET` | `/api/manager/:id/summary` | — | Manager identity + season totals (proxies `/api/entry/{id}/`) |
+| `GET` | `/api/manager/:id/range-rank?start=X&end=Y` | — | Estimated rank within GW range (see [Manager rank estimation](#manager-rank-estimation-my-trends)) |
+| `GET` | `/api/manager/:id/trajectory?start=X&end=Y` | — | Per-GW cumulative rank trajectory for the chart on `/my-trends` |
+| `GET` | `/api/manager/:id/comparison?start=X&end=Y` | — | Stats vs sample average + top-10k (see [Manager comparison](#manager-comparison-sample-averages--top-10k)) |
 
 The manager endpoints validate `:id` (positive integer ≤ 20M) and `start`/`end` (1 ≤ start ≤ end ≤ 38). They return `400` on invalid input, `404` if FPL doesn't recognise the entry, `502` on upstream FPL failures.
+
+`/api/populate` returns `401 Unauthorized` if the bearer token is missing or wrong, and `503 Server not configured.` if `ADMIN_TOKEN` is unset on the server (fail-closed). Production cron does not use this route — it invokes `node dist/database/populateDatabase.js` directly, so the cron path is unaffected by the token guard. The HTTP route is for manual operator-initiated refreshes:
+
+```bash
+curl -H "Authorization: Bearer $ADMIN_TOKEN" https://fpltrends.live/api/populate
+```
 
 CORS allowed origins are configured via the `ALLOWED_ORIGINS` env var (comma-separated). If unset, it falls back to:
 
@@ -194,6 +201,7 @@ cat > .env <<EOF
 DATABASE_URL="postgresql://fpl:localdevpass@localhost:5432/fpl-trends-db"
 NODE_ENV=development
 PORT=3000
+ADMIN_TOKEN="dev-token-$(openssl rand -hex 16)"
 # Optional: comma-separated list. Dev auto-allows localhost:5000.
 # ALLOWED_ORIGINS="https://fpltrends.live,https://www.fpltrends.live"
 EOF
@@ -323,7 +331,9 @@ DATABASE_URL="postgresql://fpl:<STRONG_PASSWORD>@localhost:5432/fpl-trends-db"
 NODE_ENV=production
 PORT=3000
 ALLOWED_ORIGINS="https://fpltrends.live,https://www.fpltrends.live"
+ADMIN_TOKEN="<openssl rand -hex 32>"
 EOF
+chmod 600 .env
 
 npm run bootstrap   # tsc + migrate + populate (first-time only)
 ```
@@ -475,6 +485,61 @@ sudo -u postgres psql -d fpl-trends-db
 # or
 PGPASSWORD='<STRONG_PASSWORD>' psql -h localhost -U fpl -d fpl-trends-db
 ```
+
+### Rotating secrets
+
+Secrets live in `~/fpl-trends-api/.env`, which should be `chmod 600` and owned by `deploy`. Rotation runbooks below assume you're SSH'd in as `deploy`.
+
+**Confirm permissions before doing anything else:**
+
+```bash
+ls -l ~/fpl-trends-api/.env
+# expect: -rw------- 1 deploy deploy ...
+
+# if it isn't:
+chmod 600 ~/fpl-trends-api/.env
+chown deploy:deploy ~/fpl-trends-api/.env
+```
+
+**Rotate `ADMIN_TOKEN`** (the `/api/populate` bearer token):
+
+```bash
+NEW_TOKEN=$(openssl rand -hex 32)
+sed -i.bak "s|^ADMIN_TOKEN=.*|ADMIN_TOKEN=\"$NEW_TOKEN\"|" ~/fpl-trends-api/.env
+rm ~/fpl-trends-api/.env.bak
+pm2 restart fpl-trends-api
+echo "$NEW_TOKEN"   # capture in your password manager — it's the only copy
+```
+
+Verify:
+
+```bash
+curl -i https://fpltrends.live/api/populate                           # → 401
+curl -i -H "Authorization: Bearer $NEW_TOKEN" https://fpltrends.live/api/populate  # → 200 (after a few minutes)
+```
+
+**Rotate the database password:**
+
+Order matters — change postgres first, then `.env`. If you flip them, pm2 restarts into a broken connection. Use `openssl rand -hex 24` (not `-base64`): hex output is URL-safe by construction, so the password drops into `DATABASE_URL` without percent-encoding.
+
+```bash
+NEW_PW=$(openssl rand -hex 24)
+sudo -u postgres psql -c "ALTER USER fpl WITH PASSWORD '$NEW_PW';"
+
+sed -i.bak "s|^DATABASE_URL=.*|DATABASE_URL=\"postgresql://fpl:$NEW_PW@localhost:5432/fpl-trends-db\"|" ~/fpl-trends-api/.env
+rm ~/fpl-trends-api/.env.bak
+pm2 restart fpl-trends-api
+echo "$NEW_PW"      # capture in your password manager
+```
+
+Verify the API is healthy after restart:
+
+```bash
+curl https://fpltrends.live/api/health
+# → {"status":"ok","db":{"status":"up", ...}}
+```
+
+If the health check returns `503` with `db.status: "down"`, the `.env` and the postgres role are out of sync — re-run `ALTER USER` with the value in `.env`, or re-edit `.env` to match.
 
 ### Logs
 
@@ -863,11 +928,7 @@ The FPL API is occasionally flaky during gameweeks. Re-run `npm run populate`. T
 ## Known issues
 
 1. **No automated data refresh inside the Node process** — relies on system cron in production.
-2. **Database credentials live in `.env`** — gitignored, but plaintext on disk.
-3. **No authentication** on any endpoint.
-4. **No rate limiting** on any endpoint.
-5. **No health check endpoint.**
-6. **Manager rank precision degrades with overall rank** — top 10k is exact (full census). Stratum 2 (10k–100k) is sampled 1-in-5 and contributes near-direct measurement. Stratum 3 (100k–`MAX(events.ranked_count)`) extrapolates ~1000–2500× per probe and so carries the bulk of the variance; expect ±5–10% on the final number while the sample is fresh.
-7. **Manager rank ingestion is unverified at scale on the production IP** — the FPL API has no published rate limit; the governor handles 429/503 gracefully but a sustained ban would require routing ingestion through a separate egress.
-8. **Picks backfill is heavy** — ~9 hours for a fully-sampled production DB. Can't be parallelised across processes (single lockfile). Kicking off with `nohup` and tailing the log is the recommended pattern.
-9. **`stratum` on `manager_summary` is whatever it was at last classification** — a manager who climbed from stratum 3 to stratum 2 since their last cron pass still appears under stratum 3 in queries until re-encountered. Small drift; not corrected because comparison/rank queries treat strata as roughly-equal-density buckets.
+2. **Manager rank precision degrades with overall rank** — top 10k is exact (full census). Stratum 2 (10k–100k) is sampled 1-in-5 and contributes near-direct measurement. Stratum 3 (100k–`MAX(events.ranked_count)`) extrapolates ~1000–2500× per probe and so carries the bulk of the variance; expect ±5–10% on the final number while the sample is fresh.
+3. **Manager rank ingestion is unverified at scale on the production IP** — the FPL API has no published rate limit; the governor handles 429/503 gracefully but a sustained ban would require routing ingestion through a separate egress.
+4. **Picks backfill is heavy** — ~9 hours for a fully-sampled production DB. Can't be parallelised across processes (single lockfile). Kicking off with `nohup` and tailing the log is the recommended pattern.
+5. **`stratum` on `manager_summary` is whatever it was at last classification** — a manager who climbed from stratum 3 to stratum 2 since their last cron pass still appears under stratum 3 in queries until re-encountered. Small drift; not corrected because comparison/rank queries treat strata as roughly-equal-density buckets.

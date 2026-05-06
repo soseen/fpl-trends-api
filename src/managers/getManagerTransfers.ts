@@ -117,7 +117,7 @@ export type TransferImpactEvent = {
 export type FreeTransferState = {
   gw: number;
   used: number;
-  available: number;
+  available: number | null;
 };
 
 export type ManagerTransfersResponse = {
@@ -311,8 +311,7 @@ const rankResult = (
 ): RankWindowResult => ({
   excess,
   rankImpact: rankPerPoint !== null ? excess * rankPerPoint : null,
-  avgOwnershipPct:
-    ownershipCount > 0 ? ownershipSum / ownershipCount : null,
+  avgOwnershipPct: ownershipCount > 0 ? ownershipSum / ownershipCount : null,
 });
 
 // Transfer rank attribution deliberately excludes armband uplift. The
@@ -333,8 +332,7 @@ const inBaseRankImpactInWindow = (
     const stat = stats.get(playerGwKey(playerId, gw));
     if (!stat) continue;
     const ownership = ownershipPct(stat);
-    const userExposure =
-      (multipliers.get(gw)?.get(playerId) ?? 0) > 0 ? 1 : 0;
+    const userExposure = (multipliers.get(gw)?.get(playerId) ?? 0) > 0 ? 1 : 0;
     excess += (userExposure - ownership) * stat.total_points;
     ownershipSum += ownership;
     ownershipCount += 1;
@@ -870,9 +868,10 @@ export const getManagerTransfers = async (
       outRankStarterRate,
       rankContext.rank_per_point,
     );
+    const netPoints = inPts - outPts;
     const pairRankImpact =
-      inRank.rankImpact !== null && outRank.rankImpact !== null
-        ? inRank.rankImpact + outRank.rankImpact
+      rankContext.rank_per_point !== null
+        ? netPoints * rankContext.rank_per_point
         : null;
     // sold_gw is informative only for non-FH transfers (FH auto-reverts
     // next GW so showing "GW t+1" on every FH tile is noise). Always
@@ -896,7 +895,7 @@ export const getManagerTransfers = async (
         outRank.rankImpact,
         outRank.avgOwnershipPct,
       ),
-      net_points: inPts - outPts,
+      net_points: netPoints,
       net_rank_impact: pairRankImpact,
       in_sold_gw: inSoldGw,
     };
@@ -910,8 +909,7 @@ export const getManagerTransfers = async (
       pair.net_rank_impact !== null
     ) {
       ev.gross_rank_impact += pair.net_rank_impact;
-      ev.combined_rank_impact =
-        ev.gross_rank_impact + ev.hits_rank_impact;
+      ev.combined_rank_impact = ev.gross_rank_impact + ev.hits_rank_impact;
     } else {
       ev.gross_rank_impact = null;
       ev.hits_rank_impact = null;
@@ -956,10 +954,11 @@ export const getManagerTransfers = async (
     (t) => !fhGws.has(t.gw) && !wcGws.has(t.gw),
   ).length;
 
-  // Simulate the FT counter from GW 1 forward so we can show "X used /
-  // Y available" on every GW card (including rolled GWs). Cap at 5 per
-  // 2024-25+ FPL rules.
-  const FT_CAP = 5;
+  // FPL's public entry history exposes transfers made and hit cost, but
+  // not the exact FT bank at the start of the GW. The authenticated
+  // `/my-team` endpoint has live transfer state, but it is not public and
+  // not historical. We therefore expose `used` only and leave `available`
+  // null so the UI never invents a denominator.
   const fullChipByGw = new Map<number, ActiveChip>();
   for (const c of history.chips ?? []) {
     fullChipByGw.set(c.event, c.name as ActiveChip);
@@ -968,23 +967,13 @@ export const getManagerTransfers = async (
     (a, b) => a.event - b.event,
   );
   const freeTransfers: FreeTransferState[] = [];
-  let ft = 1;
   for (const ev of sortedHistory) {
     if (ev.event > endGw) break;
     const chipName = fullChipByGw.get(ev.event);
     const isChip = chipName === "wildcard" || chipName === "freehit";
     const used = isChip ? 0 : (ev.event_transfers ?? 0);
     if (ev.event >= startGw) {
-      freeTransfers.push({ gw: ev.event, used, available: ft });
-    }
-    if (isChip) {
-      // Chip GW: FT count rolls forward as if the GW were unused.
-      ft = Math.min(FT_CAP, ft + 1);
-    } else {
-      const hits = Math.floor((ev.event_transfers_cost ?? 0) / 4);
-      const ftConsumed = Math.max(0, used - hits); // transfers paid by FT
-      const remaining = Math.max(0, ft - ftConsumed);
-      ft = Math.min(FT_CAP, remaining + 1);
+      freeTransfers.push({ gw: ev.event, used, available: null });
     }
   }
 

@@ -20,9 +20,18 @@ import { getManagerComparison } from "./managers/getManagerComparison.js";
 import { getTeamImpact } from "./managers/getTeamImpact.js";
 import { getManagerTransfers } from "./managers/getManagerTransfers.js";
 import { getCaptainImpact } from "./managers/getCaptainImpact.js";
+import { requireAdminToken } from "./middleware/requireAdminToken.js";
+import { apiRateLimit } from "./middleware/rateLimit.js";
+import { getHealth } from "./health/getHealth.js";
 
 const app = express();
 const PORT = parseInt(process.env["PORT"] as string) || 3000;
+
+// nginx terminates TLS and proxies to 127.0.0.1:3000 in production.
+// "loopback" trusts X-Forwarded-For only when the immediate hop is on the
+// loopback interface (i.e. the local nginx), so a remote attacker can't
+// spoof their source IP to bypass per-IP rate limits.
+app.set("trust proxy", "loopback");
 
 app.use(helmet());
 app.use(compression());
@@ -53,6 +62,10 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+
+app.use("/api", apiRateLimit);
+
+app.get("/api/health", getHealth);
 
 app.get("/api/footballersData", async (req: Request, res: Response) => {
   try {
@@ -98,16 +111,20 @@ app.get("/api/eventsData", async (req: Request, res: Response) => {
   }
 });
 
-app.get("/api/populate", async (_req: Request, res: Response) => {
-  try {
-    await populateDatabase();
-    invalidateCache();
-    res.status(200).json({ success: true });
-  } catch (error: unknown) {
-    console.error("Error populating database:", error);
-    res.status(500).json({ error: "Failed to populate database." });
-  }
-});
+app.get(
+  "/api/populate",
+  requireAdminToken,
+  async (_req: Request, res: Response) => {
+    try {
+      await populateDatabase();
+      invalidateCache();
+      res.status(200).json({ success: true });
+    } catch (error: unknown) {
+      console.error("Error populating database:", error);
+      res.status(500).json({ error: "Failed to populate database." });
+    }
+  },
+);
 
 const parseEntryId = (raw: string): number | null => {
   const id = Number(raw);

@@ -16,6 +16,9 @@ const main = async (): Promise<void> => {
     SELECT 'stratum_captain_picks_gw' AS table_name, COUNT(*)::bigint AS rows
     FROM stratum_captain_picks_gw
     UNION ALL
+    SELECT 'rank_band_player_exposure_gw', COUNT(*)::bigint
+    FROM rank_band_player_exposure_gw
+    UNION ALL
     SELECT 'stratum_gw_running_stats', COUNT(*)::bigint
     FROM stratum_gw_running_stats
     UNION ALL

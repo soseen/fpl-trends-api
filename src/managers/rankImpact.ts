@@ -38,9 +38,7 @@ export type CaptainRateInfo = {
 export const playerGwKey = (playerId: number, gw: number): string =>
   `${playerId}:${gw}`;
 
-export const ownershipPct = (
-  stat: PlayerGwRankStat | undefined,
-): number => {
+export const ownershipPct = (stat: PlayerGwRankStat | undefined): number => {
   if (!stat || stat.ranked_count <= 0) return 0;
   return Math.min(stat.selected / stat.ranked_count, 1);
 };
@@ -131,42 +129,77 @@ export const fetchCaptainRatesInStratum = async (
 ): Promise<CaptainRateInfo> => {
   const rates = new Map<string, CaptainRate>();
   const perGwSampleSize = new Map<number, number>();
-  if (stratum === null) return { rates, perGwSampleSize };
-
-  const sampleRows = await prisma.$queryRawUnsafe<
-    Array<{ gw: number; sample_size: number }>
-  >(
-    `
-    SELECT gw, SUM(picks)::int AS sample_size
-    FROM stratum_captain_picks_gw
-    WHERE gw BETWEEN $1 AND $2
-      AND stratum = $3
-    GROUP BY gw
-    `,
-    startGw,
-    endGw,
-    stratum,
-  );
+  const sampleRows =
+    stratum === null
+      ? await prisma.$queryRawUnsafe<
+          Array<{ gw: number; sample_size: number }>
+        >(
+          `
+          SELECT gw, SUM(picks)::int AS sample_size
+          FROM stratum_captain_picks_gw
+          WHERE gw BETWEEN $1 AND $2
+          GROUP BY gw
+          `,
+          startGw,
+          endGw,
+        )
+      : await prisma.$queryRawUnsafe<
+          Array<{ gw: number; sample_size: number }>
+        >(
+          `
+          SELECT gw, SUM(picks)::int AS sample_size
+          FROM stratum_captain_picks_gw
+          WHERE gw BETWEEN $1 AND $2
+            AND stratum = $3
+          GROUP BY gw
+          `,
+          startGw,
+          endGw,
+          stratum,
+        );
   for (const r of sampleRows) perGwSampleSize.set(r.gw, r.sample_size);
 
-  const captainRows = await prisma.$queryRawUnsafe<
-    Array<{
-      gw: number;
-      captain_element: number;
-      captain_multiplier: number;
-      picks: number;
-    }>
-  >(
-    `
-    SELECT gw, captain_element, captain_multiplier, picks
-    FROM stratum_captain_picks_gw
-    WHERE gw BETWEEN $1 AND $2
-      AND stratum = $3
-    `,
-    startGw,
-    endGw,
-    stratum,
-  );
+  const captainRows =
+    stratum === null
+      ? await prisma.$queryRawUnsafe<
+          Array<{
+            gw: number;
+            captain_element: number;
+            captain_multiplier: number;
+            picks: number;
+          }>
+        >(
+          `
+          SELECT
+            gw,
+            captain_element,
+            captain_multiplier,
+            SUM(picks)::int AS picks
+          FROM stratum_captain_picks_gw
+          WHERE gw BETWEEN $1 AND $2
+          GROUP BY gw, captain_element, captain_multiplier
+          `,
+          startGw,
+          endGw,
+        )
+      : await prisma.$queryRawUnsafe<
+          Array<{
+            gw: number;
+            captain_element: number;
+            captain_multiplier: number;
+            picks: number;
+          }>
+        >(
+          `
+          SELECT gw, captain_element, captain_multiplier, picks
+          FROM stratum_captain_picks_gw
+          WHERE gw BETWEEN $1 AND $2
+            AND stratum = $3
+          `,
+          startGw,
+          endGw,
+          stratum,
+        );
 
   for (const r of captainRows) {
     const sample = perGwSampleSize.get(r.gw) ?? 0;

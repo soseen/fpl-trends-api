@@ -186,6 +186,8 @@ export async function wipeAllSeasonData(): Promise<void> {
   // or first-deploy ordering issues). Same pattern getTeamImpact uses for
   // `manager_pick_elements`.
   await prisma.$executeRawUnsafe(`TRUNCATE stratum_captain_picks_gw`);
+  await prisma.$executeRawUnsafe(`TRUNCATE rank_band_player_exposure_gw`);
+  console.info("   rank_band_player_exposure_gw cleared");
   console.info("   ✓ stratum_captain_picks_gw cleared");
 
   // Delete cached data files

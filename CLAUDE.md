@@ -156,11 +156,14 @@ The app tracks the current FPL season (e.g. "2025-26") in the `app_metadata` tab
 ### Bulk data (cached globally via `cachedJson`, invalidated on populate)
 
 ```
+GET /api/health               — Liveness + DB ping; 200 if DB reachable, 503 otherwise
 GET /api/footballersData      — All players with team, history, fixtures (Prisma includes)
 GET /api/teamsData            — All teams with team_history
 GET /api/totalPlayersCount    — { totalPlayers: number }
 GET /api/eventsData           — Gameweek events
 GET /api/populate             — Triggers full data refresh from FPL API (season-aware)
+                                Requires `Authorization: Bearer $ADMIN_TOKEN`. 401 on bad/missing
+                                token, 503 if ADMIN_TOKEN is unset on the server.
 ```
 
 ### My Trends (per-(entry, range), cached via `cachedManagerJson`)
@@ -184,7 +187,9 @@ Heavy reads in comparison/team-impact are served from `manager_cumulative`
 `src/managers/resolvePicks.ts` (DB cache + FPL fallback, in-flight de-dup
 across endpoints).
 
-No authentication. CORS origins are configured via the `ALLOWED_ORIGINS` env var (comma-separated). Defaults to `https://fpltrends.live, https://www.fpltrends.live`. In dev (`NODE_ENV !== "production"`), `http://localhost:5000` is also allowed automatically.
+Read endpoints are intentionally unauthenticated — data served is public FPL data and the app has no user accounts. Privileged routes (currently `/api/populate`, guarded by `src/middleware/requireAdminToken.ts`) require `Authorization: Bearer $ADMIN_TOKEN`. CORS origins are configured via the `ALLOWED_ORIGINS` env var (comma-separated). Defaults to `https://fpltrends.live, https://www.fpltrends.live`. In dev (`NODE_ENV !== "production"`), `http://localhost:5000` is also allowed automatically.
+
+All `/api/*` routes are rate-limited per IP via `express-rate-limit` (`src/middleware/rateLimit.ts`) — 60 requests per rolling 60s window. Over the limit returns `429` with `RateLimit-*` headers (IETF draft-8). Express is configured with `trust proxy = "loopback"` so the limiter sees the real client IP from nginx's `X-Forwarded-For`, but rejects spoofed `X-Forwarded-For` from non-local sources. The frontend's normal request volume (≤10 on app init, near-zero after React Query caches) is well under the limit.
 
 ## FPL API Fetching
 
@@ -210,7 +215,20 @@ In `insertTeamHistory.ts`:
 DATABASE_URL    — PostgreSQL connection string (required)
 NODE_ENV        — "development" or "production" (controls CORS)
 PORT            — Server port (default: 3000)
+ADMIN_TOKEN     — Bearer token required by /api/populate. If unset, the endpoint
+                  returns 503 (fail-closed). Generate with `openssl rand -hex 32`.
 ```
+
+## Secrets handling
+
+Secrets (DB password, `ADMIN_TOKEN`) live in plaintext in `~/fpl-trends-api/.env` on the production box. This is deliberate, not an oversight. The threat model:
+
+- **Shell access (root or `deploy`)** — encryption-at-rest doesn't help; the running pm2 process needs the secret in memory, so anyone who can `cat /proc/<pid>/environ` already has it. SSH is hardened (key-only, root login disabled).
+- **Read-only FS leak** (path traversal, accidental `cp`, world-readable file) — mitigated by `chmod 600 ~/fpl-trends-api/.env`, owned by `deploy`. Re-apply after every edit.
+- **Backup / snapshot leak** — N/A. The Hetzner box has no automated backups (rebuild-on-failure stance) and no snapshot regimen.
+- **Source / repo leak** — `.env` is gitignored; nothing committed.
+
+Re-evaluate this stance if any of the following changes: backups are introduced, the box is shared with additional operators, or the box gets snapshotted regularly. Likely path forward at that point: `age`-encrypted `.env.age` in the repo, decrypt on the server using a key in `~/.config/age/keys.txt`. See [`Readme.md`](./Readme.md) for the rotation runbook.
 
 ## Commands
 
@@ -234,7 +252,3 @@ npm run lint:fix                       — ESLint auto-fix
 ## Known Issues
 
 1. No scheduled/automatic data refresh inside the Node process — relies on system cron in production.
-2. Database credentials live in `.env` (gitignored, plaintext on disk).
-3. No rate limiting on API endpoints.
-4. No health check endpoint.
-5. No authentication — all endpoints are public.

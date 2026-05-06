@@ -1,5 +1,6 @@
 import { prisma } from "../database/client.js";
 import { fetchEntryEventPicks } from "./fetchPicks.js";
+import { persistPickElements } from "./persistPickElements.js";
 import { delay } from "../utils.js";
 
 // Shared picks resolver for getTeamImpact and getManagerComparison.
@@ -55,43 +56,6 @@ const readPersistedPicks = async (
   );
 };
 
-const persistPicks = async (
-  entryId: number,
-  gw: number,
-  picks: ReadonlyArray<{
-    element: number;
-    position: number;
-    multiplier: number;
-    is_captain: boolean;
-    is_vice_captain: boolean;
-  }>,
-): Promise<void> => {
-  if (picks.length === 0) return;
-  const values: unknown[] = [];
-  const tuples = picks.map((p, i) => {
-    const base = i * 7;
-    values.push(
-      entryId,
-      gw,
-      p.element,
-      p.position,
-      p.multiplier,
-      p.is_captain,
-      p.is_vice_captain,
-    );
-    return `($${base + 1}, $${base + 2}, $${base + 3}, $${base + 4}, $${base + 5}, $${base + 6}, $${base + 7})`;
-  });
-  await prisma.$executeRawUnsafe(
-    `
-    INSERT INTO manager_pick_elements
-      (entry_id, gw, element_id, position, multiplier, is_captain, is_vice)
-    VALUES ${tuples.join(", ")}
-    ON CONFLICT (entry_id, gw, element_id) DO NOTHING
-    `,
-    ...values,
-  );
-};
-
 // In-flight de-dup. Keyed on (entryId, startGw, endGw) — the natural cache
 // granularity for the My Trends panel where comparison and team-impact
 // always request the exact same range simultaneously. A lookup that
@@ -138,7 +102,7 @@ const resolvePicksImpl = async (
         incomplete = true;
         continue;
       }
-      await persistPicks(entryId, r.gw, r.picks);
+      await persistPickElements(entryId, r.gw, r.picks);
       for (const p of r.picks) {
         fetched.push({
           entry_id: entryId,

@@ -65,6 +65,14 @@ const main = async (): Promise<void> => {
     GROUP BY stratum ORDER BY stratum
   `;
 
+  const playerExposure = await prisma.$queryRaw<
+    Array<{ rank_band: number; rows: bigint; total_sample: bigint | null }>
+  >`
+    SELECT rank_band, COUNT(*)::bigint AS rows, SUM(sample_size)::bigint AS total_sample
+    FROM rank_band_player_exposure_gw
+    GROUP BY rank_band ORDER BY rank_band
+  `;
+
   const runningStats = await prisma.$queryRaw<
     Array<{ stratum: number; rows: bigint; total_sample: bigint | null }>
   >`
@@ -107,7 +115,7 @@ const main = async (): Promise<void> => {
   );
 
   console.info(
-    "\nmanager_pick_elements (full XV cache, per-user team-impact):",
+    "\nmanager_pick_elements (full XV cache, user + sample EO):",
   );
   console.info(
     `  ${pickElements[0]?.rows ?? 0n} rows across ${pickElements[0]?.managers ?? 0n} managers, ${pickElements[0]?.gws ?? 0n} distinct GWs`,
@@ -133,6 +141,19 @@ const main = async (): Promise<void> => {
     }
   }
 
+  console.info("\nrank_band_player_exposure_gw (team-impact EO read path):");
+  if (playerExposure.length === 0) {
+    console.info(
+      "  EMPTY - derived from manager_pick_elements; EO falls back to global ownership/captain data.",
+    );
+  } else {
+    for (const r of playerExposure) {
+      console.info(
+        `  band ${r.rank_band}: ${r.rows} buckets, ${r.total_sample ?? 0n} sample-manager-GW pairs`,
+      );
+    }
+  }
+
   console.info(
     "\nstratum_gw_running_stats (comparison endpoint pre-aggregate):",
   );
@@ -152,6 +173,10 @@ const main = async (): Promise<void> => {
   const picksRows = Number(picks[0]?.rows ?? 0n);
   const cumRows = Number(cumulative[0]?.rows ?? 0n);
   const captainBuckets = captainPicks.reduce(
+    (acc, r) => acc + Number(r.rows),
+    0,
+  );
+  const exposureBuckets = playerExposure.reduce(
     (acc, r) => acc + Number(r.rows),
     0,
   );
@@ -182,6 +207,14 @@ const main = async (): Promise<void> => {
     );
   } else {
     console.info("  ✅ stratum_captain_picks_gw populated.");
+  }
+
+  if (exposureBuckets === 0) {
+    console.info(
+      "  rank_band_player_exposure_gw empty - run `npm run backfill-comparison-picks` or `npm run rebuild-manager-read-models` after sample full-XV picks exist.",
+    );
+  } else {
+    console.info("  rank_band_player_exposure_gw populated.");
   }
 
   const runningRows = runningStats.reduce((acc, r) => acc + Number(r.rows), 0);

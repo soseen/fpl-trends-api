@@ -14,6 +14,8 @@ import {
   fetchEntryEventPicks,
   summarizePicks,
 } from "../managers/fetchPicks.js";
+import { persistPickElements } from "../managers/persistPickElements.js";
+import { RANK_BAND_SQL_CASE } from "../managers/rankBands.js";
 import { fetchEntryTransfers } from "../managers/fetchTransfers.js";
 import {
   RateLimitGovernor,
@@ -529,11 +531,16 @@ const ingestPicksForMissingGws = async (
   if (currentGw < 1) return;
   if (governor.shouldAbort) return;
 
-  const existing = await prisma.manager_picks.findUnique({
-    where: { entry_id_gw: { entry_id: entryId, gw: currentGw } },
-    select: { gw: true },
-  });
-  if (existing) return;
+  const [existing, elementRows] = await Promise.all([
+    prisma.manager_picks.findUnique({
+      where: { entry_id_gw: { entry_id: entryId, gw: currentGw } },
+      select: { gw: true },
+    }),
+    prisma.manager_pick_elements.count({
+      where: { entry_id: entryId, gw: currentGw },
+    }),
+  ]);
+  if (existing && elementRows >= 15) return;
 
   let payload;
   try {
@@ -564,6 +571,7 @@ const ingestPicksForMissingGws = async (
       active_chip: payload.active_chip,
     },
   });
+  await persistPickElements(entryId, currentGw, payload.picks ?? []);
 };
 
 // One FPL fetch per manager visit, gated by `has_transfer_history`. The
@@ -786,6 +794,64 @@ export const rebuildStratumCaptainPicks = async (): Promise<void> => {
   ]);
 };
 
+// Rebuild LiveFPL-style player exposure by rank band from full XV rows.
+// The important metric is effective_multiplier_sum / sample_size, which is
+// actual EO from final multipliers rather than global selected-by plus a
+// separate captain estimate.
+export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
+  await prisma.$transaction([
+    prisma.$executeRawUnsafe(`TRUNCATE rank_band_player_exposure_gw`),
+    prisma.$executeRawUnsafe(`
+      INSERT INTO rank_band_player_exposure_gw
+        (rank_band, gw, element_id, sample_size, squad_picks, active_picks,
+         effective_multiplier_sum, last_rebuilt)
+      WITH pick_rows AS (
+        SELECT
+          ${RANK_BAND_SQL_CASE} AS rank_band,
+          mpe.gw,
+          mpe.entry_id,
+          mpe.element_id,
+          mpe.multiplier
+        FROM manager_pick_elements mpe
+        JOIN manager_summary ms ON ms.entry_id = mpe.entry_id
+        WHERE ms.overall_rank IS NOT NULL
+      ),
+      samples AS (
+        SELECT
+          rank_band,
+          gw,
+          COUNT(DISTINCT entry_id)::int AS sample_size
+        FROM pick_rows
+        WHERE rank_band IS NOT NULL
+        GROUP BY rank_band, gw
+      ),
+      player_exposure AS (
+        SELECT
+          rank_band,
+          gw,
+          element_id,
+          COUNT(*)::int AS squad_picks,
+          COUNT(*) FILTER (WHERE multiplier > 0)::int AS active_picks,
+          COALESCE(SUM(multiplier), 0)::int AS effective_multiplier_sum
+        FROM pick_rows
+        WHERE rank_band IS NOT NULL
+        GROUP BY rank_band, gw, element_id
+      )
+      SELECT
+        pe.rank_band,
+        pe.gw,
+        pe.element_id,
+        s.sample_size,
+        pe.squad_picks,
+        pe.active_picks,
+        pe.effective_multiplier_sum,
+        NOW() AS last_rebuilt
+      FROM player_exposure pe
+      JOIN samples s ON s.rank_band = pe.rank_band AND s.gw = pe.gw
+    `),
+  ]);
+};
+
 // Rebuild the (stratum, gw) running-stats table used by
 // getManagerComparison.sampleStratumAggregates. Single TRUNCATE+INSERT
 // inside a transaction so readers always see a consistent snapshot — no
@@ -894,6 +960,12 @@ export const rebuildManagerReadModels = async (): Promise<void> => {
   await rebuildStratumCaptainPicks();
   console.info(
     `[populateManagers] stratum_captain_picks_gw rebuilt in ${Math.round((Date.now() - captainStarted) / 1000)}s`,
+  );
+
+  const exposureStarted = Date.now();
+  await rebuildRankBandPlayerExposure();
+  console.info(
+    `[populateManagers] rank_band_player_exposure_gw rebuilt in ${Math.round((Date.now() - exposureStarted) / 1000)}s`,
   );
 
   const runningStarted = Date.now();

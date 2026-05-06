@@ -24,6 +24,7 @@ export const resetManagerAnalytics = async (): Promise<void> => {
         manager_history,
         manager_picks,
         manager_summary,
+        rank_band_player_exposure_gw,
         stratum_captain_picks_gw,
         stratum_gw_running_stats,
         manager_range_score_buckets

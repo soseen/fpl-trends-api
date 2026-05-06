@@ -5,11 +5,16 @@ import {
   fetchEntryEventPicks,
   summarizePicks,
 } from "../managers/fetchPicks.js";
+import { persistPickElements } from "../managers/persistPickElements.js";
 import {
   DEFAULT_GOVERNOR_CONFIG,
   RateLimitGovernor,
   type GovernorConfig,
 } from "../managers/rateLimitGovernor.js";
+import {
+  rebuildRankBandPlayerExposure,
+  rebuildStratumCaptainPicks,
+} from "./populateManagers.js";
 import { delay } from "../utils.js";
 
 // Long-running backfill of `manager_picks` for every (sampled manager, finished GW)
@@ -82,7 +87,13 @@ const findMissingPairs = async (
     FROM candidates c
     LEFT JOIN manager_picks mp
       ON mp.entry_id = c.entry_id AND mp.gw = c.gw
+    LEFT JOIN LATERAL (
+      SELECT COUNT(*)::int AS pick_elements
+      FROM manager_pick_elements mpe
+      WHERE mpe.entry_id = c.entry_id AND mpe.gw = c.gw
+    ) mpe ON true
     WHERE mp.entry_id IS NULL
+       OR COALESCE(mpe.pick_elements, 0) < 15
     ORDER BY c.entry_id, c.gw
   `;
   return rows;
@@ -127,6 +138,7 @@ const fetchAndStorePicks = async (
       active_chip: payload.active_chip,
     },
   });
+  await persistPickElements(entryId, gw, payload.picks ?? []);
 };
 
 const ingestStratum = async (
@@ -206,6 +218,12 @@ export const backfillPicks = async (
     totalFailed += result.failed;
     totalSkipped += result.skipped;
   }
+  const rebuildStarted = Date.now();
+  await rebuildStratumCaptainPicks();
+  await rebuildRankBandPlayerExposure();
+  console.info(
+    `[backfillPicks] pick read models rebuilt in ${Math.round((Date.now() - rebuildStarted) / 1000)}s.`,
+  );
   console.info(
     `[backfillPicks] all strata complete: ${totalDone} done, ${totalFailed} failed, ${totalSkipped} skipped (governor aborted: ${governor.shouldAbort}).`,
   );

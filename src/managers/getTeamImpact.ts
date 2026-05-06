@@ -3,6 +3,7 @@ import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks } from "./resolvePicks.js";
 import { rangeDensityFromBuckets, type Stratum } from "./rangeStats.js";
+import { pickRankBand, type RankBand } from "./rankBands.js";
 
 // ----------------------------------------------------------------------------
 // Public response types. Mirrored on the frontend in
@@ -29,6 +30,7 @@ export type TileSlot = {
 // the first number is always the player's club).
 export type PlayerMatch = {
   opponent_short: string;
+  opponent_code: number;
   was_home: boolean;
   team_score: number | null;
   opponent_score: number | null;
@@ -370,6 +372,7 @@ const fetchPlayerMatches = async (
       team_h_score: number | null;
       team_a_score: number | null;
       opponent_short: string | null;
+      opponent_code: number | null;
       kickoff_time: Date;
     }>
   >(
@@ -381,7 +384,8 @@ const fetchPlayerMatches = async (
       h.team_h_score,
       h.team_a_score,
       h.kickoff_time,
-      t.short_name AS opponent_short
+      t.short_name AS opponent_short,
+      t.code AS opponent_code
     FROM history h
     LEFT JOIN teams t ON t.id = h.opponent_team
     WHERE h.round = ANY($1::int[])
@@ -399,6 +403,7 @@ const fetchPlayerMatches = async (
     const list = map.get(key) ?? [];
     list.push({
       opponent_short: r.opponent_short ?? "?",
+      opponent_code: r.opponent_code ?? 0,
       was_home: r.was_home,
       team_score: teamScore,
       opponent_score: opponentScore,
@@ -477,6 +482,83 @@ const fetchCaptainRatesInStratum = async (
     rates.set(key, existing);
   }
   return { rates, perGwSampleSize };
+};
+
+type PlayerExposure = {
+  ownership_pct: number;
+  eo: number;
+  sample_size: number;
+};
+
+const fetchPlayerExposureInRankBand = async (
+  rankBand: RankBand | null,
+  playerIds: number[],
+  startGw: number,
+  endGw: number,
+): Promise<{
+  exposures: Map<string, PlayerExposure>;
+  perGwSampleSize: Map<number, number>;
+}> => {
+  const exposures = new Map<string, PlayerExposure>();
+  const perGwSampleSize = new Map<number, number>();
+  if (rankBand === null || playerIds.length === 0) {
+    return { exposures, perGwSampleSize };
+  }
+
+  const sampleRows = await prisma.$queryRawUnsafe<
+    Array<{ gw: number; sample_size: number }>
+  >(
+    `
+    SELECT gw, MAX(sample_size)::int AS sample_size
+    FROM rank_band_player_exposure_gw
+    WHERE rank_band = $1
+      AND gw BETWEEN $2 AND $3
+    GROUP BY gw
+    `,
+    rankBand,
+    startGw,
+    endGw,
+  );
+  for (const row of sampleRows) perGwSampleSize.set(row.gw, row.sample_size);
+
+  const rows = await prisma.$queryRawUnsafe<
+    Array<{
+      element_id: number;
+      gw: number;
+      sample_size: number;
+      squad_picks: number;
+      effective_multiplier_sum: number;
+    }>
+  >(
+    `
+    SELECT
+      element_id,
+      gw,
+      sample_size,
+      squad_picks,
+      effective_multiplier_sum
+    FROM rank_band_player_exposure_gw
+    WHERE rank_band = $1
+      AND gw BETWEEN $2 AND $3
+      AND element_id = ANY($4::int[])
+    `,
+    rankBand,
+    startGw,
+    endGw,
+    playerIds,
+  );
+
+  for (const row of rows) {
+    const sample = row.sample_size || 0;
+    if (sample <= 0) continue;
+    exposures.set(`${row.element_id}:${row.gw}`, {
+      ownership_pct: row.squad_picks / sample,
+      eo: row.effective_multiplier_sum / sample,
+      sample_size: sample,
+    });
+  }
+
+  return { exposures, perGwSampleSize };
 };
 
 // rank_per_point coefficient at the user's range total.
@@ -642,6 +724,49 @@ const pickStratum = (overallRank: number | null): 1 | 2 | 3 | null => {
   return 3;
 };
 
+const globalOwnershipPct = (stat: PerGwPlayerStat | undefined): number =>
+  stat && stat.ranked_count > 0
+    ? Math.min(stat.selected / stat.ranked_count, 1)
+    : 0;
+
+const exposureForPlayerGw = (
+  playerId: number,
+  gw: number,
+  stat: PerGwPlayerStat | undefined,
+  exposureInfo: {
+    exposures: Map<string, PlayerExposure>;
+    perGwSampleSize: Map<number, number>;
+  },
+  capInfo: {
+    rates: Map<string, { cap_rate: number; tc_rate: number }>;
+    perGwSampleSize: Map<number, number>;
+  },
+): { ownershipPct: number; eo: number; usedRankBandExposure: boolean } => {
+  const key = `${playerId}:${gw}`;
+  const exposureSample = exposureInfo.perGwSampleSize.get(gw) ?? 0;
+  if (exposureSample >= SMALL_SAMPLE_THRESHOLD) {
+    const exposure = exposureInfo.exposures.get(key);
+    return {
+      ownershipPct: exposure?.ownership_pct ?? 0,
+      eo: exposure?.eo ?? 0,
+      usedRankBandExposure: true,
+    };
+  }
+
+  const ownershipPct = globalOwnershipPct(stat);
+  const cap = capInfo.rates.get(key);
+  const capSample = capInfo.perGwSampleSize.get(gw) ?? 0;
+  if (capSample >= SMALL_SAMPLE_THRESHOLD && cap) {
+    return {
+      ownershipPct,
+      eo: ownershipPct + cap.cap_rate + 2 * cap.tc_rate,
+      usedRankBandExposure: false,
+    };
+  }
+
+  return { ownershipPct, eo: ownershipPct, usedRankBandExposure: false };
+};
+
 // ----------------------------------------------------------------------------
 // Public entry point
 // ----------------------------------------------------------------------------
@@ -695,9 +820,13 @@ export const getTeamImpact = async (
     };
   }
 
-  // Stratum picked from the user's current overall rank. If they're not
-  // ranked yet (very new entry), fallback path uses global ownership only.
-  const stratum = pickStratum(summary.summary_overall_rank);
+  const rankBasisOverallRank =
+    eventsInRange.find((ev) => ev.event === Math.max(...finishedGws))
+      ?.overall_rank ?? summary.summary_overall_rank;
+  // Prefer the user's rank at the end of this range, falling back to current
+  // rank for unusual payloads.
+  const stratum = pickStratum(rankBasisOverallRank);
+  const rankBand = pickRankBand(rankBasisOverallRank);
 
   // Resolve picks (DB cache + FPL fallback for any missing GWs).
   const { picks, incomplete } = await resolvePicks(entryId, finishedGws);
@@ -708,22 +837,23 @@ export const getTeamImpact = async (
   // In parallel: footballer metadata, per-GW player points/ownership,
   // captain-rate sample data, rank density, and per-fixture match info
   // (so the frontend can show "vs ARS 2-1" alongside each per-GW row).
-  const [infoMap, statsMap, capInfo, rankInfo, ownedMatchesMap] =
+  const [infoMap, statsMap, capInfo, exposureInfo, rankInfo, ownedMatchesMap] =
     await Promise.all([
       fetchFootballerInfo(elementIds),
       fetchPlayerGwStats(elementIds, startGw, endGw),
       fetchCaptainRatesInStratum(stratum, startGw, endGw),
+      fetchPlayerExposureInRankBand(rankBand, elementIds, startGw, endGw),
       computeRankPerPoint(stratum, startGw, endGw, userRangeTotal),
       fetchPlayerMatches(elementIds, finishedGws),
     ]);
 
   const smallSampleGws = new Set<number>();
-  for (const [gw, n] of capInfo.perGwSampleSize.entries()) {
+  for (const [gw, n] of exposureInfo.perGwSampleSize.entries()) {
     if (n < SMALL_SAMPLE_THRESHOLD) smallSampleGws.add(gw);
   }
   // GWs we don't have any sample for at all → also treat as small-sample.
   for (const gw of finishedGws) {
-    if (!capInfo.perGwSampleSize.has(gw)) smallSampleGws.add(gw);
+    if (!exposureInfo.perGwSampleSize.has(gw)) smallSampleGws.add(gw);
   }
 
   // Per-player accumulators.
@@ -749,26 +879,15 @@ export const getTeamImpact = async (
 
     const stat = statsMap.get(`${pick.element_id}:${pick.gw}`);
     const points = stat?.total_points ?? 0;
-    const ownershipPct =
-      stat && stat.ranked_count > 0
-        ? Math.min(stat.selected / stat.ranked_count, 1)
-        : 0;
-
-    const capKey = `${pick.element_id}:${pick.gw}`;
-    const cap = capInfo.rates.get(capKey);
-    const sampleSize = capInfo.perGwSampleSize.get(pick.gw) ?? 0;
-
-    let eo: number;
-    if (sampleSize >= SMALL_SAMPLE_THRESHOLD && cap) {
-      // EO = ownership + cap_rate × 1 + tc_rate × 2.
-      eo = ownershipPct + cap.cap_rate + 2 * cap.tc_rate;
-    } else if (sampleSize >= SMALL_SAMPLE_THRESHOLD) {
-      // Player wasn't captained in stratum this GW → just ownership.
-      eo = ownershipPct;
-    } else {
-      // Small sample: ownership-only fallback.
-      eo = ownershipPct;
-    }
+    const exposure = exposureForPlayerGw(
+      pick.element_id,
+      pick.gw,
+      stat,
+      exposureInfo,
+      capInfo,
+    );
+    const ownershipPct = exposure.ownershipPct;
+    const eo = exposure.eo;
 
     const excess = (pick.multiplier - eo) * points;
     const rankImpactGw =
@@ -878,6 +997,19 @@ export const getTeamImpact = async (
     const userOwnedKeys = new Set(picks.map((p) => `${p.element_id}:${p.gw}`));
 
     const allStats = await fetchAllPlayerGwStats(finishedGws);
+    const allScoringPlayerIds = Array.from(
+      new Set(
+        Array.from(allStats.keys())
+          .map((key) => Number(key.split(":")[0]))
+          .filter((id) => Number.isFinite(id)),
+      ),
+    );
+    const killerExposureInfo = await fetchPlayerExposureInRankBand(
+      rankBand,
+      allScoringPlayerIds,
+      startGw,
+      endGw,
+    );
 
     type KillerAcc = {
       excess_total: number;
@@ -897,21 +1029,15 @@ export const getTeamImpact = async (
       if (!gwsWithPicks.has(gw)) continue;
       if (userOwnedKeys.has(`${playerId}:${gw}`)) continue;
 
-      const ownershipPct =
-        stat.ranked_count > 0
-          ? Math.min(stat.selected / stat.ranked_count, 1)
-          : 0;
-
-      const capKey = `${playerId}:${gw}`;
-      const cap = capInfo.rates.get(capKey);
-      const sampleSize = capInfo.perGwSampleSize.get(gw) ?? 0;
-
-      let eo: number;
-      if (sampleSize >= SMALL_SAMPLE_THRESHOLD && cap) {
-        eo = ownershipPct + cap.cap_rate + 2 * cap.tc_rate;
-      } else {
-        eo = ownershipPct;
-      }
+      const exposure = exposureForPlayerGw(
+        playerId,
+        gw,
+        stat,
+        killerExposureInfo,
+        capInfo,
+      );
+      const ownershipPct = exposure.ownershipPct;
+      const eo = exposure.eo;
 
       if (eo === 0) continue;
 

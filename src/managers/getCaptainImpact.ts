@@ -33,12 +33,21 @@ export type CaptainPlayer = {
   // their captain (or what the template captain would have given a user
   // who picked them as captain).
   effective_points: number;
+  effective_multiplier: number;
   // These are measured in the user's rank stratum for this range. They
   // let the UI explain why 10 captain points from one player may move
   // rank very differently from 10 captain points from another.
   ownership_pct: number;
   captain_rate: number;
   triple_captain_rate: number;
+  minutes: number;
+  goals: number;
+  assists: number;
+  clean_sheets: number;
+  goals_conceded: number;
+  defensive_contribution: number;
+  saves: number;
+  bonus: number;
 };
 
 // One per GW in which the user had a captain assigned. Compares the
@@ -118,6 +127,17 @@ type FootballerMeta = {
   element_type: number | null;
 };
 
+type CaptainGwDetail = {
+  minutes: number;
+  goals: number;
+  assists: number;
+  clean_sheets: number;
+  goals_conceded: number;
+  defensive_contribution: number;
+  saves: number;
+  bonus: number;
+};
+
 const toCaptainPlayer = (
   id: number,
   meta: FootballerMeta | undefined,
@@ -126,11 +146,12 @@ const toCaptainPlayer = (
   ownership: number,
   captainRate: number,
   tripleCaptainRate: number,
+  detail: CaptainGwDetail | undefined,
+  effectiveMultiplier?: number,
 ): CaptainPlayer => {
-  // Effective points use max(mult, 1): a captain whose intended pick was
-  // benched (mult=0) still scored 0 for the user, while the template
-  // side (always mult=2) doubles the raw points.
-  const effective = rawPoints * Math.max(multiplier, multiplier === 0 ? 0 : 1);
+  const appliedMultiplier =
+    effectiveMultiplier ?? Math.max(multiplier, multiplier === 0 ? 0 : 1);
+  const effective = rawPoints * appliedMultiplier;
   return {
     player_id: id,
     web_name: meta?.web_name ?? `#${id}`,
@@ -140,10 +161,78 @@ const toCaptainPlayer = (
     raw_points: rawPoints,
     multiplier,
     effective_points: effective,
+    effective_multiplier: appliedMultiplier,
     ownership_pct: ownership,
     captain_rate: captainRate,
     triple_captain_rate: tripleCaptainRate,
+    minutes: detail?.minutes ?? 0,
+    goals: detail?.goals ?? 0,
+    assists: detail?.assists ?? 0,
+    clean_sheets: detail?.clean_sheets ?? 0,
+    goals_conceded: detail?.goals_conceded ?? 0,
+    defensive_contribution: detail?.defensive_contribution ?? 0,
+    saves: detail?.saves ?? 0,
+    bonus: detail?.bonus ?? 0,
   };
+};
+
+const fetchCaptainGwDetails = async (
+  playerIds: ReadonlyArray<number>,
+  startGw: number,
+  endGw: number,
+): Promise<Map<string, CaptainGwDetail>> => {
+  const map = new Map<string, CaptainGwDetail>();
+  if (playerIds.length === 0) return map;
+
+  const rows = await prisma.$queryRawUnsafe<
+    Array<{
+      footballer_id: number;
+      round: number;
+      minutes: number;
+      goals: number;
+      assists: number;
+      clean_sheets: number;
+      goals_conceded: number;
+      defensive_contribution: number;
+      saves: number;
+      bonus: number;
+    }>
+  >(
+    `
+    SELECT
+      footballer_id,
+      round,
+      SUM(minutes)::int AS minutes,
+      SUM(goals_scored)::int AS goals,
+      SUM(assists)::int AS assists,
+      SUM(clean_sheets)::int AS clean_sheets,
+      SUM(goals_conceded)::int AS goals_conceded,
+      COALESCE(SUM(defensive_contribution), 0)::int AS defensive_contribution,
+      SUM(saves)::int AS saves,
+      SUM(bonus)::int AS bonus
+    FROM history
+    WHERE footballer_id = ANY($1::int[])
+      AND round BETWEEN $2 AND $3
+    GROUP BY footballer_id, round
+    `,
+    [...playerIds],
+    startGw,
+    endGw,
+  );
+
+  for (const r of rows) {
+    map.set(playerGwKey(r.footballer_id, r.round), {
+      minutes: r.minutes,
+      goals: r.goals,
+      assists: r.assists,
+      clean_sheets: r.clean_sheets,
+      goals_conceded: r.goals_conceded,
+      defensive_contribution: r.defensive_contribution,
+      saves: r.saves,
+      bonus: r.bonus,
+    });
+  }
+  return map;
 };
 
 // Pick the top-captained player per GW within stratum 1 (top 10k).
@@ -188,21 +277,24 @@ export const getCaptainImpact = async (
 
   // Picks (user's captains), events (overall template captains), top-10k
   // aggregated captain picks, and rank-density context in parallel.
-  const [resolvedPicks, eventRows, top10kByGw, rankContext] = await Promise.all([
-    resolvePicks(entryId, range),
-    prisma.events.findMany({
-      where: { id: { gte: startGw, lte: endGw } },
-      select: { id: true, most_captained: true },
-    }),
-    fetchTop10kCaptainByGw(startGw, endGw),
-    resolveRankImpactContext(entryId, startGw, endGw),
-  ]);
-
-  const captainInfo = await fetchCaptainRatesInStratum(
-    rankContext.stratum,
-    startGw,
-    endGw,
+  const [resolvedPicks, eventRows, top10kByGw, rankContext] = await Promise.all(
+    [
+      resolvePicks(entryId, range),
+      prisma.events.findMany({
+        where: { id: { gte: startGw, lte: endGw } },
+        select: { id: true, most_captained: true },
+      }),
+      fetchTop10kCaptainByGw(startGw, endGw),
+      resolveRankImpactContext(entryId, startGw, endGw),
+    ],
   );
+
+  const [captainInfo, top10kCaptainInfo, overallCaptainInfo] =
+    await Promise.all([
+      fetchCaptainRatesInStratum(rankContext.stratum, startGw, endGw),
+      fetchCaptainRatesInStratum(1, startGw, endGw),
+      fetchCaptainRatesInStratum(null, startGw, endGw),
+    ]);
 
   // For each GW, the user's captain is whoever has the highest multiplier
   // — that's the player who actually got the captain bonus, accounting
@@ -231,6 +323,14 @@ export const getCaptainImpact = async (
   for (const id of templateByGw.values()) if (id !== null) playerIds.add(id);
   for (const id of top10kByGw.values()) playerIds.add(id);
   for (const key of captainInfo.rates.keys()) {
+    const playerId = Number(key.split(":")[0]);
+    if (Number.isFinite(playerId)) playerIds.add(playerId);
+  }
+  for (const key of top10kCaptainInfo.rates.keys()) {
+    const playerId = Number(key.split(":")[0]);
+    if (Number.isFinite(playerId)) playerIds.add(playerId);
+  }
+  for (const key of overallCaptainInfo.rates.keys()) {
     const playerId = Number(key.split(":")[0]);
     if (Number.isFinite(playerId)) playerIds.add(playerId);
   }
@@ -270,7 +370,7 @@ export const getCaptainImpact = async (
   }
 
   const idsArr = Array.from(playerIds);
-  const [metaRows, statsMap] = await Promise.all([
+  const [metaRows, statsMap, detailMap] = await Promise.all([
     prisma.footballers.findMany({
       where: { id: { in: idsArr } },
       select: {
@@ -282,6 +382,7 @@ export const getCaptainImpact = async (
       },
     }),
     fetchPlayerGwRankStats(idsArr, startGw, endGw),
+    fetchCaptainGwDetails(idsArr, startGw, endGw),
   ]);
 
   const metaMap = new Map<number, FootballerMeta>(
@@ -292,10 +393,12 @@ export const getCaptainImpact = async (
     playerId: number,
     gw: number,
     multiplier: number,
+    ratesInfo = captainInfo,
+    effectiveMultiplier?: number,
   ): CaptainPlayer => {
     const key = playerGwKey(playerId, gw);
     const stat = statsMap.get(key);
-    const rates = captainInfo.rates.get(key) ?? { cap_rate: 0, tc_rate: 0 };
+    const rates = ratesInfo.rates.get(key) ?? { cap_rate: 0, tc_rate: 0 };
     return toCaptainPlayer(
       playerId,
       metaMap.get(playerId),
@@ -304,6 +407,8 @@ export const getCaptainImpact = async (
       ownershipPct(stat),
       rates.cap_rate,
       rates.tc_rate,
+      detailMap.get(key),
+      effectiveMultiplier,
     );
   };
 
@@ -317,13 +422,27 @@ export const getCaptainImpact = async (
     const templateId = templateByGw.get(gw);
     let templateCap: CaptainPlayer | null = null;
     if (templateId !== null && templateId !== undefined) {
-      templateCap = playerForGw(templateId, gw, 2);
+      const rates = overallCaptainInfo.rates.get(playerGwKey(templateId, gw));
+      templateCap = playerForGw(
+        templateId,
+        gw,
+        2,
+        overallCaptainInfo,
+        2 + (rates?.tc_rate ?? 0),
+      );
     }
 
     const top10kId = top10kByGw.get(gw);
     let top10kCap: CaptainPlayer | null = null;
     if (top10kId !== undefined) {
-      top10kCap = playerForGw(top10kId, gw, 2);
+      const rates = top10kCaptainInfo.rates.get(playerGwKey(top10kId, gw));
+      top10kCap = playerForGw(
+        top10kId,
+        gw,
+        2,
+        top10kCaptainInfo,
+        2 + (rates?.tc_rate ?? 0),
+      );
     }
 
     const matchedTemplate =
@@ -336,7 +455,11 @@ export const getCaptainImpact = async (
       userCap.effective_points - (top10kCap?.effective_points ?? 0);
     const userCaptainBonus =
       userCap.raw_points * Math.max(userCap.multiplier - 1, 0);
-    const expectedCaptainBonus = captainExpectedBonus(gw, captainInfo, statsMap);
+    const expectedCaptainBonus = captainExpectedBonus(
+      gw,
+      captainInfo,
+      statsMap,
+    );
     const captaincyExcess =
       expectedCaptainBonus === null
         ? null
@@ -384,9 +507,7 @@ export const getCaptainImpact = async (
     ): e is CaptainEvent & {
       expected_captain_bonus: number;
       captaincy_excess: number;
-    } =>
-      e.expected_captain_bonus !== null &&
-      e.captaincy_excess !== null,
+    } => e.expected_captain_bonus !== null && e.captaincy_excess !== null,
   );
   const rankedEvents = eventsWithExpected.filter(
     (
