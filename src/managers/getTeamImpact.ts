@@ -3,7 +3,11 @@ import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks } from "./resolvePicks.js";
 import { rangeDensityFromBuckets, type Stratum } from "./rangeStats.js";
-import { pickRankBand, type RankBand } from "./rankBands.js";
+import {
+  pickRankBand,
+  RANK_BAND_SQL_CASE,
+  type RankBand,
+} from "./rankBands.js";
 
 // ----------------------------------------------------------------------------
 // Public response types. Mirrored on the frontend in
@@ -130,6 +134,13 @@ const STRATUM_B_MAX = 100_000;
 // EO computed from sample is unstable below this many picks rows for a GW.
 // When triggered we drop captain/TC uplift and use global ownership only.
 const SMALL_SAMPLE_THRESHOLD = 50;
+
+// Rank-band captain samples are intentionally narrower than broad strata:
+// they approximate the "near you" cohort LiveFPL-style when full-XV EO is
+// unavailable. We accept a smaller denominator here because captaincy gives a
+// hard lower bound on active ownership, while using broad stratum 3 can wash a
+// 100k-250k manager into the whole tail and massively understate template EO.
+const CAPTAIN_FALLBACK_SAMPLE_THRESHOLD = 10;
 
 // Density window for rank_per_point. We count sample managers within
 // ±W points of the user, divide by 2W to get managers-per-point, and
@@ -484,6 +495,78 @@ const fetchCaptainRatesInStratum = async (
   return { rates, perGwSampleSize };
 };
 
+const fetchCaptainRatesInRankBand = async (
+  rankBand: RankBand | null,
+  startGw: number,
+  endGw: number,
+): Promise<{
+  rates: Map<string, { cap_rate: number; tc_rate: number }>;
+  perGwSampleSize: Map<number, number>;
+}> => {
+  const rates = new Map<string, { cap_rate: number; tc_rate: number }>();
+  const perGwSampleSize = new Map<number, number>();
+  if (rankBand === null) return { rates, perGwSampleSize };
+
+  const sampleRows = await prisma.$queryRawUnsafe<
+    Array<{ gw: number; sample_size: number }>
+  >(
+    `
+    SELECT mp.gw, COUNT(*)::int AS sample_size
+    FROM manager_picks mp
+    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+    WHERE mp.gw BETWEEN $1 AND $2
+      AND mp.captain_element IS NOT NULL
+      AND mp.captain_multiplier IS NOT NULL
+      AND (${RANK_BAND_SQL_CASE}) = $3
+    GROUP BY mp.gw
+    `,
+    startGw,
+    endGw,
+    rankBand,
+  );
+  for (const r of sampleRows) perGwSampleSize.set(r.gw, r.sample_size);
+
+  const captainRows = await prisma.$queryRawUnsafe<
+    Array<{
+      gw: number;
+      captain_element: number;
+      captain_multiplier: number;
+      n: number;
+    }>
+  >(
+    `
+    SELECT
+      mp.gw,
+      mp.captain_element,
+      mp.captain_multiplier,
+      COUNT(*)::int AS n
+    FROM manager_picks mp
+    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+    WHERE mp.gw BETWEEN $1 AND $2
+      AND mp.captain_element IS NOT NULL
+      AND mp.captain_multiplier IS NOT NULL
+      AND (${RANK_BAND_SQL_CASE}) = $3
+    GROUP BY mp.gw, mp.captain_element, mp.captain_multiplier
+    `,
+    startGw,
+    endGw,
+    rankBand,
+  );
+  for (const r of captainRows) {
+    const sample = perGwSampleSize.get(r.gw) ?? 0;
+    if (sample === 0) continue;
+    const key = `${r.captain_element}:${r.gw}`;
+    const existing = rates.get(key) ?? { cap_rate: 0, tc_rate: 0 };
+    if (r.captain_multiplier === 3) {
+      existing.tc_rate += r.n / sample;
+    } else if (r.captain_multiplier === 2) {
+      existing.cap_rate += r.n / sample;
+    }
+    rates.set(key, existing);
+  }
+  return { rates, perGwSampleSize };
+};
+
 type PlayerExposure = {
   ownership_pct: number;
   eo: number;
@@ -737,7 +820,11 @@ const exposureForPlayerGw = (
     exposures: Map<string, PlayerExposure>;
     perGwSampleSize: Map<number, number>;
   },
-  capInfo: {
+  rankBandCapInfo: {
+    rates: Map<string, { cap_rate: number; tc_rate: number }>;
+    perGwSampleSize: Map<number, number>;
+  },
+  stratumCapInfo: {
     rates: Map<string, { cap_rate: number; tc_rate: number }>;
     perGwSampleSize: Map<number, number>;
   },
@@ -754,16 +841,23 @@ const exposureForPlayerGw = (
   }
 
   const ownershipPct = globalOwnershipPct(stat);
-  const cap = capInfo.rates.get(key);
-  const capSample = capInfo.perGwSampleSize.get(gw) ?? 0;
-  if (capSample >= SMALL_SAMPLE_THRESHOLD && cap) {
+  const rankBandCap = rankBandCapInfo.rates.get(key);
+  const rankBandCapSample = rankBandCapInfo.perGwSampleSize.get(gw) ?? 0;
+  const stratumCap = stratumCapInfo.rates.get(key);
+  const stratumCapSample = stratumCapInfo.perGwSampleSize.get(gw) ?? 0;
+  const cap =
+    rankBandCapSample >= CAPTAIN_FALLBACK_SAMPLE_THRESHOLD && rankBandCap
+      ? rankBandCap
+      : stratumCapSample >= SMALL_SAMPLE_THRESHOLD
+        ? stratumCap
+        : undefined;
+
+  if (cap) {
     // If the full-XV exposure sample is too light, we still have reliable
-    // captain/TC rates from `manager_picks`. A manager can only captain a
-    // player they actively own, so captain_rate + triple_captain_rate is a
-    // lower bound for this cohort's active ownership. Using only global
-    // ownership here badly undercounts EO on mass-captain/TC weeks, especially
-    // for elite cohorts where ownership can be ~100% while global ownership is
-    // much lower.
+    // captain/TC rates from `manager_picks`. A manager can only captain the
+    // player if they actively own him, so captain_rate + triple_captain_rate is
+    // a lower bound for cohort ownership. Prefer rank-band captaincy for
+    // "near you" EO, then fall back to the broader stratum sample.
     const captainOwnedPct = cap.cap_rate + cap.tc_rate;
     const activeOwnershipPct = Math.max(ownershipPct, captainOwnedPct);
     return {
@@ -846,15 +940,23 @@ export const getTeamImpact = async (
   // In parallel: footballer metadata, per-GW player points/ownership,
   // captain-rate sample data, rank density, and per-fixture match info
   // (so the frontend can show "vs ARS 2-1" alongside each per-GW row).
-  const [infoMap, statsMap, capInfo, exposureInfo, rankInfo, ownedMatchesMap] =
-    await Promise.all([
-      fetchFootballerInfo(elementIds),
-      fetchPlayerGwStats(elementIds, startGw, endGw),
-      fetchCaptainRatesInStratum(stratum, startGw, endGw),
-      fetchPlayerExposureInRankBand(rankBand, elementIds, startGw, endGw),
-      computeRankPerPoint(stratum, startGw, endGw, userRangeTotal),
-      fetchPlayerMatches(elementIds, finishedGws),
-    ]);
+  const [
+    infoMap,
+    statsMap,
+    rankBandCapInfo,
+    stratumCapInfo,
+    exposureInfo,
+    rankInfo,
+    ownedMatchesMap,
+  ] = await Promise.all([
+    fetchFootballerInfo(elementIds),
+    fetchPlayerGwStats(elementIds, startGw, endGw),
+    fetchCaptainRatesInRankBand(rankBand, startGw, endGw),
+    fetchCaptainRatesInStratum(stratum, startGw, endGw),
+    fetchPlayerExposureInRankBand(rankBand, elementIds, startGw, endGw),
+    computeRankPerPoint(stratum, startGw, endGw, userRangeTotal),
+    fetchPlayerMatches(elementIds, finishedGws),
+  ]);
 
   const smallSampleGws = new Set<number>();
   for (const [gw, n] of exposureInfo.perGwSampleSize.entries()) {
@@ -893,7 +995,8 @@ export const getTeamImpact = async (
       pick.gw,
       stat,
       exposureInfo,
-      capInfo,
+      rankBandCapInfo,
+      stratumCapInfo,
     );
     const ownershipPct = exposure.ownershipPct;
     const eo = exposure.eo;
@@ -1043,7 +1146,8 @@ export const getTeamImpact = async (
         gw,
         stat,
         killerExposureInfo,
-        capInfo,
+        rankBandCapInfo,
+        stratumCapInfo,
       );
       const ownershipPct = exposure.ownershipPct;
       const eo = exposure.eo;
