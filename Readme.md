@@ -231,6 +231,16 @@ npx prisma studio    # GUI to inspect the DB
 3. Commit the new migration folder under `prisma/migrations/`
 4. On the server, `npx prisma migrate deploy` will apply pending migrations
 
+### Local dev gotchas
+
+If `git fetch`/`git push` (or `ssh deploy@…`) hangs at a passphrase prompt, the SSH agent doesn't have your key loaded for this terminal session. Run once per session in a real terminal (not inside an editor's integrated shell):
+
+```bash
+ssh-add ~/.ssh/id_ed25519
+```
+
+The key is then cached for the lifetime of the agent. No global config change is needed.
+
 ---
 
 ## Production deployment (Hetzner)
