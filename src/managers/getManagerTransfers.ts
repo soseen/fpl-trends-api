@@ -49,10 +49,10 @@ export type TransferImpactPlayer = {
   //             actually produced — symmetric with IN at the
   //             never-doubled level.
   points_in_window: number;
-  // Estimated base rank impact over the same window, before captaincy.
-  // For IN players this is SUM((started_by_user − ownership_pct) × pts).
-  // For OUT players this is SUM((0 − ownership_pct × would_start_rate) × pts).
-  // Null when the manager has no usable rank-density sample.
+  // Estimated rank movement from this side of the transfer comparison.
+  // IN players are positive point contributions; OUT players are the
+  // counterfactual points left behind, so they are negative. Null when
+  // the manager has no usable rank-density sample.
   rank_impact: number | null;
   // Average selected-by percentage across scored fixture GWs in the window.
   avg_ownership_pct: number | null;
@@ -61,8 +61,9 @@ export type TransferImpactPlayer = {
 export type TransferImpactPair = {
   player_in: TransferImpactPlayer;
   player_out: TransferImpactPlayer;
-  net_points: number; // in.points_in_window − out.points_in_window
-  // player_in.rank_impact + player_out.rank_impact, before hit cost.
+  net_points: number; // in.points_in_window - out.points_in_window
+  // net_points translated through the manager's rank-density sample,
+  // before hit cost.
   net_rank_impact: number | null;
   // GW the IN player was later transferred out of the user's squad
   // (i.e. lastOwnedGw + 1). null when:
@@ -85,12 +86,12 @@ export type TransferImpactEvent = {
   gw: number;
   pairs: TransferImpactPair[];
   // Sum of pairs' net_points (no hit cost subtracted). Useful for the
-  // frontend's "11 − 4 = 7 pts" formula.
+  // frontend's "11 - 4 = 7 pts" formula.
   gross_net_points: number;
-  // Hits cost in raw points (e.g., 4 = one −4 hit, 8 = two). Subtracted
+  // Hits cost in raw points (e.g., 4 = one -4 hit, 8 = two). Subtracted
   // from gross to get combined.
   hits_cost: number;
-  // gross_net_points − hits_cost. Headline for the event card.
+  // gross_net_points - hits_cost. Headline for the event card.
   combined_net_points: number;
   gross_rank_impact: number | null;
   hits_rank_impact: number | null;
@@ -870,9 +871,20 @@ export const getManagerTransfers = async (
       rankContext.rank_per_point,
     );
     const netPoints = inPts - outPts;
+    const inTransferRankImpact =
+      rankContext.rank_per_point !== null
+        ? inPts * rankContext.rank_per_point
+        : null;
+    const outTransferRankImpact =
+      rankContext.rank_per_point !== null
+        ? -outPts * rankContext.rank_per_point
+        : null;
+    // Transfer rank impact is a counterfactual: what did this move gain or
+    // lose versus keeping the OUT player(s)? Unlike Team Impact, it should
+    // follow the transfer point diff itself, not field ownership excess.
     const pairRankImpact =
-      inRank.rankImpact !== null && outRank.rankImpact !== null
-        ? inRank.rankImpact + outRank.rankImpact
+      rankContext.rank_per_point !== null
+        ? netPoints * rankContext.rank_per_point
         : null;
     // sold_gw is informative only for non-FH transfers (FH auto-reverts
     // next GW so showing "GW t+1" on every FH tile is noise). Always
@@ -886,14 +898,14 @@ export const getManagerTransfers = async (
         t.in_element,
         meta.get(t.in_element),
         inPts,
-        inRank.rankImpact,
+        inTransferRankImpact,
         inRank.avgOwnershipPct,
       ),
       player_out: toPlayer(
         t.out_element,
         meta.get(t.out_element),
         outPts,
-        outRank.rankImpact,
+        outTransferRankImpact,
         outRank.avgOwnershipPct,
       ),
       net_points: netPoints,
