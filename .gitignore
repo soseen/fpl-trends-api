@@ -3,3 +3,8 @@ src/data/*
 src/!data/
 .env
 dist/
+
+local-api.dev.err.log
+local-api.dev.out.log
+local-api.err.log
+local-api.out.log
