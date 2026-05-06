@@ -757,9 +757,18 @@ const exposureForPlayerGw = (
   const cap = capInfo.rates.get(key);
   const capSample = capInfo.perGwSampleSize.get(gw) ?? 0;
   if (capSample >= SMALL_SAMPLE_THRESHOLD && cap) {
+    // If the full-XV exposure sample is too light, we still have reliable
+    // captain/TC rates from `manager_picks`. A manager can only captain a
+    // player they actively own, so captain_rate + triple_captain_rate is a
+    // lower bound for this cohort's active ownership. Using only global
+    // ownership here badly undercounts EO on mass-captain/TC weeks, especially
+    // for elite cohorts where ownership can be ~100% while global ownership is
+    // much lower.
+    const captainOwnedPct = cap.cap_rate + cap.tc_rate;
+    const activeOwnershipPct = Math.max(ownershipPct, captainOwnedPct);
     return {
-      ownershipPct,
-      eo: ownershipPct + cap.cap_rate + 2 * cap.tc_rate,
+      ownershipPct: activeOwnershipPct,
+      eo: activeOwnershipPct + cap.cap_rate + 2 * cap.tc_rate,
       usedRankBandExposure: false,
     };
   }
