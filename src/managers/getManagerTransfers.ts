@@ -725,6 +725,7 @@ export const getManagerTransfers = async (
   const emptyRankContext = {
     user_range_points: 0,
     stratum: null,
+    rank_band: null,
     stratum_avg_range_points: null,
     rank_per_point: null,
   };
@@ -870,8 +871,8 @@ export const getManagerTransfers = async (
     );
     const netPoints = inPts - outPts;
     const pairRankImpact =
-      rankContext.rank_per_point !== null
-        ? netPoints * rankContext.rank_per_point
+      inRank.rankImpact !== null && outRank.rankImpact !== null
+        ? inRank.rankImpact + outRank.rankImpact
         : null;
     // sold_gw is informative only for non-FH transfers (FH auto-reverts
     // next GW so showing "GW t+1" on every FH tile is noise). Always

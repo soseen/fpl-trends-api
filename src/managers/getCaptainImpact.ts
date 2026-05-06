@@ -2,6 +2,7 @@ import { prisma } from "../database/client.js";
 import { resolvePicks } from "./resolvePicks.js";
 import {
   captainExpectedBonus,
+  fetchCaptainRatesInRankBand,
   fetchCaptainRatesInStratum,
   fetchPlayerGwRankStats,
   ownershipPct,
@@ -9,6 +10,8 @@ import {
   resolveRankImpactContext,
   SMALL_CAPTAIN_SAMPLE_THRESHOLD,
 } from "./rankImpact.js";
+
+const RANK_BAND_CAPTAIN_SAMPLE_THRESHOLD = 10;
 
 // ----------------------------------------------------------------------------
 // Public response types. Mirrored on the frontend in
@@ -125,6 +128,34 @@ type FootballerMeta = {
   code: number | null;
   team_code: number | null;
   element_type: number | null;
+};
+
+const mergeCaptainRateInfo = (
+  rankBandInfo: Awaited<ReturnType<typeof fetchCaptainRatesInRankBand>>,
+  stratumInfo: Awaited<ReturnType<typeof fetchCaptainRatesInStratum>>,
+): Awaited<ReturnType<typeof fetchCaptainRatesInStratum>> => {
+  const rates = new Map<string, { cap_rate: number; tc_rate: number }>();
+  const perGwSampleSize = new Map<number, number>();
+  const gws = new Set<number>([
+    ...rankBandInfo.perGwSampleSize.keys(),
+    ...stratumInfo.perGwSampleSize.keys(),
+  ]);
+
+  for (const gw of gws) {
+    const rankBandSample = rankBandInfo.perGwSampleSize.get(gw) ?? 0;
+    const useRankBand = rankBandSample >= RANK_BAND_CAPTAIN_SAMPLE_THRESHOLD;
+    const source = useRankBand ? rankBandInfo : stratumInfo;
+    const sample = source.perGwSampleSize.get(gw) ?? 0;
+    if (sample === 0) continue;
+    perGwSampleSize.set(gw, sample);
+
+    const suffix = `:${gw}`;
+    for (const [key, rate] of source.rates.entries()) {
+      if (key.endsWith(suffix)) rates.set(key, rate);
+    }
+  }
+
+  return { rates, perGwSampleSize };
 };
 
 type CaptainGwDetail = {
@@ -289,12 +320,21 @@ export const getCaptainImpact = async (
     ],
   );
 
-  const [captainInfo, top10kCaptainInfo, overallCaptainInfo] =
-    await Promise.all([
-      fetchCaptainRatesInStratum(rankContext.stratum, startGw, endGw),
-      fetchCaptainRatesInStratum(1, startGw, endGw),
-      fetchCaptainRatesInStratum(null, startGw, endGw),
-    ]);
+  const [
+    rankBandCaptainInfo,
+    stratumCaptainInfo,
+    top10kCaptainInfo,
+    overallCaptainInfo,
+  ] = await Promise.all([
+    fetchCaptainRatesInRankBand(rankContext.rank_band, startGw, endGw),
+    fetchCaptainRatesInStratum(rankContext.stratum, startGw, endGw),
+    fetchCaptainRatesInStratum(1, startGw, endGw),
+    fetchCaptainRatesInStratum(null, startGw, endGw),
+  ]);
+  const captainInfo = mergeCaptainRateInfo(
+    rankBandCaptainInfo,
+    stratumCaptainInfo,
+  );
 
   // For each GW, the user's captain is whoever has the highest multiplier
   // — that's the player who actually got the captain bonus, accounting

@@ -8,6 +8,11 @@ import {
   stratumCMax,
   type Stratum,
 } from "./rangeStats.js";
+import {
+  pickRankBand,
+  RANK_BAND_SQL_CASE,
+  type RankBand,
+} from "./rankBands.js";
 
 export const RANK_DENSITY_HALF_WINDOW = 25;
 export const SMALL_CAPTAIN_SAMPLE_THRESHOLD = 50;
@@ -15,6 +20,7 @@ export const SMALL_CAPTAIN_SAMPLE_THRESHOLD = 50;
 export type RankImpactContext = {
   user_range_points: number;
   stratum: Stratum | null;
+  rank_band: RankBand | null;
   stratum_avg_range_points: number | null;
   rank_per_point: number | null;
 };
@@ -55,11 +61,18 @@ export const resolveRankImpactContext = async (
     stratumCMax(),
   ]);
 
-  const userRangePoints = (resolvedHistory.current ?? [])
-    .filter((ev) => ev.event >= startGw && ev.event <= endGw)
-    .reduce((acc, ev) => acc + netPointsForEvent(ev), 0);
+  const eventsInRange = (resolvedHistory.current ?? []).filter(
+    (ev) => ev.event >= startGw && ev.event <= endGw,
+  );
+  const userRangePoints = eventsInRange.reduce(
+    (acc, ev) => acc + netPointsForEvent(ev),
+    0,
+  );
 
-  const stratum = pickStratum(summary.summary_overall_rank, cMax);
+  const rangeEndOverallRank =
+    eventsInRange.find((ev) => ev.event === endGw)?.overall_rank ??
+    summary.summary_overall_rank;
+  const stratum = pickStratum(rangeEndOverallRank, cMax);
   const density = await rangeDensityFromBuckets(
     stratum,
     startGw,
@@ -71,6 +84,7 @@ export const resolveRankImpactContext = async (
   return {
     user_range_points: userRangePoints,
     stratum,
+    rank_band: pickRankBand(rangeEndOverallRank),
     stratum_avg_range_points: density.stratumAverage,
     rank_per_point: density.rankPerPoint,
   };
@@ -200,6 +214,78 @@ export const fetchCaptainRatesInStratum = async (
           endGw,
           stratum,
         );
+
+  for (const r of captainRows) {
+    const sample = perGwSampleSize.get(r.gw) ?? 0;
+    if (sample === 0) continue;
+
+    const key = playerGwKey(r.captain_element, r.gw);
+    const existing = rates.get(key) ?? { cap_rate: 0, tc_rate: 0 };
+    if (r.captain_multiplier === 3) {
+      existing.tc_rate += r.picks / sample;
+    } else if (r.captain_multiplier === 2) {
+      existing.cap_rate += r.picks / sample;
+    }
+    rates.set(key, existing);
+  }
+
+  return { rates, perGwSampleSize };
+};
+
+export const fetchCaptainRatesInRankBand = async (
+  rankBand: RankBand | null,
+  startGw: number,
+  endGw: number,
+): Promise<CaptainRateInfo> => {
+  const rates = new Map<string, CaptainRate>();
+  const perGwSampleSize = new Map<number, number>();
+  if (rankBand === null) return { rates, perGwSampleSize };
+
+  const sampleRows = await prisma.$queryRawUnsafe<
+    Array<{ gw: number; sample_size: number }>
+  >(
+    `
+    SELECT mp.gw, COUNT(*)::int AS sample_size
+    FROM manager_picks mp
+    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+    WHERE mp.gw BETWEEN $1 AND $2
+      AND mp.captain_element IS NOT NULL
+      AND mp.captain_multiplier IS NOT NULL
+      AND (${RANK_BAND_SQL_CASE}) = $3
+    GROUP BY mp.gw
+    `,
+    startGw,
+    endGw,
+    rankBand,
+  );
+  for (const r of sampleRows) perGwSampleSize.set(r.gw, r.sample_size);
+
+  const captainRows = await prisma.$queryRawUnsafe<
+    Array<{
+      gw: number;
+      captain_element: number;
+      captain_multiplier: number;
+      picks: number;
+    }>
+  >(
+    `
+    SELECT
+      mp.gw,
+      mp.captain_element,
+      mp.captain_multiplier,
+      COUNT(*)::int AS picks
+    FROM manager_picks mp
+    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+    WHERE mp.gw BETWEEN $1 AND $2
+      AND mp.captain_element IS NOT NULL
+      AND mp.captain_multiplier IS NOT NULL
+      AND (${RANK_BAND_SQL_CASE}) = $3
+    GROUP BY mp.gw, mp.captain_element, mp.captain_multiplier
+    `,
+    startGw,
+    endGw,
+    rankBand,
+  );
 
   for (const r of captainRows) {
     const sample = perGwSampleSize.get(r.gw) ?? 0;
