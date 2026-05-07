@@ -55,6 +55,7 @@ export const getFootballersWithHistoryAndFixtures = async () => {
           opponent_team: true,
           expected_goal_involvements: true,
           expected_goals: true,
+          expected_assists: true,
           expected_goals_conceded: true,
           defensive_contribution: true,
         },
