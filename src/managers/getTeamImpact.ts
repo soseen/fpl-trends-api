@@ -100,13 +100,15 @@ export type TeamImpactResponse = {
     fwd: TileSlot[];
   } | null;
   players: PlayerImpact[];
-  // Top 10 players the user did NOT have in their squad in the GW range
-  // who scored points and were widely owned in the stratum — i.e. they
-  // gave rank to other managers and so cost the user rank. `played_count`,
-  // `starts`, `captaincies`, `triple_captaincies`, and `points_for_user`
-  // are all 0 here. `raw_points` is the total points the player scored
-  // across the GWs the user didn't own them (= points the user "missed").
-  // `rank_impact` is signed and always non-positive.
+  // Top players the user did NOT have in their squad in the GW range who
+  // scored points and were widely owned in the stratum — i.e. they gave
+  // rank to other managers and so cost the user rank. The response normally
+  // contains the top 10, with the most damaging goalkeeper appended when no
+  // keeper made that flat top 10 so the pitch view can still render a full XI.
+  // `played_count`, `starts`, `captaincies`, `triple_captaincies`, and
+  // `points_for_user` are all 0 here. `raw_points` is the total points the
+  // player scored across the GWs the user didn't own them (= points the user
+  // "missed"). `rank_impact` is signed and always non-positive.
   rank_killers: PlayerImpact[];
   totals: {
     user_range_points: number;
@@ -1199,15 +1201,35 @@ export const getTeamImpact = async (
     }
 
     // Top 10 by lowest excess_total (most negative — biggest rank cost).
-    const top = Array.from(killerAccs.entries())
-      .sort((a, b) => a[1].excess_total - b[1].excess_total)
-      .slice(0, 10);
+    // If that flat list has no goalkeeper, append the most damaging keeper
+    // after the top 10. The pitch is an XI view, and a missing keeper leaves
+    // the visual formation looking broken even though the outfield ordering is
+    // mathematically correct.
+    const allKillersByCost = Array.from(killerAccs.entries()).sort(
+      (a, b) => a[1].excess_total - b[1].excess_total,
+    );
+    const killerInfoMap = await fetchFootballerInfo(
+      allKillersByCost.map(([id]) => id),
+    );
+    const top = allKillersByCost.slice(0, 10);
+    const hasTopGoalkeeper = top.some(
+      ([id]) => killerInfoMap.get(id)?.element_type === ELEMENT_TYPE_GK,
+    );
+    if (!hasTopGoalkeeper) {
+      const topIds = new Set(top.map(([id]) => id));
+      const goalkeeper = allKillersByCost.find(([id, acc]) => {
+        if (topIds.has(id)) return false;
+        if (acc.excess_total >= 0) return false;
+        return killerInfoMap.get(id)?.element_type === ELEMENT_TYPE_GK;
+      });
+      if (goalkeeper) top.push(goalkeeper);
+    }
 
     const killerPlayerIds = top.map(([id]) => id);
-    const [killerInfoMap, killerMatchesMap] = await Promise.all([
-      fetchFootballerInfo(killerPlayerIds),
-      fetchPlayerMatches(killerPlayerIds, finishedGws),
-    ]);
+    const killerMatchesMap = await fetchPlayerMatches(
+      killerPlayerIds,
+      finishedGws,
+    );
     for (const [playerId, acc] of top) {
       const info = killerInfoMap.get(playerId);
       if (!info) continue;
