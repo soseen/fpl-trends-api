@@ -390,8 +390,9 @@ model manager_cumulative {
 // One row per FPL transfer the manager has ever made (filtered to a range
 // at query time via gw). Sourced from `entry/{id}/transfers/`. Populated
 // opportunistically when the user queries their own /transfers or /comparison
-// endpoints; sample-wide transfer-log enrichment is optional via
-// MANAGER_INGEST_SAMPLE_TRANSFERS and normally disabled.
+// endpoints; sample-wide transfer-log enrichment is maintained by
+// populateManagers, with MANAGER_INGEST_SAMPLE_TRANSFERS available as a
+// rate-limit kill switch.
 //
 // Used by:
 //   - getManagerTransfers (per-user view, joins to history for points)

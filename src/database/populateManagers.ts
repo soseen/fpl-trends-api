@@ -118,13 +118,13 @@ const MAX_MANAGERS_PER_RUN = readEnvInt("MANAGER_MAX_PER_RUN", 20_000, 1_000);
 const BUDGET_A_WHILE_RUNNING = readEnvInt("MANAGER_BUDGET_A", 2_000, 0);
 const BUDGET_B_WHILE_RUNNING = readEnvInt("MANAGER_BUDGET_B", 5_000, 0);
 
-// Optional enrichment. Core rank/comparison reads only need entry history;
-// sample-side picks/transfers are expensive FPL calls and are hidden by the
-// API until a dedicated coverage model exists.
-const INGEST_SAMPLE_PICKS = readEnvBool("MANAGER_INGEST_SAMPLE_PICKS", false);
+// Sample-side enrichment used by My Trends captaincy, EO, and transfer-value
+// comparisons. The env flags remain as kill switches if FPL rate limiting gets
+// tight, but steady-state cron should keep future GWs complete by default.
+const INGEST_SAMPLE_PICKS = readEnvBool("MANAGER_INGEST_SAMPLE_PICKS", true);
 const INGEST_SAMPLE_TRANSFERS = readEnvBool(
   "MANAGER_INGEST_SAMPLE_TRANSFERS",
-  false,
+  true,
 );
 
 // Concurrency within each batch. Combined with the governor's inter-batch
@@ -320,7 +320,7 @@ const processEntry = async (
 ): Promise<ProcessOutcome> => {
   const existing = await prisma.manager_summary.findUnique({
     where: { entry_id: entryId },
-    select: { last_checked_gw: true },
+    select: { last_checked_gw: true, has_transfer_history: true },
   });
   if (existing?.last_checked_gw === currentGw) return "skipped";
 
@@ -375,6 +375,10 @@ const processEntry = async (
   const chipByGw = new Map(
     (history.chips ?? []).map((chip) => [chip.event, chip.name]),
   );
+  const currentEvent = (history.current ?? []).find(
+    (ev) => ev.event === currentGw,
+  );
+  const currentChip = chipByGw.get(currentGw) ?? null;
 
   // Write per-GW history for every manager — no activity classification.
   // Inactive / trolling / "abnormal" managers are valid sample data; the
@@ -402,9 +406,9 @@ const processEntry = async (
     });
   }
 
-  // Optional picks ingestion: fill in the latest finished GW for sample-side
-  // captain/chip experiments. Historical depth still belongs to
-  // `backfillPicks.ts`; by default the core sampler skips this extra FPL call.
+  // Fill in the latest finished GW for sample-side captaincy and EO. Historical
+  // depth still belongs to `backfillPicks.ts`; steady-state cron only needs the
+  // newly finished GW.
   if (INGEST_SAMPLE_PICKS) {
     await ingestPicksForMissingGws(entryId, currentGw, governor);
   }
@@ -414,10 +418,16 @@ const processEntry = async (
   // come from manager_history.active_chip, stored from the history payload.
   await rebuildCumulativeForEntry(entryId, stratum);
 
-  // Optional transfer-log ingestion. The comparison endpoint uses reliable
-  // transfer counts from entry history; transfer logs are only needed for
-  // future sample-side transfer-value experiments.
-  if (INGEST_SAMPLE_TRANSFERS) {
+  // Keep sample transfer logs current without refetching every unchanged
+  // manager on every GW pass. Fetch once for coverage, then again only when
+  // the newly finished GW could have appended transfer rows.
+  const shouldIngestTransfers =
+    INGEST_SAMPLE_TRANSFERS &&
+    (!existing?.has_transfer_history ||
+      (currentEvent?.event_transfers ?? 0) > 0 ||
+      currentChip === "wildcard" ||
+      currentChip === "freehit");
+  if (shouldIngestTransfers) {
     await ingestTransfersForEntry(entryId, governor);
   }
 
@@ -574,13 +584,10 @@ const ingestPicksForMissingGws = async (
   await persistPickElements(entryId, currentGw, payload.picks ?? []);
 };
 
-// One FPL fetch per manager visit, gated by `has_transfer_history`. The
-// transfer log is append-only on FPL's side so we don't need to refetch
-// for managers we've already ingested — but we do refetch when the cron
-// processes them again at a new GW (because `processEntry` short-circuits
-// via `last_checked_gw === currentGw` long before getting here, this only
-// runs when the entry has new GW history to record, which is the same
-// cadence at which they could have made new transfers).
+// One FPL fetch for managers missing transfer coverage, then again only when
+// the newly finished GW could have appended rows. The transfer log is
+// append-only on FPL's side, so managers with no new transfer/chip activity can
+// keep using their persisted rows.
 //
 // A failure leaves `has_transfer_history = false` so the next pass retries.
 const ingestTransfersForEntry = async (

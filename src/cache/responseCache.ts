@@ -1,12 +1,14 @@
 import crypto from "crypto";
 import type { Request, Response } from "express";
+import { prisma } from "../database/client.js";
 
 // Entry layout shared between global (e.g. /footballersData) and parameterised
 // (e.g. /api/manager/:id/comparison?start=...&end=...) cached responses.
 //
-// `expiresAt` is set to Number.POSITIVE_INFINITY for the global keys (they're
-// only ever invalidated by `invalidateCache()` from the populate flow) and
-// to `Date.now() + MANAGER_TTL_MS` for manager keys.
+// `expiresAt` is set to Number.POSITIVE_INFINITY for global keys. Global
+// freshness is keyed by a DB-stored populate version, so direct cron jobs can
+// invalidate the running API process without an HTTP callback. Manager keys
+// use `Date.now() + MANAGER_TTL_MS`.
 type Entry = {
   body: unknown;
   etag: string;
@@ -31,14 +33,43 @@ const inflight = new Map<string, Promise<Entry>>();
 // Manager-keyed entries are bounded by an LRU cap and a TTL. The cap
 // protects the process from a runaway distinct-key set (e.g. an attacker
 // scanning entry IDs); the TTL keeps the data fresh enough to track
-// 30-min populate cycles. Global keys (footballersData etc.) are
-// unaffected — they re-set expiresAt to Number.POSITIVE_INFINITY.
+// 30-min populate cycles. Global keys (footballersData etc.) are versioned by
+// the latest successful bulk populate and keep expiresAt at Infinity.
 const MANAGER_TTL_MS = 5 * 60 * 1000;
 const MANAGER_MAX_ENTRIES = 1000;
+const GLOBAL_CACHE_PREFIX = "global:";
+const DATA_REFRESH_VERSION_KEY = "bulk_data_refresh_version";
+
+let globalCacheVersion: string | null = null;
+
+const readGlobalCacheVersion = async (): Promise<string> => {
+  try {
+    const rows = await prisma.$queryRaw<Array<{ value: string }>>`
+      SELECT value FROM app_metadata WHERE key = ${DATA_REFRESH_VERSION_KEY}
+    `;
+    return rows[0]?.value ?? "unversioned";
+  } catch (err) {
+    console.warn(
+      "[responseCache] Could not read bulk data refresh version:",
+      (err as Error).message,
+    );
+    return globalCacheVersion ?? "unversioned";
+  }
+};
+
+const evictGlobalEntries = (): void => {
+  for (const key of Array.from(store.keys())) {
+    if (key.startsWith(GLOBAL_CACHE_PREFIX)) store.delete(key);
+  }
+  for (const key of Array.from(inflight.keys())) {
+    if (key.startsWith(GLOBAL_CACHE_PREFIX)) inflight.delete(key);
+  }
+};
 
 export const invalidateCache = (): void => {
   store.clear();
   inflight.clear();
+  globalCacheVersion = null;
   console.info("🧹 Response cache invalidated");
 };
 
@@ -117,14 +148,25 @@ const loadOrShare = (
 
 // Global-keyed cache, used for whole-endpoint responses that share one key
 // (e.g. /footballersData). Entries live until `invalidateCache()` is called
-// by the populate flow.
+// by the HTTP populate flow or the DB-stored populate version changes after
+// the direct cron flow.
 export const cachedJson = async (
   req: Request,
   res: Response,
   key: string,
   loader: () => Promise<unknown>,
 ): Promise<void> => {
-  const entry = await loadOrShare(key, Infinity, loader);
+  const version = await readGlobalCacheVersion();
+  if (globalCacheVersion !== null && version !== globalCacheVersion) {
+    evictGlobalEntries();
+  }
+  globalCacheVersion = version;
+
+  const entry = await loadOrShare(
+    `${GLOBAL_CACHE_PREFIX}${version}:${key}`,
+    Infinity,
+    loader,
+  );
   writeCached(req, res, entry);
 };
 

@@ -11,6 +11,18 @@ import { insertEvents } from "../events/insertEvents.js";
 import { insertTeamHistory } from "./insertTeamHistory.js";
 import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
 import { detectSeasonChange, performSeasonReset } from "./seasonManager.js";
+import { prisma } from "./client.js";
+
+const DATA_REFRESH_VERSION_KEY = "bulk_data_refresh_version";
+
+const markBulkDataRefreshComplete = async (): Promise<void> => {
+  const value = new Date().toISOString();
+  await prisma.$executeRaw`
+    INSERT INTO app_metadata (key, value)
+    VALUES (${DATA_REFRESH_VERSION_KEY}, ${value})
+    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+  `;
+};
 
 export const populateDatabase = async () => {
   try {
@@ -62,6 +74,8 @@ export const populateDatabase = async () => {
     console.info("Populating footballers history...");
     await insertFootballersHistory();
 
+    await markBulkDataRefreshComplete();
+
     console.info("✅ Database populated successfully!");
   } catch (error) {
     console.error("❌ Failed to populate the database:", error);
@@ -70,5 +84,9 @@ export const populateDatabase = async () => {
 };
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
-  await populateDatabase();
+  try {
+    await populateDatabase();
+  } finally {
+    await prisma.$disconnect();
+  }
 }
