@@ -102,9 +102,9 @@ export type TeamImpactResponse = {
   players: PlayerImpact[];
   // Top players the user did NOT have in their squad in the GW range who
   // scored points and were widely owned in the stratum — i.e. they gave
-  // rank to other managers and so cost the user rank. The response normally
-  // contains the top 10, with the most damaging goalkeeper appended when no
-  // keeper made that flat top 10 so the pitch view can still render a full XI.
+  // rank to other managers and so cost the user rank. The response contains
+  // the most damaging valid FPL XI when enough candidates exist, falling back
+  // to a flat top list only if the range cannot produce a full formation.
   // `played_count`, `starts`, `captaincies`, `triple_captaincies`, and
   // `points_for_user` are all 0 here. `raw_points` is the total points the
   // player scored across the GWs the user didn't own them (= points the user
@@ -705,6 +705,107 @@ const MAX_LIMITS: Record<PositionKey, number> = {
   FWD: 3,
 };
 
+const POSITION_KEYS: PositionKey[] = ["GK", "DEF", "MID", "FWD"];
+
+const emptyPositionCounts = (): Record<PositionKey, number> => ({
+  GK: 0,
+  DEF: 0,
+  MID: 0,
+  FWD: 0,
+});
+
+const countPositions = <T>(
+  candidates: T[],
+  getElementType: (candidate: T) => number,
+): Record<PositionKey, number> => {
+  const counts = emptyPositionCounts();
+  for (const candidate of candidates) {
+    const key = positionKey(getElementType(candidate));
+    if (key) counts[key]++;
+  }
+  return counts;
+};
+
+const hasValidFormation = <T>(
+  candidates: T[],
+  getElementType: (candidate: T) => number,
+): boolean => {
+  if (candidates.length !== 11) return false;
+  const counts = countPositions(candidates, getElementType);
+  return POSITION_KEYS.every(
+    (key) =>
+      counts[key] >= MIN_REQUIREMENTS[key] && counts[key] <= MAX_LIMITS[key],
+  );
+};
+
+const selectFormationXi = <T>(
+  sortedCandidates: T[],
+  getElementType: (candidate: T) => number,
+): T[] | null => {
+  const selected: T[] = [];
+  const positionCount: Record<PositionKey, number> = {
+    GK: 0,
+    DEF: 0,
+    MID: 0,
+    FWD: 0,
+  };
+
+  for (const candidate of sortedCandidates) {
+    const key = positionKey(getElementType(candidate));
+    if (!key) continue;
+    if (positionCount[key] >= MAX_LIMITS[key]) continue;
+    selected.push(candidate);
+    positionCount[key]++;
+    if (selected.length === 11) break;
+  }
+
+  // Repair: if we hit max for some positions before reaching min for others,
+  // swap the lowest-frequency picks of an over-min position for the highest-
+  // frequency available pick of a missing position.
+  let safety = 20;
+  while (
+    safety-- > 0 &&
+    POSITION_KEYS.some((key) => positionCount[key] < MIN_REQUIREMENTS[key])
+  ) {
+    const missing = POSITION_KEYS.find(
+      (key) => positionCount[key] < MIN_REQUIREMENTS[key],
+    );
+    if (!missing) break;
+
+    // Find the last-added removable player from a position currently above
+    // its minimum.
+    let removableIndex = -1;
+    for (let i = selected.length - 1; i >= 0; i--) {
+      const candidate = selected[i];
+      if (!candidate) continue;
+      const key = positionKey(getElementType(candidate));
+      if (key && positionCount[key] > MIN_REQUIREMENTS[key]) {
+        removableIndex = i;
+        break;
+      }
+    }
+    if (removableIndex === -1) break;
+
+    const [removable] = selected.splice(removableIndex, 1);
+    if (!removable) break;
+    const removeKey = positionKey(getElementType(removable));
+    if (!removeKey) break;
+    positionCount[removeKey]--;
+
+    const selectedSet = new Set(selected);
+    const replacement = sortedCandidates.find(
+      (candidate) =>
+        positionKey(getElementType(candidate)) === missing &&
+        !selectedSet.has(candidate),
+    );
+    if (!replacement) break;
+    selected.push(replacement);
+    positionCount[missing]++;
+  }
+
+  return hasValidFormation(selected, getElementType) ? selected : null;
+};
+
 const buildMostPlayedXi = (
   candidates: PlayerImpact[],
 ): TeamImpactResponse["most_played_xi"] => {
@@ -717,64 +818,8 @@ const buildMostPlayedXi = (
     return b.points_for_user - a.points_for_user;
   });
 
-  let selected: PlayerImpact[] = [];
-  const positionCount: Record<PositionKey, number> = {
-    GK: 0,
-    DEF: 0,
-    MID: 0,
-    FWD: 0,
-  };
-
-  for (const p of sorted) {
-    const key = positionKey(p.element_type);
-    if (!key) continue;
-    if (positionCount[key] >= MAX_LIMITS[key]) continue;
-    selected.push(p);
-    positionCount[key]++;
-    if (selected.length === 11) break;
-  }
-
-  // Repair: if we hit max for some positions before reaching min for others,
-  // swap the lowest-frequency picks of an over-min position for the highest-
-  // frequency available pick of a missing position.
-  let safety = 20;
-  while (
-    safety-- > 0 &&
-    (Object.keys(MIN_REQUIREMENTS) as PositionKey[]).some(
-      (k) => positionCount[k] < MIN_REQUIREMENTS[k],
-    )
-  ) {
-    const missing = (Object.keys(MIN_REQUIREMENTS) as PositionKey[]).find(
-      (k) => positionCount[k] < MIN_REQUIREMENTS[k],
-    );
-    if (!missing) break;
-
-    // Find the last-added removable player from a position currently above
-    // its minimum.
-    const removable = [...selected].reverse().find((p) => {
-      const k = positionKey(p.element_type);
-      if (!k) return false;
-      return positionCount[k] > MIN_REQUIREMENTS[k];
-    });
-    if (!removable) break;
-    const removeKey = positionKey(removable.element_type);
-    if (!removeKey) break;
-
-    selected = selected.filter((p) => p.player_id !== removable.player_id);
-    positionCount[removeKey]--;
-
-    const selectedIds = new Set(selected.map((p) => p.player_id));
-    const replacement = sorted.find(
-      (p) =>
-        positionKey(p.element_type) === missing &&
-        !selectedIds.has(p.player_id),
-    );
-    if (!replacement) break;
-    selected.push(replacement);
-    positionCount[missing]++;
-  }
-
-  if (selected.length < 11) return null;
+  const selected = selectFormationXi(sorted, (p) => p.element_type);
+  if (!selected) return null;
 
   const toTile = (p: PlayerImpact): TileSlot => ({
     player_id: p.player_id,
@@ -1200,30 +1245,26 @@ export const getTeamImpact = async (
       });
     }
 
-    // Top 10 by lowest excess_total (most negative — biggest rank cost).
-    // If that flat list has no goalkeeper, append the most damaging keeper
-    // after the top 10. The pitch is an XI view, and a missing keeper leaves
-    // the visual formation looking broken even though the outfield ordering is
-    // mathematically correct.
-    const allKillersByCost = Array.from(killerAccs.entries()).sort(
-      (a, b) => a[1].excess_total - b[1].excess_total,
-    );
+    // Rank-killer pitch selection: take the biggest rank costs while still
+    // producing a valid FPL formation. A flat top list can be all outfielders
+    // or miss the minimum DEF/MID/FWD counts, which leaves the pitch view in a
+    // shape that could never be fielded.
+    type KillerEntry = [number, KillerAcc];
+    const allKillersByCost: KillerEntry[] = Array.from(
+      killerAccs.entries(),
+    ).sort((a, b) => a[1].excess_total - b[1].excess_total);
     const killerInfoMap = await fetchFootballerInfo(
       allKillersByCost.map(([id]) => id),
     );
-    const top = allKillersByCost.slice(0, 10);
-    const hasTopGoalkeeper = top.some(
-      ([id]) => killerInfoMap.get(id)?.element_type === ELEMENT_TYPE_GK,
-    );
-    if (!hasTopGoalkeeper) {
-      const topIds = new Set(top.map(([id]) => id));
-      const goalkeeper = allKillersByCost.find(([id, acc]) => {
-        if (topIds.has(id)) return false;
-        if (acc.excess_total >= 0) return false;
-        return killerInfoMap.get(id)?.element_type === ELEMENT_TYPE_GK;
-      });
-      if (goalkeeper) top.push(goalkeeper);
-    }
+    const formationCandidates = allKillersByCost.filter(([id, acc]) => {
+      if (acc.excess_total >= 0) return false;
+      return positionKey(killerInfoMap.get(id)?.element_type ?? 0) !== null;
+    });
+    const top =
+      selectFormationXi(
+        formationCandidates,
+        ([id]) => killerInfoMap.get(id)?.element_type ?? 0,
+      ) ?? allKillersByCost.slice(0, 10);
 
     const killerPlayerIds = top.map(([id]) => id);
     const killerMatchesMap = await fetchPlayerMatches(

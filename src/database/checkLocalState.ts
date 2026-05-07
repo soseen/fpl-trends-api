@@ -8,9 +8,11 @@ import { prisma } from "./client.js";
 
 const main = async (): Promise<void> => {
   const summary = await prisma.$queryRaw<
-    Array<{ stratum: number; rows: bigint }>
+    Array<{ stratum: number; rows: bigint; chip_history: bigint }>
   >`
-    SELECT stratum, COUNT(*)::bigint AS rows
+    SELECT stratum,
+           COUNT(*)::bigint AS rows,
+           COUNT(*) FILTER (WHERE has_chip_history)::bigint AS chip_history
     FROM manager_summary
     GROUP BY stratum ORDER BY stratum
   `;
@@ -98,7 +100,9 @@ const main = async (): Promise<void> => {
 
   console.info("\nmanager_summary (sample membership):");
   for (const r of summary) {
-    console.info(`  stratum ${r.stratum}: ${r.rows} managers`);
+    console.info(
+      `  stratum ${r.stratum}: ${r.rows} managers (${r.chip_history} with chip history)`,
+    );
   }
 
   console.info("\nmanager_history (per-GW points for the sample):");
@@ -114,9 +118,7 @@ const main = async (): Promise<void> => {
     `  with captain_element NOT NULL: ${picks[0]?.with_captain ?? 0n}`,
   );
 
-  console.info(
-    "\nmanager_pick_elements (full XV cache, user + sample EO):",
-  );
+  console.info("\nmanager_pick_elements (full XV cache, user + sample EO):");
   console.info(
     `  ${pickElements[0]?.rows ?? 0n} rows across ${pickElements[0]?.managers ?? 0n} managers, ${pickElements[0]?.gws ?? 0n} distinct GWs`,
   );
@@ -199,6 +201,17 @@ const main = async (): Promise<void> => {
     );
   } else {
     console.info("  ✅ manager_picks reasonably covered.");
+  }
+
+  const sparseChipStrata = summary.filter(
+    (r) => Number(r.chip_history) < Number(r.rows) * 0.5,
+  );
+  if (sparseChipStrata.length > 0) {
+    console.info(
+      "  WARNING chip-history coverage is sparse - re-run `populate-managers` after a cursor-version repair or run `backfill-manager-chips` followed by cumulative/read-model rebuilds.",
+    );
+  } else {
+    console.info("  OK chip-history coverage looks healthy.");
   }
 
   if (captainBuckets === 0) {

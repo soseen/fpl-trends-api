@@ -141,6 +141,8 @@ const userCaptainBonusFromPicks = async (
   return bonus;
 };
 
+const COVERAGE_THRESHOLD = 0.5;
+
 // Per-stratum sample aggregates: averages of total_points, transfers,
 // hits, bench, captain_bonus, gw_score; chip rates; coverage counts.
 //
@@ -406,7 +408,10 @@ const sampleStratumAggregates = async (
   const hasH1 = startGw <= 19;
   const hasH2 = endGw > 19;
   const chipSampleSize = row.e_with_chips ?? 0;
-  const chipCoverageOk = chipSampleSize >= captainSampleMinimum(stratumFilter);
+  const chipCoverage = sampleSize > 0 ? chipSampleSize / sampleSize : 0;
+  const chipCoverageOk =
+    chipSampleSize >= captainSampleMinimum(stratumFilter) &&
+    chipCoverage >= COVERAGE_THRESHOLD;
   const chipRate = (played: number): number | null =>
     chipCoverageOk ? played / chipSampleSize : null;
 
@@ -435,8 +440,6 @@ const sampleStratumAggregates = async (
     with_chips_data: chipSampleSize,
   };
 };
-
-const COVERAGE_THRESHOLD = 0.5;
 
 const gateOnCoverage = (
   value: number | null,

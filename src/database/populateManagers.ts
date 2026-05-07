@@ -136,11 +136,14 @@ const CURSOR_KEY_B = "manager_ingest_cursor_b";
 const CURSOR_KEY_C = "manager_ingest_cursor_c";
 const SAMPLE_GW_KEY = "manager_sample_gw";
 // Bumped when cursor semantics change in a way that pre-existing cursor
-// values would be silently misinterpreted. v1 = raw page number (pre
+// values would be silently misinterpreted or when steady-state enrichment
+// needs a one-time same-GW repair pass. v1 = raw page number (pre
 // golden-step refactor). v2 = iteration index within a walk's `numSteps`.
 // v3 = bounded per-GW sample: completed walks stay complete until GW changes.
+// v4 = same-GW repair for chips/current picks after the prod GW35 pass ran
+// with sample-pick ingestion disabled.
 const CURSOR_FORMAT_KEY = "manager_walk_cursor_version";
-const CURRENT_CURSOR_FORMAT_VERSION = 3;
+const CURRENT_CURSOR_FORMAT_VERSION = 4;
 const LOCKFILE_PATH = path.join(os.tmpdir(), "fpl-populate-managers.lock");
 // Conservative max age — a normal run is ~13 min; anything older than this
 // can only mean the previous owner died without releasing.
@@ -310,6 +313,25 @@ const recordOutcome = (stats: Stats, o: ProcessOutcome): void => {
   else if (o === "out_of_stratum") stats.outOfStratum += 1;
 };
 
+const hasCompletePicksForGw = async (
+  entryId: number,
+  gw: number,
+): Promise<boolean> => {
+  if (gw < 1) return true;
+
+  const [existing, elementRows] = await Promise.all([
+    prisma.manager_picks.findUnique({
+      where: { entry_id_gw: { entry_id: entryId, gw } },
+      select: { gw: true },
+    }),
+    prisma.manager_pick_elements.count({
+      where: { entry_id: entryId, gw },
+    }),
+  ]);
+
+  return Boolean(existing && elementRows >= 15);
+};
+
 const processEntry = async (
   entryId: number,
   overallRank: number,
@@ -320,9 +342,28 @@ const processEntry = async (
 ): Promise<ProcessOutcome> => {
   const existing = await prisma.manager_summary.findUnique({
     where: { entry_id: entryId },
-    select: { last_checked_gw: true, has_transfer_history: true },
+    select: {
+      last_checked_gw: true,
+      has_chip_history: true,
+      has_transfer_history: true,
+    },
   });
-  if (existing?.last_checked_gw === currentGw) return "skipped";
+
+  const alreadyCheckedCurrentGw = existing?.last_checked_gw === currentGw;
+  const currentGwPicksComplete =
+    !INGEST_SAMPLE_PICKS ||
+    !alreadyCheckedCurrentGw ||
+    (await hasCompletePicksForGw(entryId, currentGw));
+  const needsTransferHistory =
+    INGEST_SAMPLE_TRANSFERS && !existing?.has_transfer_history;
+  if (
+    alreadyCheckedCurrentGw &&
+    existing.has_chip_history &&
+    currentGwPicksComplete &&
+    !needsTransferHistory
+  ) {
+    return "skipped";
+  }
 
   let history;
   try {
@@ -460,7 +501,7 @@ const CHIP_HALVES_BOUNDARY = 19;
 // the contribution is 0 — the comparison endpoint's sample average is
 // best-effort and converges as picks are filled in over subsequent
 // processEntry visits.
-const rebuildCumulativeForEntry = async (
+export const rebuildCumulativeForEntry = async (
   entryId: number,
   stratum: 1 | 2 | 3,
 ): Promise<void> => {

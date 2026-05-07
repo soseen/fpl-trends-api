@@ -2,6 +2,10 @@ import "dotenv/config";
 import { fileURLToPath } from "node:url";
 import { prisma } from "./client.js";
 import { fetchEntryHistory } from "../managers/fetchManager.js";
+import {
+  rebuildCumulativeForEntry,
+  rebuildStratumGwRunningStats,
+} from "./populateManagers.js";
 import { delay } from "../utils.js";
 
 const readEnvInt = (key: string, fallback: number, min = 1): number => {
@@ -34,10 +38,18 @@ const fetchPendingEntryIds = async (): Promise<number[]> => {
   return rows.map((r) => r.entry_id);
 };
 
+const isStratum = (value: number | null | undefined): value is 1 | 2 | 3 =>
+  value === 1 || value === 2 || value === 3;
+
 const persistOne = async (
   entryId: number,
   chips: ReadonlyArray<{ event: number; name: string }>,
 ): Promise<void> => {
+  const summary = await prisma.manager_summary.findUnique({
+    where: { entry_id: entryId },
+    select: { stratum: true },
+  });
+
   await prisma.$transaction(async (tx) => {
     await tx.$executeRawUnsafe(
       `UPDATE manager_history SET active_chip = NULL WHERE entry_id = $1`,
@@ -68,6 +80,11 @@ const persistOne = async (
       entryId,
     );
   });
+
+  const stratum = summary?.stratum;
+  if (isStratum(stratum)) {
+    await rebuildCumulativeForEntry(entryId, stratum);
+  }
 };
 
 const backfill = async (): Promise<void> => {
@@ -115,6 +132,14 @@ const backfill = async (): Promise<void> => {
   console.info(
     `[backfillManagerChips] Done. ${succeeded} succeeded, ${failed} failed, ${elapsedSec}s elapsed.`,
   );
+
+  if (succeeded > 0) {
+    const rebuildStarted = Date.now();
+    await rebuildStratumGwRunningStats();
+    console.info(
+      `[backfillManagerChips] stratum_gw_running_stats rebuilt in ${Math.round((Date.now() - rebuildStarted) / 1000)}s.`,
+    );
+  }
 };
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
