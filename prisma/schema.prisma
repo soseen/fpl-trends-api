@@ -513,6 +513,40 @@ model stratum_gw_running_stats {
   @@id([stratum, gw])
 }
 
+// Per-(stratum, start_gw, end_gw) precomputed avg net points per transfer.
+//
+// Replaces the per-request sampleAvgPtsPerTransfer query (manager_transfers
+// ⨝ history with a generate_series CTE × 3 calls) that dominated comparison
+// endpoint latency. Read path becomes a single PK lookup.
+//
+// `sum_per_manager_avg` is the SUM of (per-manager net / xfers) across
+// managers with ≥1 transfer in range; combined-stratum mean is recovered via
+// SUM(sum_per_manager_avg) / SUM(managers_with_xfers). Storing the sum/count
+// pair (instead of just an avg) is what lets stratum1, stratum12, and active
+// share rows.
+//
+// Rebuild cadence:
+//   - cron (rebuildManagerReadModels) → end_gw=currentGw column only (~30-90s).
+//     Older ranges drift slowly as new managers ingest; manual backfill
+//     resyncs.
+//   - npm run backfill-stratum-range-xfer-avg → full rebuild (~10-30 min).
+//
+// Uses the FULL ingested stratum-3 sample (no entry_id % 32 sub-sample);
+// accuracy improves over the previous request-time path.
+model stratum_range_xfer_avg {
+  stratum             Int
+  start_gw            Int
+  end_gw              Int
+  sum_per_manager_avg Float    @default(0)
+  managers_with_xfers Int      @default(0)
+  with_data           Int      @default(0)
+  stratum_size        Int      @default(0)
+  last_rebuilt        DateTime @updatedAt
+
+  @@id([stratum, start_gw, end_gw])
+  @@index([start_gw, end_gw, stratum])
+}
+
 // Histogram of manager range totals by stratum and GW range. Rebuilt from
 // manager_cumulative after populateManagers updates the sampled managers.
 // Hot reads use this for range-rank and team-impact rank-density estimates:

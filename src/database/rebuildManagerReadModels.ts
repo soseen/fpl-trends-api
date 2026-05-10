@@ -24,6 +24,9 @@ const main = async (): Promise<void> => {
     UNION ALL
     SELECT 'manager_range_score_buckets', COUNT(*)::bigint
     FROM manager_range_score_buckets
+    UNION ALL
+    SELECT 'stratum_range_xfer_avg', COUNT(*)::bigint
+    FROM stratum_range_xfer_avg
     ORDER BY table_name
   `;
 

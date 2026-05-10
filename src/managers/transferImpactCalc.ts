@@ -70,30 +70,37 @@ export const sumPointsInWindow = (
 // My Trends Transfer Impact section's headline byte-for-byte).
 
 // Sample-side aggregate: average net-points-per-transfer across managers
-// in the given stratum partition. One SQL call against
-// manager_transfers ⨝ manager_cumulative ⨝ history. Range-conditional on
-// (start_gw, end_gw) — can't be precomputed because each transfer's
-// points window depends on the query's end_gw.
+// in the given stratum partition. Reads from `stratum_range_xfer_avg`,
+// the per-(stratum, start_gw, end_gw) precomputed table rebuilt by
+// populateManagers (cron) and backfillStratumRangeXferAvg (OOB).
 //
-// Per-manager net: SUM(in_pts) - SUM(out_pts) over their transfers in
-// range, where in_pts / out_pts are the player's history points from
-// the transfer's gw through end_gw. Per-manager average: net / count.
-// Stratum average: AVG(per-manager average) across managers with at
-// least one transfer in range.
+// Range queries collapse to one indexed lookup per stratum, summed across
+// the requested strata. Replaces the per-request CTE that joined
+// manager_transfers ⨝ history with a generate_series — that path was the
+// dominant cost of /api/manager/:id/comparison (three calls in parallel,
+// ~18 s combined on cold cache).
 //
 // `stratumFilter`:
-//   "active"   → strata 1, 2, 3 (full sample, no activity filter)
+//   "active"   → strata 1, 2, 3 summed
+//   "stratum12"→ strata 1, 2 summed (top-100k comparator)
 //   "stratum1" → stratum 1 only (top-10k comparator)
 //
-// Returns null when no managers in the stratum have transfers in range.
-// `with_data` is the count of stratum managers that contributed at least
-// one transfer to the average; `stratum_size` is the population the
-// average is normalised against — used by gateOnCoverage.
+// Combined-stratum mean is computed as
+//   avg = SUM(sum_per_manager_avg) / SUM(managers_with_xfers)
+// — a weighted mean of per-stratum means, weighted by manager count. This
+// matches the previous request-time semantics where the per-request query
+// computed AVG(per-manager average) over all matching managers in one go.
 //
-// Stratum 3 is sub-sampled (1-in-8 by entry_id) to bound the manager_transfers
-// scan + per-transfer in/out point lookups. The sample mean is unbiased
-// regardless of sample density; sampling just trades a small std-dev
-// inflation for a roughly 8× reduction in per-request work.
+// Unlike the previous path, the precompute uses the FULL ingested
+// stratum-3 sample (no entry_id % 32 sub-sample). Sample mean is unbiased
+// either way; the larger N tightens the confidence interval.
+//
+// `with_data`: count of stratum managers with has_transfer_history=true.
+// `stratum_size`: total stratum population. Both are stored redundantly
+// per row in the precomputed table (don't depend on the range), so a
+// single SUM across the matching strata gives the combined values.
+// `gateOnMinimumSample` in getManagerComparison uses these to gate the
+// displayed value when coverage is too thin.
 export type SampleTransferNet = {
   avg: number | null;
   with_data: number;
@@ -106,87 +113,45 @@ export const sampleAvgPtsPerTransfer = async (
   endGw: number,
   stratumFilter: "active" | "stratum1" | "stratum12",
 ): Promise<SampleTransferNet> => {
-  // For "active" mode include all of stratum 1+2 plus a 1-in-32 sample of
-  // stratum 3 (entry_id % 32 = 0). The narrower sample (vs. 1/8 used in
-  // stratumCounts/computeRankPerPoint) is a per-query trade-off: each
-  // transfer triggers two scalar subqueries against `history`, so the
-  // total work scales with sampled-transfer count, not sampled-manager
-  // count. 1/32 keeps the cold-cache budget under ~3 s; the sample mean
-  // remains unbiased.
-  // For "stratum1" mode it's just stratum 1 (~10k entries — small enough
-  // not to need sampling).
-  const stratumClause =
+  const strata =
     stratumFilter === "stratum1"
-      ? `AND ms.stratum = 1`
+      ? [1]
       : stratumFilter === "stratum12"
-        ? `AND ms.stratum IN (1, 2)`
-        : `AND (ms.stratum IN (1, 2) OR (ms.stratum = 3 AND ms.entry_id % 32 = 0))`;
+        ? [1, 2]
+        : [1, 2, 3];
 
-  // Per-manager net + count via scalar subqueries on history (small,
-  // PK-indexed — ~30 k rows per season). The previous version filtered
-  // candidate managers via DISTINCT on manager_cumulative; here we filter
-  // directly via manager_summary, avoiding the cumulative scan entirely.
   const rows = await prisma.$queryRawUnsafe<
     Array<{
-      avg_pts_per_transfer: number | null;
-      with_transfers_data: number;
-      with_transfer_history: number;
-      stratum_size: number;
+      sum_per_manager_avg: number | null;
+      managers_with_xfers: number | null;
+      with_data: number | null;
+      stratum_size: number | null;
     }>
   >(
     `
-    WITH point_windows AS (
-      SELECT
-        h.footballer_id,
-        gw_series.gw,
-        SUM(h.total_points)::float AS pts
-      FROM generate_series($1::int, $2::int) AS gw_series(gw)
-      JOIN history h
-        ON h.round BETWEEN gw_series.gw AND $2
-      GROUP BY h.footballer_id, gw_series.gw
-    ),
-    per_manager AS (
-      SELECT
-        mt.entry_id,
-        SUM(COALESCE(in_pts.pts, 0) - COALESCE(out_pts.pts, 0))::float AS net,
-        COUNT(*)::int AS xfers
-      FROM manager_transfers mt
-      JOIN manager_summary ms ON ms.entry_id = mt.entry_id
-      LEFT JOIN point_windows in_pts
-        ON in_pts.footballer_id = mt.in_element
-       AND in_pts.gw = mt.gw
-      LEFT JOIN point_windows out_pts
-        ON out_pts.footballer_id = mt.out_element
-       AND out_pts.gw = mt.gw
-      WHERE mt.gw BETWEEN $1 AND $2
-        ${stratumClause}
-      GROUP BY mt.entry_id
-    )
     SELECT
-      AVG(per_manager.net / NULLIF(per_manager.xfers, 0))::float AS avg_pts_per_transfer,
-      COUNT(*)::int AS with_transfers_data,
-      (
-        SELECT COUNT(*)::int
-        FROM manager_summary ms
-        WHERE ms.has_transfer_history = true ${stratumClause}
-      ) AS with_transfer_history,
-      (
-        SELECT COUNT(*)::int
-        FROM manager_summary ms
-        WHERE TRUE ${stratumClause}
-      ) AS stratum_size
-    FROM per_manager
-    WHERE per_manager.xfers > 0
+      SUM(sum_per_manager_avg)::float AS sum_per_manager_avg,
+      SUM(managers_with_xfers)::int   AS managers_with_xfers,
+      SUM(with_data)::int             AS with_data,
+      SUM(stratum_size)::int          AS stratum_size
+    FROM stratum_range_xfer_avg
+    WHERE start_gw = $1 AND end_gw = $2 AND stratum = ANY($3::int[])
     `,
     startGw,
     endGw,
+    strata,
   );
 
   const row = rows[0];
+  const managers = row?.managers_with_xfers ?? 0;
+  const sum = row?.sum_per_manager_avg ?? 0;
   return {
-    avg: row?.avg_pts_per_transfer ?? null,
-    with_data: row?.with_transfer_history ?? 0,
-    with_transfers: row?.with_transfers_data ?? 0,
+    // Null when no managers in the requested strata had transfers in range
+    // (or when the row is missing — e.g. mid-rebuild, or end_gw beyond what
+    // the cron has refreshed). UI renders as "—" rather than zero.
+    avg: managers > 0 ? sum / managers : null,
+    with_data: row?.with_data ?? 0,
+    with_transfers: managers,
     stratum_size: row?.stratum_size ?? 0,
   };
 };

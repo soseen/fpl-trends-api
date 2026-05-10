@@ -980,6 +980,127 @@ export const rebuildStratumGwRunningStats = async (): Promise<void> => {
   ]);
 };
 
+// Per-(stratum, start_gw, end_gw) precomputed avg net points per transfer.
+// Replaces the per-request sampleAvgPtsPerTransfer query that dominated
+// comparison-endpoint latency. See stratum_range_xfer_avg in schema.prisma
+// for the model and read-path semantics.
+//
+// Two modes:
+//   - `endGwOnly` (cron): refresh only the rows for end_gw=currentGw.
+//     The aggregation cost scales with one end_gw column (~currentGw rows ×
+//     3 strata) instead of the full grid (~currentGw²/2 rows × 3). Older
+//     end_gws are left in place — they drift slightly as new managers
+//     ingest, but the drift is bounded (~few percent per cron) and a manual
+//     backfill resyncs.
+//   - no args (backfill): full rebuild of every (start_gw, end_gw) row.
+//     TRUNCATE then INSERT one (start_gw, end_gw) at a time so each query's
+//     working set stays bounded; total runtime is ~10-30 min on prod.
+//
+// Each per-(start_gw, end_gw) INSERT is structurally the same query that
+// sampleAvgPtsPerTransfer ran per request, just executed once per range
+// instead of once per request. The FULL stratum-3 ingested sample is used
+// (no entry_id % 32 sub-sample), which improves precision vs the previous
+// request-time path.
+export const rebuildStratumRangeXferAvg = async (options?: {
+  endGwOnly?: number;
+}): Promise<void> => {
+  const sampledGw = await prisma.manager_cumulative.aggregate({
+    _max: { gw: true },
+  });
+  const maxGw = sampledGw._max.gw ?? 0;
+  if (maxGw < 1) {
+    if (options?.endGwOnly === undefined) {
+      await prisma.$executeRawUnsafe(`TRUNCATE stratum_range_xfer_avg`);
+    }
+    return;
+  }
+
+  const endGws =
+    options?.endGwOnly !== undefined
+      ? options.endGwOnly >= 1 && options.endGwOnly <= maxGw
+        ? [options.endGwOnly]
+        : []
+      : Array.from({ length: maxGw }, (_, i) => i + 1);
+
+  if (options?.endGwOnly === undefined) {
+    await prisma.$executeRawUnsafe(`TRUNCATE stratum_range_xfer_avg`);
+  } else if (endGws.length > 0) {
+    // Brief inconsistency window (~1-3s per start_gw) where readers see
+    // missing rows for this end_gw column. Acceptable: read path returns
+    // null for missing rows, which the UI renders the same as
+    // not-enough-data. UPSERT would avoid the window but complicates the
+    // SQL; the gap is small enough not to bother.
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM stratum_range_xfer_avg WHERE end_gw = $1`,
+      options.endGwOnly,
+    );
+  }
+
+  for (const endGw of endGws) {
+    for (let startGw = 1; startGw <= endGw; startGw++) {
+      await prisma.$executeRawUnsafe(
+        `
+        INSERT INTO stratum_range_xfer_avg
+          (stratum, start_gw, end_gw, sum_per_manager_avg, managers_with_xfers,
+           with_data, stratum_size, last_rebuilt)
+        WITH point_windows AS (
+          SELECT h.footballer_id, gw_series.gw,
+                 SUM(h.total_points)::float AS pts
+          FROM generate_series($1::int, $2::int) AS gw_series(gw)
+          JOIN history h ON h.round BETWEEN gw_series.gw AND $2::int
+          GROUP BY h.footballer_id, gw_series.gw
+        ),
+        per_manager AS (
+          SELECT mt.entry_id, ms.stratum,
+                 SUM(COALESCE(in_pts.pts, 0) - COALESCE(out_pts.pts, 0))::float AS net,
+                 COUNT(*)::int AS xfers
+          FROM manager_transfers mt
+          JOIN manager_summary ms ON ms.entry_id = mt.entry_id
+          LEFT JOIN point_windows in_pts
+            ON in_pts.footballer_id = mt.in_element AND in_pts.gw = mt.gw
+          LEFT JOIN point_windows out_pts
+            ON out_pts.footballer_id = mt.out_element AND out_pts.gw = mt.gw
+          WHERE mt.gw BETWEEN $1::int AND $2::int
+            AND ms.stratum IN (1, 2, 3)
+          GROUP BY mt.entry_id, ms.stratum
+        ),
+        agg AS (
+          SELECT stratum,
+                 SUM(net / NULLIF(xfers, 0))::float AS sum_per_manager_avg,
+                 COUNT(*)::int AS managers_with_xfers
+          FROM per_manager
+          WHERE xfers > 0
+          GROUP BY stratum
+        ),
+        sizes AS (
+          SELECT stratum,
+                 COUNT(*) FILTER (WHERE has_transfer_history)::int AS with_data,
+                 COUNT(*)::int AS stratum_size
+          FROM manager_summary
+          WHERE stratum IN (1, 2, 3)
+          GROUP BY stratum
+        ),
+        strata AS (SELECT unnest(ARRAY[1, 2, 3]::int[]) AS stratum)
+        SELECT
+          st.stratum,
+          $1::int,
+          $2::int,
+          COALESCE(a.sum_per_manager_avg, 0)::float,
+          COALESCE(a.managers_with_xfers, 0)::int,
+          COALESCE(sz.with_data, 0)::int,
+          COALESCE(sz.stratum_size, 0)::int,
+          NOW()
+        FROM strata st
+        LEFT JOIN sizes sz ON sz.stratum = st.stratum
+        LEFT JOIN agg a ON a.stratum = st.stratum
+        `,
+        startGw,
+        endGw,
+      );
+    }
+  }
+};
+
 export const rebuildManagerRangeScoreBuckets = async (): Promise<void> => {
   const sampledGw = await prisma.manager_cumulative.aggregate({
     _max: { gw: true },
@@ -1050,6 +1171,25 @@ export const rebuildManagerReadModels = async (): Promise<void> => {
   console.info(
     `[populateManagers] manager_range_score_buckets rebuilt in ${Math.round((Date.now() - bucketStarted) / 1000)}s`,
   );
+
+  // Refresh only the latest end_gw column of stratum_range_xfer_avg —
+  // older end_gws drift slowly and are kept fresh by the manual backfill
+  // script (npm run backfill-stratum-range-xfer-avg). Full rebuild here
+  // would add ~10-30 min to every cron tick, blowing past the 15-min
+  // cycle budget. End_gw=current is what most users query (default UI
+  // ranges anchor at the current GW), so this is where freshness matters
+  // most.
+  const xferStarted = Date.now();
+  const sampledGw = await prisma.manager_cumulative.aggregate({
+    _max: { gw: true },
+  });
+  const currentGw = sampledGw._max.gw ?? 0;
+  if (currentGw >= 1) {
+    await rebuildStratumRangeXferAvg({ endGwOnly: currentGw });
+    console.info(
+      `[populateManagers] stratum_range_xfer_avg (end_gw=${currentGw}) rebuilt in ${Math.round((Date.now() - xferStarted) / 1000)}s`,
+    );
+  }
 };
 
 export const populateManagers = async (
