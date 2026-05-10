@@ -9,7 +9,6 @@ const ALL_STRATA: readonly Stratum[] = [1, 2, 3];
 
 export const stratumCMax = async (): Promise<number> => {
   const row = await prisma.events.aggregate({
-    where: { finished: true },
     _max: { ranked_count: true },
   });
   return row._max.ranked_count ?? STRATUM_C_MAX_FALLBACK;
@@ -117,39 +116,62 @@ export type RangeDensity = {
   stratumAverage: number | null;
 };
 
-export const rangeDensityFromBuckets = async (
+// Density of OVERALL season totals at the user's overall total (at end_gw)
+// within their stratum, plus the stratum's average RANGE total.
+//
+// rank_per_point: gaining +1 range point = +1 overall point, so the rank
+// movement is governed by the local density of overall totals around the
+// user's overall total. The earlier implementation read from
+// manager_range_score_buckets (range totals); for short ranges the range
+// distribution is much narrower than overall totals, which inflated the
+// coefficient by ≈ √(38 / N_range_gws). Querying manager_cumulative at
+// end_gw gives the correct local density.
+//
+// stratumAverage: average of (cumulative_at_end − cumulative_at_start_minus_1)
+// per manager — i.e. the average range total. Display-only on the response;
+// independent of rank_per_point math.
+export const rangeDensityFromCumulative = async (
   stratum: Stratum | null,
   startGw: number,
   endGw: number,
-  userRangeTotal: number,
+  userOverallTotal: number | null,
   halfWindow: number,
 ): Promise<RangeDensity> => {
-  if (stratum === null) return { rankPerPoint: null, stratumAverage: null };
-  const lo = userRangeTotal - halfWindow;
-  const hi = userRangeTotal + halfWindow;
+  if (stratum === null || userOverallTotal === null) {
+    return { rankPerPoint: null, stratumAverage: null };
+  }
+  const lo = userOverallTotal - halfWindow;
+  const hi = userOverallTotal + halfWindow;
+  const startMinusOne = startGw - 1;
 
   const [rows, trueSize] = await Promise.all([
     prisma.$queryRawUnsafe<
       Array<{
         sample_size: bigint | number | null;
         neighbours: bigint | number | null;
-        total_points: bigint | number | null;
+        sum_range_total: bigint | number | null;
       }>
     >(
       `
       SELECT
-        SUM(managers)::bigint AS sample_size,
-        SUM(managers) FILTER (WHERE range_total BETWEEN $4 AND $5)::bigint
-          AS neighbours,
-        SUM((range_total::bigint * managers::bigint))::bigint AS total_points
-      FROM manager_range_score_buckets
-      WHERE stratum = $1 AND start_gw = $2 AND end_gw = $3
+        COUNT(*)::bigint AS sample_size,
+        COUNT(*) FILTER (
+          WHERE c_end.cumulative_points BETWEEN $4 AND $5
+        )::bigint AS neighbours,
+        SUM(
+          c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0)
+        )::bigint AS sum_range_total
+      FROM manager_cumulative c_end
+      LEFT JOIN manager_cumulative c_start
+        ON c_start.entry_id = c_end.entry_id AND c_start.gw = $6
+      WHERE c_end.stratum = $1 AND c_end.gw = $3
       `,
       stratum,
       startGw,
       endGw,
       lo,
       hi,
+      startMinusOne,
     ),
     trueStratumSizes(endGw),
   ]);
@@ -161,13 +183,13 @@ export const rangeDensityFromBuckets = async (
   }
 
   const neighbours = toNumber(row.neighbours);
-  const totalPoints = toNumber(row.total_points);
+  const sumRangeTotal = toNumber(row.sum_range_total);
   const density = neighbours / Math.max(1, 2 * halfWindow);
   const extrapolation = trueSize[stratum] / sampleSize;
   const rankPerPoint = density * extrapolation;
 
   return {
     rankPerPoint: rankPerPoint > 0 ? rankPerPoint : null,
-    stratumAverage: totalPoints / sampleSize,
+    stratumAverage: sumRangeTotal / sampleSize,
   };
 };

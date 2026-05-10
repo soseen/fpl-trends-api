@@ -4,7 +4,7 @@ import { netPointsForEvent } from "./activityFilter.js";
 import { fetchEntryHistory, fetchEntrySummary } from "./fetchManager.js";
 import {
   pickStratum,
-  rangeDensityFromBuckets,
+  rangeDensityFromCumulative,
   stratumCMax,
   type Stratum,
 } from "./rangeStats.js";
@@ -69,15 +69,21 @@ export const resolveRankImpactContext = async (
     0,
   );
 
+  const rangeEndEvent = eventsInRange.find((ev) => ev.event === endGw);
   const rangeEndOverallRank =
-    eventsInRange.find((ev) => ev.event === endGw)?.overall_rank ??
-    summary.summary_overall_rank;
+    rangeEndEvent?.overall_rank ?? summary.summary_overall_rank;
+  // Cumulative season total at end_gw — used for density(overall_total) so
+  // that rank_per_point reflects how many managers are within ±halfWindow of
+  // the user in the OVERALL standings (which is what governs rank movement
+  // when the user gains range points).
+  const userOverallTotal =
+    rangeEndEvent?.total_points ?? summary.summary_overall_points;
   const stratum = pickStratum(rangeEndOverallRank, cMax);
-  const density = await rangeDensityFromBuckets(
+  const density = await rangeDensityFromCumulative(
     stratum,
     startGw,
     endGw,
-    userRangePoints,
+    userOverallTotal,
     RANK_DENSITY_HALF_WINDOW,
   );
 

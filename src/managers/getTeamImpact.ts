@@ -2,7 +2,7 @@ import { prisma } from "../database/client.js";
 import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks } from "./resolvePicks.js";
-import { rangeDensityFromBuckets, type Stratum } from "./rangeStats.js";
+import { rangeDensityFromCumulative, type Stratum } from "./rangeStats.js";
 import {
   pickRankBand,
   RANK_BAND_SQL_CASE,
@@ -646,12 +646,16 @@ const fetchPlayerExposureInRankBand = async (
   return { exposures, perGwSampleSize };
 };
 
-// rank_per_point coefficient at the user's range total.
+// rank_per_point coefficient at the user's overall total.
 //
-// Density = sample managers within ±RANK_DENSITY_HALF_WINDOW of user_total,
+// Density = sample managers in stratum whose cumulative_points at end_gw is
+// within ±RANK_DENSITY_HALF_WINDOW of the user's overall total at end_gw,
 // divided by (2 × half-window). Multiply by stratum extrapolation factor
-// (trueSize / probesWithHistory) — same ratio getRangeRank uses — to get
-// rank places per point.
+// (trueSize / sampleSize) to get rank places per point.
+//
+// Uses overall totals (not range totals) because adding +1 to a range total
+// adds +1 to the season total, and the rank movement is governed by the
+// local density of OVERALL totals around the user. See rangeStats.ts.
 //
 // Returns null if stratum can't be determined or the sample has no
 // neighbours of the user (e.g. very early in the season with sparse data).
@@ -659,13 +663,13 @@ const computeRankPerPoint = async (
   stratum: number | null,
   startGw: number,
   endGw: number,
-  userRangeTotal: number,
+  userOverallTotal: number | null,
 ): Promise<{ rank_per_point: number | null; stratum_avg: number | null }> => {
-  const density = await rangeDensityFromBuckets(
+  const density = await rangeDensityFromCumulative(
     stratum as Stratum | null,
     startGw,
     endGw,
-    userRangeTotal,
+    userOverallTotal,
     RANK_DENSITY_HALF_WINDOW,
   );
   return {
@@ -931,24 +935,24 @@ export const getTeamImpact = async (
     fetchEntrySummary(entryId),
     fetchEntryHistory(entryId),
     prisma.events.findMany({
-      where: { id: { gte: startGw, lte: endGw }, finished: true },
+      where: { id: { gte: startGw, lte: endGw } },
       select: { id: true },
     }),
   ]);
 
-  const finishedGws = events.map((e) => e.id).sort((a, b) => a - b);
-  const finishedSet = new Set(finishedGws);
+  const ingestedGws = events.map((e) => e.id).sort((a, b) => a - b);
+  const ingestedSet = new Set(ingestedGws);
 
   // User's per-GW range total from the FPL history payload (net of hits).
   const eventsInRange = (history.current ?? []).filter((ev) =>
-    finishedSet.has(ev.event),
+    ingestedSet.has(ev.event),
   );
   const userRangeTotal = eventsInRange.reduce(
     (acc, ev) => acc + netPointsForEvent(ev),
     0,
   );
 
-  if (finishedGws.length === 0) {
+  if (ingestedGws.length === 0) {
     return {
       entry_id: entryId,
       start_gw: startGw,
@@ -970,16 +974,21 @@ export const getTeamImpact = async (
     };
   }
 
+  const rangeEndGw = Math.max(...ingestedGws);
+  const rangeEndEvent = eventsInRange.find((ev) => ev.event === rangeEndGw);
   const rankBasisOverallRank =
-    eventsInRange.find((ev) => ev.event === Math.max(...finishedGws))
-      ?.overall_rank ?? summary.summary_overall_rank;
+    rangeEndEvent?.overall_rank ?? summary.summary_overall_rank;
   // Prefer the user's rank at the end of this range, falling back to current
   // rank for unusual payloads.
   const stratum = pickStratum(rankBasisOverallRank);
   const rankBand = pickRankBand(rankBasisOverallRank);
+  // Cumulative season total at end_gw — the input to rank_per_point density.
+  // See computeRankPerPoint comment for why overall (not range) total.
+  const userOverallTotal =
+    rangeEndEvent?.total_points ?? summary.summary_overall_points;
 
   // Resolve picks (DB cache + FPL fallback for any missing GWs).
-  const { picks, incomplete } = await resolvePicks(entryId, finishedGws);
+  const { picks, incomplete } = await resolvePicks(entryId, ingestedGws);
 
   // Element ids the user owned at any GW in the range.
   const elementIds = Array.from(new Set(picks.map((p) => p.element_id)));
@@ -1001,8 +1010,8 @@ export const getTeamImpact = async (
     fetchCaptainRatesInRankBand(rankBand, startGw, endGw),
     fetchCaptainRatesInStratum(stratum, startGw, endGw),
     fetchPlayerExposureInRankBand(rankBand, elementIds, startGw, endGw),
-    computeRankPerPoint(stratum, startGw, endGw, userRangeTotal),
-    fetchPlayerMatches(elementIds, finishedGws),
+    computeRankPerPoint(stratum, startGw, endGw, userOverallTotal),
+    fetchPlayerMatches(elementIds, ingestedGws),
   ]);
 
   const smallSampleGws = new Set<number>();
@@ -1010,7 +1019,7 @@ export const getTeamImpact = async (
     if (n < SMALL_SAMPLE_THRESHOLD) smallSampleGws.add(gw);
   }
   // GWs we don't have any sample for at all → also treat as small-sample.
-  for (const gw of finishedGws) {
+  for (const gw of ingestedGws) {
     if (!exposureInfo.perGwSampleSize.has(gw)) smallSampleGws.add(gw);
   }
 
@@ -1031,7 +1040,7 @@ export const getTeamImpact = async (
   const accumulators = new Map<number, Acc>();
 
   for (const pick of picks) {
-    if (!finishedSet.has(pick.gw)) continue;
+    if (!ingestedSet.has(pick.gw)) continue;
     const info = infoMap.get(pick.element_id);
     if (!info) continue;
 
@@ -1155,7 +1164,7 @@ export const getTeamImpact = async (
     // meaningful sense; the user had the option to play them.
     const userOwnedKeys = new Set(picks.map((p) => `${p.element_id}:${p.gw}`));
 
-    const allStats = await fetchAllPlayerGwStats(finishedGws);
+    const allStats = await fetchAllPlayerGwStats(ingestedGws);
     const allScoringPlayerIds = Array.from(
       new Set(
         Array.from(allStats.keys())
@@ -1269,7 +1278,7 @@ export const getTeamImpact = async (
     const killerPlayerIds = top.map(([id]) => id);
     const killerMatchesMap = await fetchPlayerMatches(
       killerPlayerIds,
-      finishedGws,
+      ingestedGws,
     );
     for (const [playerId, acc] of top) {
       const info = killerInfoMap.get(playerId);
