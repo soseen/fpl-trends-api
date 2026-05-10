@@ -2,9 +2,13 @@ node_modules/
 src/data/*
 src/!data/
 .env
+.env.bak*
+.env.*.bak
 dist/
 
 local-api.dev.err.log
 local-api.dev.out.log
 local-api.err.log
 local-api.out.log
+*.log
+logs/
