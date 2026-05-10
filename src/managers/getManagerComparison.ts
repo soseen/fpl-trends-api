@@ -470,6 +470,28 @@ const captainSampleMinimum = (
   return 1_500;
 };
 
+// Per-stratum sample aggregates for captain stats. Two precomputed reads,
+// no per-request LATERAL joins:
+//
+// 1. avg_bonus — average captain bonus across managers with FULL picks
+//    coverage in [startGw..endGw]. Reads cumulative_captain_bonus and
+//    picks_count_cum from manager_cumulative; range delta of
+//    picks_count_cum equals expectedGws iff the manager has a picks row
+//    at every GW in the range. Same accuracy gate as the previous slow
+//    path (which ran COUNT(DISTINCT mp.gw) = expectedGws over
+//    manager_picks ⨝ history with a LATERAL captain-points subquery).
+//    Both numbers monotonically converge as backfillPicks fills history.
+//
+// 2. most_captained — sum of pick counts across stratum_captain_picks_gw
+//    in the range, take argmax. Tiny precomputed table (~17k rows total),
+//    rebuilt at the end of each populateManagers run. Trade-off vs. the
+//    previous "complete-coverage-only most-captained": partial-coverage
+//    managers contribute their captain choices for ingested GWs, so a
+//    minority of partially-ingested managers can shift the argmax. In
+//    practice the most-captained over a range is a high-popularity
+//    player and this drift is rare; the captain_average_partial flag
+//    surfaced in the response notes lets the UI hedge the label when
+//    coverage is below threshold.
 const sampleCaptainAggregate = async (
   startGw: number,
   endGw: number,
@@ -490,71 +512,58 @@ const sampleCaptainAggregate = async (
   const minimum = captainSampleMinimum(stratumFilter);
 
   const [bonusRows, mostRows] = await Promise.all([
+    // Two anchored lookups (gw=endGw and gw=startGw-1) joined by
+    // entry_id, filtered to managers whose picks_count_cum delta equals
+    // expectedGws (full coverage in the range). Range captain bonus per
+    // manager = cumulative_captain_bonus[end] − cumulative_captain_bonus[start-1].
+    // start row is null for ranges starting at GW 1 — COALESCE to 0.
     prisma.$queryRawUnsafe<
       Array<{ avg_bonus: number | null; complete_managers: number }>
     >(
       `
-      WITH per_manager AS (
-        SELECT
-          mp.entry_id,
-          COUNT(DISTINCT mp.gw)::int AS gws_with_picks,
-          SUM(
-            CASE
-              WHEN mp.captain_multiplier IS NOT NULL
-               AND mp.captain_multiplier > 1
-              THEN COALESCE(h.pts, 0) * (mp.captain_multiplier - 1)
-              ELSE 0
-            END
-          )::float AS captain_bonus
-        FROM manager_picks mp
-        JOIN manager_summary ms ON ms.entry_id = mp.entry_id
-        LEFT JOIN LATERAL (
-          SELECT SUM(total_points)::int AS pts
-          FROM history h
-          WHERE h.footballer_id = mp.captain_element
-            AND h.round = mp.gw
-        ) h ON TRUE
-        WHERE mp.gw BETWEEN $1 AND $2
-          AND ms.stratum = ANY($3::int[])
-        GROUP BY mp.entry_id
+      WITH e AS (
+        SELECT entry_id, cumulative_captain_bonus, picks_count_cum
+        FROM manager_cumulative
+        WHERE gw = $2 AND stratum = ANY($3::int[])
+      ),
+      s AS (
+        SELECT entry_id, cumulative_captain_bonus, picks_count_cum
+        FROM manager_cumulative
+        WHERE gw = $1 - 1 AND stratum = ANY($3::int[])
       )
       SELECT
-        AVG(captain_bonus)::float AS avg_bonus,
+        AVG(
+          e.cumulative_captain_bonus
+            - COALESCE(s.cumulative_captain_bonus, 0)
+        )::float AS avg_bonus,
         COUNT(*)::int AS complete_managers
-      FROM per_manager
-      WHERE gws_with_picks = $4
+      FROM e
+      LEFT JOIN s USING (entry_id)
+      WHERE (e.picks_count_cum - COALESCE(s.picks_count_cum, 0)) = $4
       `,
       startGw,
       endGw,
       strata,
       expectedGws,
     ),
+    // Most-captained over the range from the precomputed pick-counts
+    // table. Filters captain_multiplier >= 2 to exclude rows where the
+    // intended captain was benched (multiplier 0) and the vice took
+    // over for the actual bonus.
     prisma.$queryRawUnsafe<Array<{ captain_element: number; picks: number }>>(
       `
-      WITH complete_managers AS (
-        SELECT mp.entry_id
-        FROM manager_picks mp
-        JOIN manager_summary ms ON ms.entry_id = mp.entry_id
-        WHERE mp.gw BETWEEN $1 AND $2
-          AND ms.stratum = ANY($3::int[])
-        GROUP BY mp.entry_id
-        HAVING COUNT(DISTINCT mp.gw) = $4
-      )
-      SELECT mp.captain_element, COUNT(*)::int AS picks
-      FROM manager_picks mp
-      JOIN complete_managers cm ON cm.entry_id = mp.entry_id
-      WHERE mp.gw BETWEEN $1 AND $2
-        AND mp.captain_element IS NOT NULL
-        AND mp.captain_multiplier IS NOT NULL
-        AND mp.captain_multiplier >= 2
-      GROUP BY mp.captain_element
+      SELECT captain_element, SUM(picks)::int AS picks
+      FROM stratum_captain_picks_gw
+      WHERE stratum = ANY($3::int[])
+        AND gw BETWEEN $1 AND $2
+        AND captain_multiplier >= 2
+      GROUP BY captain_element
       ORDER BY picks DESC
       LIMIT 1
       `,
       startGw,
       endGw,
       strata,
-      expectedGws,
     ),
   ]);
 
@@ -625,7 +634,7 @@ export const getManagerComparison = async (
   // ---- Per-event aggregates from our DB (whole-population averages from
   // FPL's own per-GW counts; orthogonal to the sampled stratum stats).
   const events = await prisma.events.findMany({
-    where: { id: { gte: startGw, lte: endGw }, finished: true },
+    where: { id: { gte: startGw, lte: endGw } },
     select: {
       id: true,
       average_entry_score: true,
@@ -634,7 +643,7 @@ export const getManagerComparison = async (
       chip_plays: true,
     },
   });
-  const finishedGws = events.map((e) => e.id).sort((a, b) => a - b);
+  const ingestedGws = events.map((e) => e.id).sort((a, b) => a - b);
 
   let avgTotalPoints = 0;
   let avgTransfersTotal = 0;
@@ -693,7 +702,7 @@ export const getManagerComparison = async (
     sampleAvgPtsPerTransfer(startGw, endGw, "active"),
     sampleAvgPtsPerTransfer(startGw, endGw, "stratum12"),
     sampleAvgPtsPerTransfer(startGw, endGw, "stratum1"),
-    resolvePicks(entryId, finishedGws),
+    resolvePicks(entryId, ingestedGws),
     computeUserTransferNet(entryId, startGw, endGw),
   ]);
 
@@ -757,7 +766,7 @@ export const getManagerComparison = async (
   // picks. Every is_captain row already carries the post-autosub
   // multiplier; filter to multiplier > 1 (captain doubled) and join
   // with `history` for the captain's GW points in one query.
-  const userCaptains = captainPicksFromResolved(userPicks, finishedGws);
+  const userCaptains = captainPicksFromResolved(userPicks, ingestedGws);
   const userCaptainsForBonus = userCaptains.filter(
     (
       c,
@@ -894,7 +903,7 @@ export const getManagerComparison = async (
     avg_gw_score: {
       user: userGwScore,
       average:
-        finishedGws.length > 0 ? avgTotalPoints / finishedGws.length : null,
+        ingestedGws.length > 0 ? avgTotalPoints / ingestedGws.length : null,
       top100k_average: top100kAgg.avg_gw_score,
       top10k_average: top10kAgg.avg_gw_score,
     },

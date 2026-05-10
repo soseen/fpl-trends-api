@@ -65,6 +65,7 @@ const backfill = async (): Promise<void> => {
          chip_freehit_h1,  chip_freehit_h2,
          chip_bboost_h1,   chip_bboost_h2,
          has_transfers, has_hits, has_bench,
+         picks_count_cum,
          stratum)
       SELECT
         base.entry_id,
@@ -85,6 +86,7 @@ const backfill = async (): Promise<void> => {
         BOOL_OR(base.event_transfers      IS NOT NULL) OVER w AS has_transfers,
         BOOL_OR(base.event_transfers_cost IS NOT NULL) OVER w AS has_hits,
         BOOL_OR(base.points_on_bench      IS NOT NULL) OVER w AS has_bench,
+        (SUM(base.has_picks)                         OVER w)::int AS picks_count_cum,
         base.stratum
       FROM (
         SELECT
@@ -92,6 +94,7 @@ const backfill = async (): Promise<void> => {
           mh.event_transfers, mh.event_transfers_cost, mh.points_on_bench,
           mh.active_chip,
           ms.stratum,
+          CASE WHEN mp.gw IS NOT NULL THEN 1 ELSE 0 END AS has_picks,
           COALESCE(
             CASE
               WHEN mp.captain_multiplier IS NOT NULL AND mp.captain_multiplier > 1 THEN
@@ -126,6 +129,7 @@ const backfill = async (): Promise<void> => {
         has_transfers            = EXCLUDED.has_transfers,
         has_hits                 = EXCLUDED.has_hits,
         has_bench                = EXCLUDED.has_bench,
+        picks_count_cum          = EXCLUDED.picks_count_cum,
         stratum                  = EXCLUDED.stratum
     `;
     totalRows += rowCount;

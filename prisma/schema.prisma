@@ -370,6 +370,13 @@ model manager_cumulative {
   has_transfers            Boolean @default(false) // BOOL_OR(event_transfers IS NOT NULL)      — coverage gate
   has_hits                 Boolean @default(false) // BOOL_OR(event_transfers_cost IS NOT NULL) — coverage gate
   has_bench                Boolean @default(false) // BOOL_OR(points_on_bench IS NOT NULL)      — coverage gate
+  // Running count of GWs in [1..gw] where the manager has a row in
+  // manager_picks. Range delta (cum[end] − cum[start−1]) gives the count
+  // of GWs in [start..end] with picks ingested; equals end−start+1 iff
+  // the manager has full picks coverage in the range. Lets
+  // sampleCaptainAggregate gate to complete-coverage managers without a
+  // per-request COUNT(DISTINCT mp.gw) over manager_picks.
+  picks_count_cum          Int     @default(0)
   stratum                  Int // denormalised from manager_summary
 
   manager manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)

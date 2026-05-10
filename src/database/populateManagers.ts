@@ -249,14 +249,25 @@ const writeIntCursor = async (key: string, value: number): Promise<void> => {
   `;
 };
 
-const getCurrentFinishedGw = async (): Promise<number> => {
+type SampleGameweek = {
+  gw: number;
+  isLive: boolean;
+};
+
+const getCurrentSampleGameweek = async (): Promise<SampleGameweek> => {
   const rows = await prisma.events.findMany({
-    where: { finished: true },
-    select: { id: true },
+    where: {
+      OR: [{ is_current: true }, { finished: true }],
+    },
+    select: { id: true, finished: true, is_current: true },
     orderBy: { id: "desc" },
     take: 1,
   });
-  return rows[0]?.id ?? 0;
+  const event = rows[0];
+  return {
+    gw: event?.id ?? 0,
+    isLive: Boolean(event?.is_current && !event.finished),
+  };
 };
 
 const MAX_PER_CALL_RETRIES = 4;
@@ -338,6 +349,7 @@ const processEntry = async (
   totalPoints: number,
   stratum: 1 | 2 | 3,
   currentGw: number,
+  isLiveCurrentGw: boolean,
   governor: RateLimitGovernor,
 ): Promise<ProcessOutcome> => {
   const existing = await prisma.manager_summary.findUnique({
@@ -357,6 +369,7 @@ const processEntry = async (
   const needsTransferHistory =
     INGEST_SAMPLE_TRANSFERS && !existing?.has_transfer_history;
   if (
+    !isLiveCurrentGw &&
     alreadyCheckedCurrentGw &&
     existing.has_chip_history &&
     currentGwPicksComplete &&
@@ -447,9 +460,9 @@ const processEntry = async (
     });
   }
 
-  // Fill in the latest finished GW for sample-side captaincy and EO. Historical
-  // depth still belongs to `backfillPicks.ts`; steady-state cron only needs the
-  // newly finished GW.
+  // Fill in the latest sampled GW for captaincy and EO. During live GWs this
+  // is the current GW, so My Trends can converge while matches are still
+  // being played.
   if (INGEST_SAMPLE_PICKS) {
     await ingestPicksForMissingGws(entryId, currentGw, governor);
   }
@@ -517,6 +530,7 @@ export const rebuildCumulativeForEntry = async (
          chip_freehit_h1,  chip_freehit_h2,
          chip_bboost_h1,   chip_bboost_h2,
          has_transfers, has_hits, has_bench,
+         picks_count_cum,
          stratum)
       SELECT
         base.entry_id, base.gw,
@@ -536,12 +550,14 @@ export const rebuildCumulativeForEntry = async (
         BOOL_OR(base.event_transfers      IS NOT NULL) OVER w AS has_transfers,
         BOOL_OR(base.event_transfers_cost IS NOT NULL) OVER w AS has_hits,
         BOOL_OR(base.points_on_bench      IS NOT NULL) OVER w AS has_bench,
+        (SUM(base.has_picks)                         OVER w)::int AS picks_count_cum,
         $2
       FROM (
         SELECT
           mh.entry_id, mh.gw, mh.points,
           mh.event_transfers, mh.event_transfers_cost, mh.points_on_bench,
           mh.active_chip,
+          CASE WHEN mp.gw IS NOT NULL THEN 1 ELSE 0 END AS has_picks,
           COALESCE(
             CASE
               WHEN mp.captain_multiplier IS NOT NULL AND mp.captain_multiplier > 1 THEN
@@ -568,7 +584,7 @@ export const rebuildCumulativeForEntry = async (
   });
 };
 
-// Inline picks ingestion: fetch picks for the LATEST finished GW only,
+// Inline picks ingestion: fetch picks for the latest sampled GW only,
 // and only if not already stored for this manager. Historical depth is
 // the job of `backfillPicks.ts` — keeping the cron path bounded to one
 // extra FPL call per manager per run means the steady-state load is
@@ -626,7 +642,7 @@ const ingestPicksForMissingGws = async (
 };
 
 // One FPL fetch for managers missing transfer coverage, then again only when
-// the newly finished GW could have appended rows. The transfer log is
+// the latest sampled GW could have appended rows. The transfer log is
 // append-only on FPL's side, so managers with no new transfer/chip activity can
 // keep using their persisted rows.
 //
@@ -732,12 +748,14 @@ const ingestFromStandings = async ({
   walk,
   budget,
   currentGw,
+  isLiveCurrentGw,
   governor,
   stats,
 }: {
   walk: StratumWalk;
   budget: number;
   currentGw: number;
+  isLiveCurrentGw: boolean;
   governor: RateLimitGovernor;
   stats: Stats;
 }): Promise<void> => {
@@ -747,7 +765,11 @@ const ingestFromStandings = async ({
   // state.
   let idx = await readIntCursor(walk.cursorKey, 0);
   if (idx < 0) idx = 0;
-  if (idx >= walk.numSteps) return;
+  if (idx >= walk.numSteps) {
+    if (!isLiveCurrentGw) return;
+    idx = 0;
+    await writeIntCursor(walk.cursorKey, idx);
+  }
 
   while (
     !governor.shouldAbort &&
@@ -788,6 +810,7 @@ const ingestFromStandings = async ({
               e.total,
               walk.stratum,
               currentGw,
+              isLiveCurrentGw,
               governor,
             );
           } catch {
@@ -807,7 +830,7 @@ const ingestFromStandings = async ({
     console.info(
       `[populateManagers] Stratum ${walk.stratum} complete for this GW.`,
     );
-    await writeIntCursor(walk.cursorKey, walk.numSteps);
+    await writeIntCursor(walk.cursorKey, isLiveCurrentGw ? 0 : walk.numSteps);
   }
 };
 
@@ -961,7 +984,7 @@ export const rebuildManagerRangeScoreBuckets = async (): Promise<void> => {
   const sampledGw = await prisma.manager_cumulative.aggregate({
     _max: { gw: true },
   });
-  const currentGw = sampledGw._max.gw ?? (await getCurrentFinishedGw());
+  const currentGw = sampledGw._max.gw ?? (await getCurrentSampleGameweek()).gw;
   if (currentGw < 1) {
     await prisma.$executeRawUnsafe(`TRUNCATE manager_range_score_buckets`);
     return;
@@ -1048,10 +1071,11 @@ export const populateManagers = async (
   const stats = newStats();
 
   try {
-    const currentGw = await getCurrentFinishedGw();
+    const { gw: currentGw, isLive: isLiveCurrentGw } =
+      await getCurrentSampleGameweek();
     if (currentGw < 1) {
       console.warn(
-        "[populateManagers] No finished GWs yet — nothing to ingest.",
+        "[populateManagers] No active or finished GWs yet - nothing to ingest.",
       );
       return;
     }
@@ -1088,9 +1112,9 @@ export const populateManagers = async (
     // end of the iteration range. C never goes "done" on the same
     // condition because we want to keep refilling its sample (cycle wraps
     // each time A and B finish a pass).
-    const aDone = aIdx >= STRATUM_A_WALK.numSteps;
-    const bDone = bIdx >= STRATUM_B_WALK.numSteps;
-    const cDone = cIdx >= STRATUM_C_WALK.numSteps;
+    const aDone = !isLiveCurrentGw && aIdx >= STRATUM_A_WALK.numSteps;
+    const bDone = !isLiveCurrentGw && bIdx >= STRATUM_B_WALK.numSteps;
+    const cDone = !isLiveCurrentGw && cIdx >= STRATUM_C_WALK.numSteps;
 
     // Budget allocation: keep A moving while it has work, but always reserve
     // the bulk of the budget for C so the deep tail fills as quickly as
@@ -1109,7 +1133,7 @@ export const populateManagers = async (
     const budgetC = cDone ? 0 : MAX_MANAGERS_PER_RUN - budgetA - budgetB;
 
     console.info(
-      `[populateManagers] Starting: currentGw ${currentGw}, A idx ${aIdx}/${STRATUM_A_WALK.numSteps} (budget ${budgetA}), B idx ${bIdx}/${STRATUM_B_WALK.numSteps} (budget ${budgetB}), C idx ${cIdx}/${STRATUM_C_WALK.numSteps} (target ${STRATUM_C_TARGET_MANAGERS}, budget ${budgetC}), samplePicks ${INGEST_SAMPLE_PICKS}, sampleTransfers ${INGEST_SAMPLE_TRANSFERS}`,
+      `[populateManagers] Starting: currentGw ${currentGw}${isLiveCurrentGw ? " live" : ""}, A idx ${aIdx}/${STRATUM_A_WALK.numSteps} (budget ${budgetA}), B idx ${bIdx}/${STRATUM_B_WALK.numSteps} (budget ${budgetB}), C idx ${cIdx}/${STRATUM_C_WALK.numSteps} (target ${STRATUM_C_TARGET_MANAGERS}, budget ${budgetC}), samplePicks ${INGEST_SAMPLE_PICKS}, sampleTransfers ${INGEST_SAMPLE_TRANSFERS}`,
     );
 
     if (budgetA > 0) {
@@ -1118,6 +1142,7 @@ export const populateManagers = async (
         walk: STRATUM_A_WALK,
         budget: target,
         currentGw,
+        isLiveCurrentGw,
         governor,
         stats,
       });
@@ -1129,6 +1154,7 @@ export const populateManagers = async (
         walk: STRATUM_B_WALK,
         budget: target,
         currentGw,
+        isLiveCurrentGw,
         governor,
         stats,
       });
@@ -1140,6 +1166,7 @@ export const populateManagers = async (
         walk: STRATUM_C_WALK,
         budget: target,
         currentGw,
+        isLiveCurrentGw,
         governor,
         stats,
       });
