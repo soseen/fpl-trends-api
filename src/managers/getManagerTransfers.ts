@@ -49,16 +49,25 @@ export type TransferImpactPlayer = {
   //             doubling on IN only creates a one-sided bias because
   //             we can't assume the user would have captained the OUT
   //             player too.
-  //   OUT side → raw history.points scaled by the player's pre-transfer
-  //             start rate (started_GWs / owned_GWs) for the user's
-  //             actual lineup. FH GWs falling INSIDE the window (for
-  //             normal transfers that overlap a later Free Hit) are
-  //             skipped — during a FH the normal squad is dormant, so
-  //             the "would have played this OUT player" counterfactual
-  //             is false by construction. For the FH transfer itself,
-  //             the single FH GW stays in the sum (that's the entire
-  //             pair). Dead-bench picks contribute ~0; rotational
-  //             players get partial credit; true starters get full raw.
+  //   OUT side → raw history.points scaled by an effective start-rate
+  //             derived from the pre-transfer ratio
+  //             (started_GWs / owned_GWs) via two thresholds:
+  //               rate ≥ 50%      → effective = 1 (treat as starter,
+  //                                  show full raw — matches the user's
+  //                                  "main player" mental model and
+  //                                  avoids dampening the displayed
+  //                                  number against the player's actual
+  //                                  scoring)
+  //               rate < 25%      → effective = 0 (treat as bench
+  //                                  filler; bench badge signals why)
+  //               25% ≤ rate < 50%→ effective = rate (linear, with the
+  //                                  `points_approximated` flag set so
+  //                                  the UI renders "~X pts" and a
+  //                                  tooltip)
+  //             FH GWs INSIDE the window are skipped (FH overrides the
+  //             normal squad, so the kept-OUT counterfactual is false).
+  //             For an FH transfer itself, the single FH GW stays in
+  //             the sum.
   points_in_window: number;
   // True when the model treats this player as a non-starter (bench role)
   // in the manager's squad. Used by the UI to render a bench icon next
@@ -69,6 +78,13 @@ export type TransferImpactPlayer = {
   // Both sides require ≥ 2 GWs of data to flag — single-GW windows or
   // single-GW ownership histories are too noisy to label.
   bench_role: boolean;
+  // True when `points_in_window` is a scaled approximation rather than
+  // the player's raw scoring. Only set on OUT-side tiles in the
+  // rotational range (pre-transfer start rate 25-50%), where we keep
+  // the linear scaling but signal the approximation with a "~" prefix
+  // and tooltip. Clear starters (rate ≥ 50%) round up to full raw
+  // (no flag), and bench-role picks (rate < 25%) zero out instead.
+  points_approximated: boolean;
   // Estimated rank movement from this side of the transfer comparison.
   // IN players are positive point contributions; OUT players are the
   // counterfactual points left behind, so they are negative. Null when
@@ -211,6 +227,7 @@ const toPlayer = (
   meta: FootballerMeta | undefined,
   points: number,
   benchRole: boolean,
+  pointsApproximated: boolean,
   rankImpact: number | null,
   avgOwnershipPct: number | null,
 ): TransferImpactPlayer => ({
@@ -221,6 +238,7 @@ const toPlayer = (
   element_type: meta?.element_type ?? 0,
   points_in_window: points,
   bench_role: benchRole,
+  points_approximated: pointsApproximated,
   rank_impact: rankImpact,
   avg_ownership_pct: avgOwnershipPct,
 });
@@ -873,21 +891,34 @@ export const getManagerTransfers = async (
       t.gw,
       windowEnd,
     );
-    // OUT-side scaling applies to every transfer type now: a bench
-    // filler's points shouldn't count against the user just because
-    // they later scored for their club, and a real starter still
-    // surfaces ~all of their raw points (their rate ≈ 1).
+    // OUT-side scaling — two thresholds keep the displayed value
+    // intuitive while preserving fair attribution:
+    //   rate ≥ 50% → effective rate = 1 (treat as starter, show full
+    //                raw points; matches "main player" mental model)
+    //   rate < 25% → effective rate = 0 (treat as bench filler, zero
+    //                contribution; bench badge already signals why)
+    //   25% ≤ rate < 50% → effective rate = rate (linear, scaled),
+    //                with `points_approximated` flag so the UI shows
+    //                "~X pts" and a tooltip explaining the math.
     const outStarter = outStarterRateMap.get(`${t.out_element}:${t.gw}`) ?? {
       rate: 1,
       owned: 0,
     };
-    const starterRate = outStarter.rate;
+    const STARTER_THRESHOLD = 0.5;
+    const BENCH_ROLE_THRESHOLD = 0.25;
+    const rawRate = outStarter.rate;
+    const effectiveRate =
+      rawRate >= STARTER_THRESHOLD
+        ? 1
+        : rawRate < BENCH_ROLE_THRESHOLD
+          ? 0
+          : rawRate;
     const outPts = outPointsInWindow(
       perRound,
       t.out_element,
       t.gw,
       windowEnd,
-      starterRate,
+      effectiveRate,
       allFhGws,
     );
     const inRank = inBaseRankImpactInWindow(
@@ -906,7 +937,7 @@ export const getManagerTransfers = async (
       t.out_element,
       t.gw,
       windowEnd,
-      starterRate,
+      effectiveRate,
       rankContext.rank_per_point,
       allFhGws,
     );
@@ -923,18 +954,22 @@ export const getManagerTransfers = async (
       t.out_element,
       t.gw,
       windowEnd,
-      starterRate,
+      effectiveRate,
       rankContext.rank_per_point,
       allFhGws,
       "kept_counterfactual",
     );
-    // Bench-role flags drive the UI's "Bench" badge on player tiles. A
-    // player is flagged when we have ≥ 2 GWs of usable data and the
-    // start-rate (OUT: pre-transfer; IN: across the pair window) is
-    // below 25%. < 2 GWs of data is too noisy to label.
-    const BENCH_ROLE_THRESHOLD = 0.25;
+    // Bench-role and approximation flags drive the UI's tile badges:
+    //   bench_role  → small armchair icon next to the points text
+    //   points_approximated → "~" prefix on the points number + tooltip
+    // Both require ≥ 2 GWs of usable data so single-GW windows or
+    // single-GW ownership histories don't trigger noisy labels.
     const outBenchRole =
-      outStarter.owned >= 2 && outStarter.rate < BENCH_ROLE_THRESHOLD;
+      outStarter.owned >= 2 && rawRate < BENCH_ROLE_THRESHOLD;
+    const outPointsApproximated =
+      outStarter.owned >= 2 &&
+      rawRate >= BENCH_ROLE_THRESHOLD &&
+      rawRate < STARTER_THRESHOLD;
     const inWindowGws = windowEnd - t.gw + 1;
     let inStartedGws = 0;
     for (let g = t.gw; g <= windowEnd; g += 1) {
@@ -972,6 +1007,7 @@ export const getManagerTransfers = async (
         meta.get(t.in_element),
         inPts,
         inBenchRole,
+        false, // IN side is factual — sum of actually-played GWs — never an approximation
         inTransferRankImpact,
         inRank.avgOwnershipPct,
       ),
@@ -980,6 +1016,7 @@ export const getManagerTransfers = async (
         meta.get(t.out_element),
         outPts,
         outBenchRole,
+        outPointsApproximated,
         outTransferRankImpact,
         outRank.avgOwnershipPct,
       ),
