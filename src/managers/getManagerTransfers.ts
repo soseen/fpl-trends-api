@@ -43,12 +43,21 @@ export type TransferImpactPlayer = {
   //             can't assume the user would have captained the OUT
   //             player too — keeping doubling on IN only creates a
   //             one-sided bias.
-  //   OUT side → raw SUM of history.points across the window. We don't
-  //             know how the user would have played the OUT player
-  //             after they were sold, so we count what the player
-  //             actually produced — symmetric with IN at the
-  //             never-doubled level.
+  //   OUT side → raw history.points scaled by the player's pre-transfer
+  //             start rate (started_GWs / owned_GWs) for the user's
+  //             actual lineup. Dead-bench picks contribute ~0; rotational
+  //             players get partial credit; true starters get full raw.
+  //             Same convention applies to FH/WC and normal transfers.
   points_in_window: number;
+  // True when the model treats this player as a non-starter (bench role)
+  // in the manager's squad. Used by the UI to render a bench icon next
+  // to the tile so a 0/low points figure reads as "bench fodder" rather
+  // than "bad luck blank".
+  //   IN side  → flagged if mult > 0 in < 25% of the pair window's GWs.
+  //   OUT side → flagged if pre-transfer started/owned < 25%.
+  // Both sides require ≥ 2 GWs of data to flag — single-GW windows or
+  // single-GW ownership histories are too noisy to label.
+  bench_role: boolean;
   // Estimated rank movement from this side of the transfer comparison.
   // IN players are positive point contributions; OUT players are the
   // counterfactual points left behind, so they are negative. Null when
@@ -190,6 +199,7 @@ const toPlayer = (
   id: number,
   meta: FootballerMeta | undefined,
   points: number,
+  benchRole: boolean,
   rankImpact: number | null,
   avgOwnershipPct: number | null,
 ): TransferImpactPlayer => ({
@@ -199,6 +209,7 @@ const toPlayer = (
   team_code: meta?.team_code ?? 0,
   element_type: meta?.element_type ?? 0,
   points_in_window: points,
+  bench_role: benchRole,
   rank_impact: rankImpact,
   avg_ownership_pct: avgOwnershipPct,
 });
@@ -414,67 +425,38 @@ const buildNextOutGwMap = (
   return result;
 };
 
-// For each Wildcard / Free Hit transfer's OUT player, compute the
-// fraction of pre-chip GWs the user *actually started them* (i.e. had
-// multiplier > 0 in the user's lineup). Used to scale that player's
-// raw history points on the OUT side, so dead-bench picks contribute
-// ~0 and rotational players get partial credit.
+// For each (OUT player, transfer GW), compute the fraction of
+// pre-transfer GWs the user *actually started them* (i.e. had multiplier
+// > 0 in the user's lineup). Used to scale that player's raw history
+// points on the OUT side, so dead-bench picks contribute ~0, rotational
+// players get partial credit, and true starters keep full raw.
 //
-// Why only WC/FH and not single transfers: in a single-transfer GW
-// you swap one player you cared enough about to actively manage; the
-// user accepted "raw OUT" for those because the bench-suppress was
-// hiding real points (e.g. Cunha post-sale). In WC/FH you swap many
-// at once, including 4-of-15 bench fodder slots that *can't* all be
-// "live"; raw OUT systematically overstates the "what I would have
-// kept" counterfactual there.
+// Applied to ALL transfer types (normal, WC, FH). Earlier versions
+// gated this to chip GWs only, with the intent of preserving "Cunha
+// post-sale regret" — but a starter's pre-sale start rate is ~1 so
+// they still surface their full points; the gate only ever spared
+// genuine bench fillers from being correctly zeroed.
 //
 // Captain doubling is collapsed into a binary "did they start?"
-// signal — we treat any positive multiplier as 1 (consistent with the
-// IN-side rule that captures captaincy at 1× too).
+// signal — any positive multiplier counts as 1, consistent with the
+// IN-side rule.
 //
-// Skips FH GWs while scanning history because the FH XV is temporary
-// and doesn't reflect the underlying squad's role for the OUT player.
+// Skips ALL Free Hit GWs (including out-of-range ones) while scanning
+// history because the FH XV is temporary and doesn't reflect the
+// underlying squad's role for the OUT player.
 //
-// Falls back to 1 (treat as full starter, full raw) when the player
-// has no pre-chip ownership history we can use — e.g. WC at GW 1, or
-// a player owned only inside earlier FH GWs.
+// Falls back to rate = 1 with owned = 0 when the player has no usable
+// pre-transfer ownership history (e.g. transfer at GW 1, or a player
+// only owned inside earlier FH GWs). `owned` is exposed so callers
+// can suppress the "bench role" UI flag on too-thin samples.
+type OutStarterStat = { rate: number; owned: number };
 const buildOutStarterRateMap = (
-  realTransfers: ReadonlyArray<TransferRow>,
-  multipliers: MultiplierMap,
-  finalXv: FinalXvMap,
-  fhGws: ReadonlySet<number>,
-  wcGws: ReadonlySet<number>,
-): Map<string, number> => {
-  const result = new Map<string, number>();
-  for (const t of realTransfers) {
-    if (!fhGws.has(t.gw) && !wcGws.has(t.gw)) continue;
-    const key = `${t.out_element}:${t.gw}`;
-    let owned = 0;
-    let started = 0;
-    for (let g = 1; g < t.gw; g += 1) {
-      if (fhGws.has(g)) continue;
-      const xv = finalXv.get(g);
-      if (!xv?.has(t.out_element)) continue;
-      owned += 1;
-      const mult = multipliers.get(g)?.get(t.out_element) ?? 0;
-      if (mult > 0) started += 1;
-    }
-    result.set(key, owned > 0 ? started / owned : 1);
-  }
-  return result;
-};
-
-// Rank attribution uses start-rate for every OUT player, not only WC/FH
-// events. Points view keeps the simpler raw-OUT convention for normal
-// transfers, but rank view should not imply that selling a permanent
-// bench slot cost rank every time that player later scored.
-const buildOutRankStarterRateMap = (
   transfers: ReadonlyArray<TransferRow>,
   multipliers: MultiplierMap,
   finalXv: FinalXvMap,
   fhGws: ReadonlySet<number>,
-): Map<string, number> => {
-  const result = new Map<string, number>();
+): Map<string, OutStarterStat> => {
+  const result = new Map<string, OutStarterStat>();
   for (const t of transfers) {
     const key = `${t.out_element}:${t.gw}`;
     let owned = 0;
@@ -487,7 +469,7 @@ const buildOutRankStarterRateMap = (
       const mult = multipliers.get(g)?.get(t.out_element) ?? 0;
       if (mult > 0) started += 1;
     }
-    result.set(key, owned > 0 ? started / owned : 1);
+    result.set(key, { rate: owned > 0 ? started / owned : 1, owned });
   }
   return result;
 };
@@ -791,16 +773,11 @@ export const getManagerTransfers = async (
   // The window-end calc still caps at endGw; the badge does not.
   const nextOutGwMap = buildNextOutGwMap(resolved.rows, allFhGws);
 
-  // Per-OUT-player starter rate for WC/FH events only (single-transfer
-  // GWs use raw OUT, rate = 1).
+  // Per-OUT-player starter rate, computed for every transfer (normal,
+  // WC, FH). One unified map drives both the points-side scaling and
+  // the rank-side attribution — they previously diverged but the
+  // mathematics is identical.
   const outStarterRateMap = buildOutStarterRateMap(
-    realTransfers,
-    multipliers,
-    finalXv,
-    fhGws,
-    wcGws,
-  );
-  const outRankStarterRateMap = buildOutRankStarterRateMap(
     displayTransfers,
     multipliers,
     finalXv,
@@ -833,7 +810,6 @@ export const getManagerTransfers = async (
 
   for (const t of displayTransfers) {
     const isFh = fhGws.has(t.gw);
-    const isWc = wcGws.has(t.gw);
     const nextOutGw = nextOutGwMap.get(`${t.in_element}:${t.gw}`);
     // Per-pair window: both IN and OUT are evaluated over the same
     // [transfer.gw, lastOwnedGw_of_IN] range so the comparison stays
@@ -852,13 +828,15 @@ export const getManagerTransfers = async (
       t.gw,
       windowEnd,
     );
-    // Single-transfer GWs use raw OUT (rate=1); WC/FH GWs scale by the
-    // OUT player's pre-chip start-rate so dead-bench picks don't inflate
-    // the apparent "loss" of the chip event.
-    const starterRate =
-      isFh || isWc
-        ? (outStarterRateMap.get(`${t.out_element}:${t.gw}`) ?? 1)
-        : 1;
+    // OUT-side scaling applies to every transfer type now: a bench
+    // filler's points shouldn't count against the user just because
+    // they later scored for their club, and a real starter still
+    // surfaces ~all of their raw points (their rate ≈ 1).
+    const outStarter = outStarterRateMap.get(`${t.out_element}:${t.gw}`) ?? {
+      rate: 1,
+      owned: 0,
+    };
+    const starterRate = outStarter.rate;
     const outPts = outPointsInWindow(
       perRound,
       t.out_element,
@@ -874,8 +852,6 @@ export const getManagerTransfers = async (
       windowEnd,
       rankContext.rank_per_point,
     );
-    const outRankStarterRate =
-      outRankStarterRateMap.get(`${t.out_element}:${t.gw}`) ?? starterRate;
     // outRank (did_not_have) is kept ONLY for its avgOwnershipPct, which the
     // OUT-tile UI displays. The actual OUT contribution to the swap's rank
     // delta uses the kept-counterfactual variant below.
@@ -884,7 +860,7 @@ export const getManagerTransfers = async (
       t.out_element,
       t.gw,
       windowEnd,
-      outRankStarterRate,
+      starterRate,
       rankContext.rank_per_point,
     );
     // EO-aware swap attribution: rank delta = (rank impact of having IN) −
@@ -900,10 +876,25 @@ export const getManagerTransfers = async (
       t.out_element,
       t.gw,
       windowEnd,
-      outRankStarterRate,
+      starterRate,
       rankContext.rank_per_point,
       "kept_counterfactual",
     );
+    // Bench-role flags drive the UI's "Bench" badge on player tiles. A
+    // player is flagged when we have ≥ 2 GWs of usable data and the
+    // start-rate (OUT: pre-transfer; IN: across the pair window) is
+    // below 25%. < 2 GWs of data is too noisy to label.
+    const BENCH_ROLE_THRESHOLD = 0.25;
+    const outBenchRole =
+      outStarter.owned >= 2 && outStarter.rate < BENCH_ROLE_THRESHOLD;
+    const inWindowGws = windowEnd - t.gw + 1;
+    let inStartedGws = 0;
+    for (let g = t.gw; g <= windowEnd; g += 1) {
+      const mult = multipliers.get(g)?.get(t.in_element) ?? 0;
+      if (mult > 0) inStartedGws += 1;
+    }
+    const inBenchRole =
+      inWindowGws >= 2 && inStartedGws / inWindowGws < BENCH_ROLE_THRESHOLD;
     const netPoints = inPts - outPts;
     const inTransferRankImpact = inRank.rankImpact;
     const outTransferRankImpact =
@@ -932,6 +923,7 @@ export const getManagerTransfers = async (
         t.in_element,
         meta.get(t.in_element),
         inPts,
+        inBenchRole,
         inTransferRankImpact,
         inRank.avgOwnershipPct,
       ),
@@ -939,6 +931,7 @@ export const getManagerTransfers = async (
         t.out_element,
         meta.get(t.out_element),
         outPts,
+        outBenchRole,
         outTransferRankImpact,
         outRank.avgOwnershipPct,
       ),
