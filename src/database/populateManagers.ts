@@ -934,6 +934,16 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
 // per request, which is the entire point: the per-request DISTINCT ON
 // over the same partition is what was costing 15–25 s on cold cache.
 //
+// Population filter (stable_managers CTE): the read path subtracts
+// (sum at end_gw) − (sum at start_gw − 1). That subtraction is only
+// well-defined when the SAME set of managers contributes to both
+// endpoints. Without a filter, managers whose latest manager_cumulative
+// row is some past GW (ingested weeks ago, not yet re-walked) contribute
+// to the start anchor but not the end, producing negative deltas in
+// sampleStratumAggregates. The CTE restricts every (stratum, gw) row to
+// managers who have a row at the current max GW — i.e. the cohort that
+// is actually up-to-date — so the subtraction is well-defined.
+//
 // Exported so backfillStratumGwRunningStats.ts can run the same operation
 // out-of-band (e.g. immediately after applying the schema migration so
 // the new read path has a populated table to read from before the next
@@ -942,6 +952,14 @@ export const rebuildStratumGwRunningStats = async (): Promise<void> => {
   await prisma.$transaction([
     prisma.$executeRawUnsafe(`TRUNCATE stratum_gw_running_stats`),
     prisma.$executeRawUnsafe(`
+      WITH current_max AS (
+        SELECT MAX(gw) AS gw FROM manager_cumulative
+      ),
+      stable_managers AS (
+        SELECT mc.entry_id
+        FROM manager_cumulative mc
+        JOIN current_max cm ON mc.gw = cm.gw
+      )
       INSERT INTO stratum_gw_running_stats
         (stratum, gw, sample_size,
          sum_cum_points, sum_cum_transfers, sum_cum_hits_cost,
@@ -974,6 +992,7 @@ export const rebuildStratumGwRunningStats = async (): Promise<void> => {
         COUNT(*) FILTER (WHERE mc.chip_bboost_h2)::int             AS cum_bboosts_h2,
         NOW()                                                      AS last_rebuilt
       FROM manager_cumulative mc
+      JOIN stable_managers sm ON sm.entry_id = mc.entry_id
       JOIN manager_summary ms ON ms.entry_id = mc.entry_id
       GROUP BY mc.stratum, mc.gw
     `),

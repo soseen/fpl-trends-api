@@ -378,6 +378,52 @@ const sampleStratumAggregates = async (
   );
   const dGwsPlayed = sumDelta(row.sum_e_gws_played, row.sum_s_gws_played);
 
+  // Every cumulative_X is non-decreasing per-manager, so a sum of those
+  // values over a stable population must be non-decreasing in gw. A
+  // negative delta means the population at gw=start-1 included managers
+  // who are missing at gw=end_gw (their manager_cumulative rows weren't
+  // refreshed to the current GW). The new rebuildStratumGwRunningStats
+  // filters those out, but until the next rebuild lands or if a future
+  // regression reintroduces this, refuse to serve physically impossible
+  // numbers rather than rendering "-0.96 transfers" in the UI.
+  if (
+    dPoints < 0 ||
+    dTransfers < 0 ||
+    dHitsCost < 0 ||
+    dBench < 0 ||
+    dCaptainBonus < 0 ||
+    dGwsPlayed < 0
+  ) {
+    console.warn(
+      `[sampleStratumAggregates] negative delta detected — stale-stratum population? ` +
+        `stratum=${stratumFilter} range=${startGw}..${endGw} ` +
+        `dPoints=${dPoints} dTransfers=${dTransfers} dHits=${dHitsCost} ` +
+        `dBench=${dBench} dCaptainBonus=${dCaptainBonus} dGwsPlayed=${dGwsPlayed}`,
+    );
+    return {
+      avg_total_points: null,
+      avg_transfers: null,
+      avg_hits: null,
+      avg_bench: null,
+      avg_captain_bonus: null,
+      avg_gw_score: null,
+      wildcards_rate: null,
+      wildcards_h1_rate: null,
+      wildcards_h2_rate: null,
+      free_hits_rate: null,
+      free_hits_h1_rate: null,
+      free_hits_h2_rate: null,
+      bench_boosts_rate: null,
+      bench_boosts_h1_rate: null,
+      bench_boosts_h2_rate: null,
+      sample_size: 0,
+      with_hits_data: 0,
+      with_bench_data: 0,
+      with_transfers_data: 0,
+      with_chips_data: 0,
+    };
+  }
+
   // Chip "played-in-range" deltas, by half. A chip play is detected at the
   // earliest GW it appears in the cumulative; the per-half split lets a
   // range that crosses the GW20 boundary count both halves correctly.
