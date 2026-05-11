@@ -32,22 +32,33 @@ export type TransferImpactPlayer = {
   code: number;
   team_code: number;
   element_type: number; // 1=GK, 2=DEF, 3=MID, 4=FWD
-  // Points contributed in the per-pair comparison window:
-  //   Window  = [transfer.gw, lastOwnedGw] for normal transfers, where
-  //             lastOwnedGw is the GW before the IN player was next
-  //             transferred OUT (or endGw if still owned). For Free Hit
-  //             transfers the window is [fhGw, fhGw] (single GW).
+  // Points contributed in the per-pair comparison window. IN and OUT
+  // use ASYMMETRIC windows so each player's timeline is tiled exactly
+  // once across all pairs (no double-counting in chains, no leaks for
+  // sells-and-never-buy-back):
+  //   IN window  = [transfer.gw, lastOwnedGw_of_IN] for normal transfers
+  //                (lastOwnedGw = GW before the IN player was next
+  //                transferred OUT, or endGw if still owned).
+  //   OUT window = [transfer.gw, repurchaseGw_of_OUT - 1] for normal
+  //                transfers (repurchase = GW the OUT player was next
+  //                transferred IN, or endGw if never bought back).
+  //   For Free Hit, both windows collapse to [fhGw, fhGw].
+  //
+  // What's summed:
   //   IN side → SUM of history.points for GWs the player was on the
   //             field (multiplier > 0). Benched GWs contribute 0; the
-  //             captain ×2 is intentionally NOT applied because we
-  //             can't assume the user would have captained the OUT
-  //             player too — keeping doubling on IN only creates a
-  //             one-sided bias.
+  //             captain ×2 is intentionally NOT applied — keeping
+  //             doubling on IN only creates a one-sided bias because
+  //             we can't assume the user would have captained the OUT
+  //             player too.
   //   OUT side → raw history.points scaled by the player's pre-transfer
   //             start rate (started_GWs / owned_GWs) for the user's
-  //             actual lineup. Dead-bench picks contribute ~0; rotational
+  //             actual lineup, summed across non-FH GWs in the OUT
+  //             window. FH GWs are skipped because during a FH the
+  //             user's normal squad reverts — the counterfactual
+  //             "would have played this OUT player" is false by
+  //             definition. Dead-bench picks contribute ~0; rotational
   //             players get partial credit; true starters get full raw.
-  //             Same convention applies to FH/WC and normal transfers.
   points_in_window: number;
   // True when the model treats this player as a non-starter (bench role)
   // in the manager's squad. Used by the UI to render a bench icon next
@@ -277,30 +288,39 @@ const inPointsInWindow = (
 };
 
 // OUT-player points: raw history points scaled by `starterRate` across
-// the window.
+// the window, with FH GWs skipped FOR NORMAL transfers.
 //
 // `starterRate` is the fraction of "would I have started this player"
-// to apply each GW:
-//   - For single-transfer GWs we pass 1 (full raw — the user explicitly
-//     chose this; they want to see the OUT player's actual scoring).
-//   - For Wildcard / Free Hit GWs we pass the player's pre-chip
-//     start-rate (started_GWs / owned_GWs in the user's actual lineup),
-//     which corrects the WC bench-overcount problem: a manager who
-//     wildcarded out 10 players couldn't have started all 10 each
-//     week, only 11/15 of the kept squad would be live, and a true
-//     bench-fodder transfer should not penalise the metric for points
-//     it never could have earned. A rotational player gets partial
-//     credit; a never-played dead pick gets ~0.
+// applied each GW (pre-transfer started_GWs / owned_GWs in the user's
+// actual lineup). Dead-bench picks contribute ~0; rotational players
+// get partial credit; true starters get full raw.
+//
+// FH-skip rule: for a NORMAL transfer whose OUT window happens to cover
+// a later FH GW, we skip that FH GW — during a Free Hit the user's
+// normal squad reverts, so the counterfactual "would have started the
+// OUT player" is false by construction (FH XV is active, normal squad
+// is dormant). Counting those FH-GW raw points would double-charge.
+//
+// For the FH transfer ITSELF, the FH-GW is the entire comparison —
+// IN = FH-XI player's score, OUT = displaced normal-squad player's
+// counterfactual score. We detect this case by `fromGw === a FH GW`
+// and keep the GW in the sum.
 const outPointsInWindow = (
   perRound: Map<string, number>,
   playerId: number,
   fromGw: number,
   windowEnd: number,
   starterRate: number,
+  fhGws: ReadonlySet<number>,
 ): number => {
   if (starterRate <= 0) return 0;
+  // Normal-transfer OUT side spans non-FH GWs; FH transfers stay on
+  // their own GW. Either way, the rule is "skip FH GWs that aren't
+  // this transfer's own GW".
+  const skipFh = !fhGws.has(fromGw);
   let total = 0;
   for (let gw = fromGw; gw <= windowEnd; gw += 1) {
+    if (skipFh && fhGws.has(gw)) continue;
     total += (perRound.get(`${playerId}:${gw}`) ?? 0) * starterRate;
   }
   // Round to keep tile labels and gain pills integer-clean. The few
@@ -361,6 +381,11 @@ const inBaseRankImpactInWindow = (
 //                           the IN-side EO-aware excess to get the swap's
 //                           rank delta — keeps Transfer Impact consistent
 //                           with Team Impact's per-player attribution.
+//
+// Skips FH GWs (other than this transfer's own GW): during a Free Hit
+// the user's normal squad reverts, so the kept-OUT counterfactual is
+// meaningless for FH GWs that fall mid-window. A FH transfer ITSELF
+// (fromGw is a FH GW) keeps its single FH GW in the sum.
 const outBaseRankImpactInWindow = (
   stats: Map<string, PlayerGwRankStat>,
   playerId: number,
@@ -368,13 +393,16 @@ const outBaseRankImpactInWindow = (
   windowEnd: number,
   starterRate: number,
   rankPerPoint: number | null,
+  fhGws: ReadonlySet<number>,
   mode: "did_not_have" | "kept_counterfactual" = "did_not_have",
 ): RankWindowResult => {
   let excess = 0;
   let ownershipSum = 0;
   let ownershipCount = 0;
   if (starterRate <= 0) return rankResult(0, 0, 0, rankPerPoint);
+  const skipFh = !fhGws.has(fromGw);
   for (let gw = fromGw; gw <= windowEnd; gw += 1) {
+    if (skipFh && fhGws.has(gw)) continue;
     const stat = stats.get(playerGwKey(playerId, gw));
     if (!stat) continue;
     const ownership = ownershipPct(stat);
@@ -418,6 +446,36 @@ const buildNextOutGwMap = (
       if (t2.gw <= t.gw) continue;
       if (fhGws.has(t2.gw)) continue;
       if (t2.out_element !== t.in_element) continue;
+      result.set(key, t2.gw);
+      break;
+    }
+  }
+  return result;
+};
+
+// Symmetric counterpart to buildNextOutGwMap: for each OUT-event at GW X,
+// find the next non-FH GW the OUT player was transferred back IN. Used
+// to bound the OUT-side "not-owned" window so a starter sold and never
+// repurchased keeps accruing OUT-side points to endGw (the user genuinely
+// "lost" them), while a player sold and repurchased GW Y stops accruing
+// at GW Y - 1 (after which they're picked up by the next pair's IN side).
+// This is what prevents the chain double-counting that motivated the old
+// symmetric pair window — different pairs cover non-overlapping slices
+// of each player's timeline.
+const buildNextInGwMap = (
+  fullTransfers: ReadonlyArray<TransferRow>,
+  fhGws: ReadonlySet<number>,
+): Map<string, number> => {
+  const result = new Map<string, number>();
+  const sorted = [...fullTransfers].sort((a, b) => a.gw - b.gw);
+  for (const t of sorted) {
+    const key = `${t.out_element}:${t.gw}`;
+    if (fhGws.has(t.gw)) continue;
+    if (result.has(key)) continue;
+    for (const t2 of sorted) {
+      if (t2.gw <= t.gw) continue;
+      if (fhGws.has(t2.gw)) continue;
+      if (t2.in_element !== t.out_element) continue;
       result.set(key, t2.gw);
       break;
     }
@@ -772,6 +830,11 @@ export const getManagerTransfers = async (
   // surface sales that happen past endGw on the "Sold in GW X" badge.
   // The window-end calc still caps at endGw; the badge does not.
   const nextOutGwMap = buildNextOutGwMap(resolved.rows, allFhGws);
+  // Build the next-IN lookup (when an OUT player is later transferred
+  // back in by the user) so the OUT-side window can extend through
+  // every GW the user did NOT own them, capping at the repurchase GW.
+  // Sells-and-never-bought-back → window runs to endGw.
+  const nextInGwMap = buildNextInGwMap(resolved.rows, allFhGws);
 
   // Per-OUT-player starter rate, computed for every transfer (normal,
   // WC, FH). One unified map drives both the points-side scaling and
@@ -811,22 +874,34 @@ export const getManagerTransfers = async (
   for (const t of displayTransfers) {
     const isFh = fhGws.has(t.gw);
     const nextOutGw = nextOutGwMap.get(`${t.in_element}:${t.gw}`);
-    // Per-pair window: both IN and OUT are evaluated over the same
-    // [transfer.gw, lastOwnedGw_of_IN] range so the comparison stays
-    // symmetric. Extending OUT past the IN player's tenure leads to
-    // chain double-counting (Wirtz's post-sale raw counted both at
-    // the GW 8 Saka→Wirtz pair and at the GW 13 Wirtz→Wilson pair),
-    // which inflates losses on every chained transfer.
-    const windowEnd = isFh
+    const nextInGw = nextInGwMap.get(`${t.out_element}:${t.gw}`);
+    // Asymmetric pair windows — the slice each player's timeline maps
+    // onto for THIS pair:
+    //   IN  = [t.gw, lastOwnedGw_of_IN]  — only count IN's points while
+    //         the user owned them. Sale ends the IN side; the player's
+    //         post-sale impact is picked up wherever they next appear
+    //         as an OUT in the transfer log.
+    //   OUT = [t.gw, repurchaseGw_of_OUT - 1]  — count OUT's points for
+    //         every GW the user did NOT own them. Re-buying OUT caps
+    //         the window; the next-IN pair picks them up from then on.
+    //         Together IN/OUT slices tile every player's timeline
+    //         exactly once, so chains (Saka → Wirtz → Wilson) don't
+    //         double-count.
+    // Free Hit collapses both sides to a single GW (FH XV is the only
+    // lineup that matters that week; normal squad is dormant).
+    const inWindowEnd = isFh
       ? t.gw
       : Math.min(nextOutGw !== undefined ? nextOutGw - 1 : endGw, endGw);
+    const outWindowEnd = isFh
+      ? t.gw
+      : Math.min(nextInGw !== undefined ? nextInGw - 1 : endGw, endGw);
 
     const inPts = inPointsInWindow(
       perRound,
       multipliers,
       t.in_element,
       t.gw,
-      windowEnd,
+      inWindowEnd,
     );
     // OUT-side scaling applies to every transfer type now: a bench
     // filler's points shouldn't count against the user just because
@@ -841,15 +916,16 @@ export const getManagerTransfers = async (
       perRound,
       t.out_element,
       t.gw,
-      windowEnd,
+      outWindowEnd,
       starterRate,
+      allFhGws,
     );
     const inRank = inBaseRankImpactInWindow(
       rankStats,
       multipliers,
       t.in_element,
       t.gw,
-      windowEnd,
+      inWindowEnd,
       rankContext.rank_per_point,
     );
     // outRank (did_not_have) is kept ONLY for its avgOwnershipPct, which the
@@ -859,9 +935,10 @@ export const getManagerTransfers = async (
       rankStats,
       t.out_element,
       t.gw,
-      windowEnd,
+      outWindowEnd,
       starterRate,
       rankContext.rank_per_point,
+      allFhGws,
     );
     // EO-aware swap attribution: rank delta = (rank impact of having IN) −
     // (rank impact the user gave up by selling OUT, assuming OUT would've
@@ -875,9 +952,10 @@ export const getManagerTransfers = async (
       rankStats,
       t.out_element,
       t.gw,
-      windowEnd,
+      outWindowEnd,
       starterRate,
       rankContext.rank_per_point,
+      allFhGws,
       "kept_counterfactual",
     );
     // Bench-role flags drive the UI's "Bench" badge on player tiles. A
@@ -887,9 +965,9 @@ export const getManagerTransfers = async (
     const BENCH_ROLE_THRESHOLD = 0.25;
     const outBenchRole =
       outStarter.owned >= 2 && outStarter.rate < BENCH_ROLE_THRESHOLD;
-    const inWindowGws = windowEnd - t.gw + 1;
+    const inWindowGws = inWindowEnd - t.gw + 1;
     let inStartedGws = 0;
-    for (let g = t.gw; g <= windowEnd; g += 1) {
+    for (let g = t.gw; g <= inWindowEnd; g += 1) {
       const mult = multipliers.get(g)?.get(t.in_element) ?? 0;
       if (mult > 0) inStartedGws += 1;
     }
