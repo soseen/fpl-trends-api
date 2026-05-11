@@ -644,8 +644,16 @@ export const getManagerTransfers = async (
   //   3. resolvePicks — full XV per GW. Shared in-flight with the
   //      comparison & team-impact endpoints, so the picks fetches
   //      happen once across the My Trends panel.
+  // Picks range covers GW1..endGw, not just the user's selected range.
+  // The pre-transfer scan in buildOutStarterRateMap needs each OUT
+  // player's FULL pre-transfer ownership/start history; if the slider
+  // starts mid-season we used to see only a partial slice (e.g. just
+  // a single benched GW immediately before the sale), which collapsed
+  // started/owned to 0/1 and silently zeroed the OUT contribution.
+  // Picks are DB-cached per (entry, gw) after first fetch, so the
+  // wider window only costs extra FPL calls on a cold cache.
   const finishedRange: number[] = [];
-  for (let g = startGw; g <= endGw; g += 1) finishedRange.push(g);
+  for (let g = 1; g <= endGw; g += 1) finishedRange.push(g);
 
   const [resolved, history, resolvedPicks] = await Promise.all([
     resolveTransfers(entryId, true),
