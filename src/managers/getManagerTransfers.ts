@@ -49,21 +49,22 @@ export type TransferImpactPlayer = {
   //             doubling on IN only creates a one-sided bias because
   //             we can't assume the user would have captained the OUT
   //             player too.
-  //   OUT side → raw history.points scaled by an effective start-rate
-  //             derived from the pre-transfer ratio
-  //             (started_GWs / owned_GWs) via two thresholds:
-  //               rate ≥ 50%      → effective = 1 (treat as starter,
-  //                                  show full raw — matches the user's
-  //                                  "main player" mental model and
-  //                                  avoids dampening the displayed
-  //                                  number against the player's actual
-  //                                  scoring)
-  //               rate < 25%      → effective = 0 (treat as bench
-  //                                  filler; bench badge signals why)
-  //               25% ≤ rate < 50%→ effective = rate (linear, with the
-  //                                  `points_approximated` flag set so
-  //                                  the UI renders "~X pts" and a
-  //                                  tooltip)
+  //   OUT side → raw history.points scaled by an effective start-rate.
+  //             Primary signal is the user's pre-sale ratio
+  //             (started_GWs / owned_GWs); when that ratio is
+  //             ambiguous or the sample is small we defer to a coarse
+  //             "is this a starter-tier asset" check on the player's
+  //             price + ownership + season starts:
+  //               rate ≥ 50% with owned ≥ 2 → effective = 1 (starter,
+  //                                            full raw)
+  //               rate < 25% with owned ≥ 4 → effective = 0 (bench
+  //                                            filler, with badge)
+  //               owned = 0 OR ambiguous middle → defer to global
+  //                                            starter check:
+  //                  - player passes → effective = 1
+  //                  - player doesn't pass → effective = rate (linear,
+  //                                          with `points_approximated`
+  //                                          flag for the "~" UI prefix)
   //             FH GWs INSIDE the window are skipped (FH overrides the
   //             normal squad, so the kept-OUT counterfactual is false).
   //             For an FH transfer itself, the single FH GW stays in
@@ -202,6 +203,15 @@ type FootballerMeta = {
   // "premium ↔ premium, mid ↔ mid, fodder ↔ fodder" rather than relying
   // on arbitrary FPL transfer-log order.
   now_cost: number | null;
+  // Selected-by-percent ("5.5" etc., kept as a string in FPL's payload).
+  // Community-consensus signal for "is this a starter" — used as a
+  // tiebreaker on the OUT-side effective-rate decision when the user's
+  // pre-sale sample is too small or too noisy to classify confidently.
+  selected_by_percent: string | null;
+  // Season-to-date starts count. A player with many starts for their
+  // club is a real starter; one with few is a fringe/bench option. Same
+  // tiebreaker role as ownership.
+  starts: number | null;
 };
 
 const fetchFootballerMeta = async (
@@ -217,9 +227,31 @@ const fetchFootballerMeta = async (
       team_code: true,
       element_type: true,
       now_cost: true,
+      selected_by_percent: true,
+      starts: true,
     },
   });
   return new Map(rows.map((r) => [r.id, r]));
+};
+
+// "Is this player a starter-tier asset at the league level?" — used as a
+// tiebreaker when the user's pre-sale sample is too small or too
+// ambiguous to classify confidently. Three independent coarse signals;
+// the player passes when at least two clear their floors. Floors are
+// set deliberately low so we only catch obvious bench-fodder.
+const isLikelyStarter = (meta: FootballerMeta | undefined): boolean => {
+  if (!meta) return false;
+  const priceTenths = meta.now_cost ?? 0; // 50 = £5.0m
+  const ownershipPct = Number.parseFloat(meta.selected_by_percent ?? "0") || 0;
+  const starts = meta.starts ?? 0;
+  const PRICE_FLOOR = 50;
+  const OWNERSHIP_FLOOR = 5;
+  const STARTS_FLOOR = 10;
+  let signals = 0;
+  if (priceTenths >= PRICE_FLOOR) signals += 1;
+  if (ownershipPct >= OWNERSHIP_FLOOR) signals += 1;
+  if (starts >= STARTS_FLOOR) signals += 1;
+  return signals >= 2;
 };
 
 const toPlayer = (
@@ -891,28 +923,42 @@ export const getManagerTransfers = async (
       t.gw,
       windowEnd,
     );
-    // OUT-side scaling — two thresholds keep the displayed value
-    // intuitive while preserving fair attribution:
-    //   rate ≥ 50% → effective rate = 1 (treat as starter, show full
-    //                raw points; matches "main player" mental model)
-    //   rate < 25% → effective rate = 0 (treat as bench filler, zero
-    //                contribution; bench badge already signals why)
-    //   25% ≤ rate < 50% → effective rate = rate (linear, scaled),
-    //                with `points_approximated` flag so the UI shows
-    //                "~X pts" and a tooltip explaining the math.
+    // OUT-side effective rate — primary signal is the user's pre-sale
+    // start rate; for noisy/ambiguous user data we defer to a global
+    // "is this a starter-tier asset" signal (price + ownership + season
+    // starts) so a small or partial pre-sale sample doesn't mislabel a
+    // clear starter as bench (or vice versa).
+    //
+    // Cases:
+    //   rate ≥ 50% AND owned ≥ 2     → starter (effective = 1, full raw)
+    //   rate < 25% AND owned ≥ 4     → bench (effective = 0, with badge)
+    //   no pre-sale data (owned = 0) → defer to global signal
+    //   anything else (ambiguous)    → defer to global signal:
+    //     - global says starter      → effective = 1
+    //     - global says fringe       → linear scaling (rate × raw) with "~"
     const outStarter = outStarterRateMap.get(`${t.out_element}:${t.gw}`) ?? {
-      rate: 1,
+      rate: 0,
       owned: 0,
     };
     const STARTER_THRESHOLD = 0.5;
     const BENCH_ROLE_THRESHOLD = 0.25;
+    const CONFIDENT_SAMPLE = 4;
     const rawRate = outStarter.rate;
-    const effectiveRate =
-      rawRate >= STARTER_THRESHOLD
-        ? 1
-        : rawRate < BENCH_ROLE_THRESHOLD
-          ? 0
-          : rawRate;
+    const ownedGws = outStarter.owned;
+    const outMeta = meta.get(t.out_element);
+    const outLikelyStarter = isLikelyStarter(outMeta);
+    let effectiveRate: number;
+    if (ownedGws === 0) {
+      effectiveRate = outLikelyStarter ? 1 : 0;
+    } else if (rawRate >= STARTER_THRESHOLD && ownedGws >= 2) {
+      effectiveRate = 1;
+    } else if (rawRate < BENCH_ROLE_THRESHOLD && ownedGws >= CONFIDENT_SAMPLE) {
+      effectiveRate = 0;
+    } else if (outLikelyStarter) {
+      effectiveRate = 1;
+    } else {
+      effectiveRate = rawRate;
+    }
     const outPts = outPointsInWindow(
       perRound,
       t.out_element,
@@ -959,17 +1005,13 @@ export const getManagerTransfers = async (
       allFhGws,
       "kept_counterfactual",
     );
-    // Bench-role and approximation flags drive the UI's tile badges:
-    //   bench_role  → small armchair icon next to the points text
-    //   points_approximated → "~" prefix on the points number + tooltip
-    // Both require ≥ 2 GWs of usable data so single-GW windows or
-    // single-GW ownership histories don't trigger noisy labels.
-    const outBenchRole =
-      outStarter.owned >= 2 && rawRate < BENCH_ROLE_THRESHOLD;
-    const outPointsApproximated =
-      outStarter.owned >= 2 &&
-      rawRate >= BENCH_ROLE_THRESHOLD &&
-      rawRate < STARTER_THRESHOLD;
+    // Bench-role and approximation flags follow directly from the
+    // effective-rate decision above:
+    //   effective = 0          → bench (armchair badge)
+    //   effective in (0, 1)    → linear-scaled (~ prefix + tooltip)
+    //   effective = 1          → starter (no indicator)
+    const outBenchRole = effectiveRate === 0;
+    const outPointsApproximated = effectiveRate > 0 && effectiveRate < 1;
     const inWindowGws = windowEnd - t.gw + 1;
     let inStartedGws = 0;
     for (let g = t.gw; g <= windowEnd; g += 1) {
