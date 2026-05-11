@@ -471,7 +471,7 @@ model rank_band_player_exposure_gw {
 //
 // Refreshed at the end of every `populateManagers` run via
 // `rebuildStratumGwRunningStats` (a single GROUP BY (stratum, gw) over
-// manager_cumulative), or out-of-band via `backfillStratumGwRunningStats`.
+// manager_cumulative), or out-of-band via `npm run rebuild-manager-read-models`.
 //
 // 3 strata × 38 GWs = 114 rows, ~150 bytes each — fits in a single buffer
 // page.

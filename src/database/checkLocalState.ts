@@ -161,7 +161,7 @@ const main = async (): Promise<void> => {
   );
   if (runningStats.length === 0) {
     console.info(
-      "  EMPTY — run `npm run backfill-stratum-running-stats` after schema migration.",
+      "  EMPTY — run `npm run rebuild-manager-read-models` after schema migration.",
     );
   } else {
     for (const r of runningStats) {
@@ -216,7 +216,7 @@ const main = async (): Promise<void> => {
 
   if (captainBuckets === 0) {
     console.info(
-      "  ❌ stratum_captain_picks_gw empty — derived from manager_picks; populate that first then re-run `backfill-stratum-captain-picks`.",
+      "  ❌ stratum_captain_picks_gw empty — derived from manager_picks; populate that first then re-run `npm run rebuild-manager-read-models`.",
     );
   } else {
     console.info("  ✅ stratum_captain_picks_gw populated.");
@@ -233,7 +233,7 @@ const main = async (): Promise<void> => {
   const runningRows = runningStats.reduce((acc, r) => acc + Number(r.rows), 0);
   if (runningRows === 0) {
     console.info(
-      "  ❌ stratum_gw_running_stats empty — run `npm run backfill-stratum-running-stats` after manager_cumulative is populated.",
+      "  ❌ stratum_gw_running_stats empty — run `npm run rebuild-manager-read-models` after manager_cumulative is populated.",
     );
   } else {
     console.info("  ✅ stratum_gw_running_stats populated.");

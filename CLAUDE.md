@@ -20,6 +20,16 @@ Node.js backend for FPL Trends. Fetches Fantasy Premier League data, stores in P
 - System cron triggers populate (no in-process scheduler)
 - No backups — rebuild-on-failure stance
 
+### Cron line
+
+The populate cron should be wrapped in `timeout` so a hung run can't hold the lockfile past one tick:
+
+```
+*/15 * * * * cd /home/deploy/fpl-trends-api && /usr/bin/timeout 1800 /usr/bin/node dist/database/populateManagers.js >> /home/deploy/populate-managers.log 2>&1
+```
+
+The `1800` (30 min) matches `LOCK_MAX_AGE_MS` in `populateManagers.ts`: at the same moment OS-level `timeout` SIGTERMs a runaway process, the next tick's `isLockStale` check would also reclaim the lock. Two independent watchdogs, same threshold.
+
 ### Quick ops commands
 
 ```bash
@@ -41,7 +51,6 @@ cd ~/fpl-trends-api && npm run reset-season && npm run populate && pm2 restart f
 
 # Backfills (one-off, idempotent):
 npm run backfill-cumulative              # required after schema migrations that add cumulative cols
-npm run backfill-stratum-captain-picks   # optional; populate cron does the same at end of each tick
 npm run backfill-picks                   # one-off historic catch-up of manager_picks (heavy FPL load)
 
 # Diagnostic — prints row counts for every My Trends-relevant table:
@@ -241,8 +250,8 @@ npm run populate                       — Fetch FPL bulk data into DB (season-a
 npm run populate-managers              — Walk standings + ingest manager histories (cron job entrypoint)
 npm run reset-season                   — Wipe all season data (run populate after)
 npm run backfill-cumulative            — Bulk-build manager_cumulative from manager_history
-npm run backfill-stratum-captain-picks — Rebuild stratum_captain_picks_gw out-of-band
 npm run backfill-picks                 — One-off historic catch-up of manager_picks (heavy FPL load)
+npm run rebuild-manager-read-models    — Rebuild stratum_gw_running_stats, stratum_captain_picks_gw, etc. out-of-band
 npm run check-local-state              — Print row counts for every My Trends-relevant table
 npm start                              — node dist/server.js
 npm run lint                           — ESLint check

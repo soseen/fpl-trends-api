@@ -145,8 +145,11 @@ const SAMPLE_GW_KEY = "manager_sample_gw";
 const CURSOR_FORMAT_KEY = "manager_walk_cursor_version";
 const CURRENT_CURSOR_FORMAT_VERSION = 4;
 const LOCKFILE_PATH = path.join(os.tmpdir(), "fpl-populate-managers.lock");
-// Conservative max age — a normal run is ~13 min; anything older than this
-// can only mean the previous owner died without releasing.
+// Conservative max age — a normal run is ~13 min, peak ~20 min on heavy
+// ticks. Anything past 30 min is stuck: a DB query that's spinning on
+// disk pressure, an FPL HTTP call without a timeout, or a hard hang we
+// can't otherwise see. We treat it as recoverable and reclaim — see
+// isLockStale below.
 const LOCK_MAX_AGE_MS = 30 * 60 * 1000;
 
 const releaseLock = (): void => {
@@ -176,26 +179,44 @@ const isLockStale = (): boolean => {
     return false;
   }
 
+  let mtimeMs = 0;
+  try {
+    mtimeMs = fs.statSync(LOCKFILE_PATH).mtimeMs;
+  } catch {
+    return false;
+  }
+  const tooOld = Date.now() - mtimeMs > LOCK_MAX_AGE_MS;
+
   const pid = parseInt(contents.trim(), 10);
   if (Number.isFinite(pid) && pid > 0) {
     try {
       process.kill(pid, 0);
-      return false;
     } catch (err) {
-      // ESRCH = process is gone. EPERM = exists but owned by another user
-      // (alive on this host) — leave it alone.
+      // ESRCH = process is gone (stale, regardless of age).
+      // EPERM = exists but owned by another user — leave it alone.
       return (err as NodeJS.ErrnoException).code === "ESRCH";
     }
+    // Process is alive. Fresh = let it run; stuck-past-LOCK_MAX_AGE = kill
+    // it and reclaim. Without this, a hung populate-managers (e.g. blocked
+    // on a Postgres query during a disk-pressure incident) holds the lock
+    // forever and every subsequent cron tick exits with "Another run
+    // holds the lock".
+    if (!tooOld) return false;
+    try {
+      process.kill(pid, "SIGTERM");
+      console.warn(
+        `[populateManagers] Lockfile age exceeds ${LOCK_MAX_AGE_MS / 60_000} min — SIGTERM'd alive-but-stuck PID ${pid}.`,
+      );
+    } catch {
+      // Race: process exited between our liveness check and the signal.
+      // Either way, fall through to the stale path.
+    }
+    return true;
   }
 
   // PID unparseable — fall back to mtime so a corrupt lockfile can still
   // self-heal once it's well past any plausible run length.
-  try {
-    const stat = fs.statSync(LOCKFILE_PATH);
-    return Date.now() - stat.mtimeMs > LOCK_MAX_AGE_MS;
-  } catch {
-    return false;
-  }
+  return tooOld;
 };
 
 const acquireLock = (): boolean => {
@@ -840,9 +861,9 @@ const ingestFromStandings = async ({
 // a transaction so readers always see a consistent snapshot — no partial
 // state where some captains/GWs are missing.
 //
-// Exported so backfillStratumCaptainPicks.ts can run the same operation
-// out-of-band (e.g. immediately after deploying the schema, before the
-// next populate cron tick).
+// Exported so rebuildManagerReadModels can call this out-of-band (e.g.
+// immediately after deploying the schema, before the next populate cron
+// tick).
 export const rebuildStratumCaptainPicks = async (): Promise<void> => {
   await prisma.$transaction([
     prisma.$executeRawUnsafe(`TRUNCATE stratum_captain_picks_gw`),
@@ -944,10 +965,10 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
 // managers who have a row at the current max GW — i.e. the cohort that
 // is actually up-to-date — so the subtraction is well-defined.
 //
-// Exported so backfillStratumGwRunningStats.ts can run the same operation
-// out-of-band (e.g. immediately after applying the schema migration so
-// the new read path has a populated table to read from before the next
-// 15-minute populate tick).
+// Exported so rebuildManagerReadModels can call this out-of-band (e.g.
+// immediately after applying the schema migration so the new read path
+// has a populated table to read from before the next 15-minute populate
+// tick).
 export const rebuildStratumGwRunningStats = async (): Promise<void> => {
   await prisma.$transaction([
     prisma.$executeRawUnsafe(`TRUNCATE stratum_gw_running_stats`),
