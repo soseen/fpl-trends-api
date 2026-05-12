@@ -1,7 +1,11 @@
 import { prisma } from "../database/client.js";
 import { resolveTransfers, type TransferRow } from "./resolveTransfers.js";
 import { fetchEntryHistory } from "./fetchManager.js";
-import { resolvePicks, type PickRow } from "./resolvePicks.js";
+import {
+  readPersistedPicks,
+  resolvePicks,
+  type PickRow,
+} from "./resolvePicks.js";
 import { fetchHistoryPointsByRound } from "./transferImpactCalc.js";
 import {
   fetchPlayerGwRankStats,
@@ -694,22 +698,31 @@ export const getManagerTransfers = async (
   //   3. resolvePicks — full XV per GW. Shared in-flight with the
   //      comparison & team-impact endpoints, so the picks fetches
   //      happen once across the My Trends panel.
-  // Picks range covers GW1..endGw, not just the user's selected range.
-  // The pre-transfer scan in buildOutStarterRateMap needs each OUT
-  // player's FULL pre-transfer ownership/start history; if the slider
-  // starts mid-season we used to see only a partial slice (e.g. just
-  // a single benched GW immediately before the sale), which collapsed
-  // started/owned to 0/1 and silently zeroed the OUT contribution.
-  // Picks are DB-cached per (entry, gw) after first fetch, so the
-  // wider window only costs extra FPL calls on a cold cache.
-  const finishedRange: number[] = [];
-  for (let g = 1; g <= endGw; g += 1) finishedRange.push(g);
+  // We must have final-XV picks for the selected range, but fetching
+  // GW1..endGw from FPL on a cold user blocks the whole My Trends panel
+  // behind dozens of HTTP calls. Use already-persisted older picks when
+  // present (including start-1 for wildcard/free-hit diffing), and fall
+  // back to the global starter-tier signal when historical picks have not
+  // been cached yet.
+  const requiredPicksStart = startGw;
+  const requiredPicksRange: number[] = [];
+  for (let g = requiredPicksStart; g <= endGw; g += 1) {
+    requiredPicksRange.push(g);
+  }
 
-  const [resolved, history, resolvedPicks] = await Promise.all([
-    resolveTransfers(entryId, true),
-    fetchEntryHistory(entryId),
-    resolvePicks(entryId, finishedRange),
-  ]);
+  const [resolved, history, resolvedRequiredPicks, historicalPicks] =
+    await Promise.all([
+      resolveTransfers(entryId, true),
+      fetchEntryHistory(entryId),
+      resolvePicks(entryId, requiredPicksRange),
+      startGw > 1
+        ? readPersistedPicks(entryId, 1, startGw - 1)
+        : Promise.resolve([]),
+    ]);
+  const resolvedPicks = {
+    picks: [...historicalPicks, ...resolvedRequiredPicks.picks],
+    incomplete: resolvedRequiredPicks.incomplete,
+  };
 
   const inRange = resolved.rows.filter(
     (t: TransferRow) => t.gw >= startGw && t.gw <= endGw,

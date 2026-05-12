@@ -516,28 +516,11 @@ const captainSampleMinimum = (
   return 1_500;
 };
 
-// Per-stratum sample aggregates for captain stats. Two precomputed reads,
-// no per-request LATERAL joins:
-//
-// 1. avg_bonus — average captain bonus across managers with FULL picks
-//    coverage in [startGw..endGw]. Reads cumulative_captain_bonus and
-//    picks_count_cum from manager_cumulative; range delta of
-//    picks_count_cum equals expectedGws iff the manager has a picks row
-//    at every GW in the range. Same accuracy gate as the previous slow
-//    path (which ran COUNT(DISTINCT mp.gw) = expectedGws over
-//    manager_picks ⨝ history with a LATERAL captain-points subquery).
-//    Both numbers monotonically converge as backfillPicks fills history.
-//
-// 2. most_captained — sum of pick counts across stratum_captain_picks_gw
-//    in the range, take argmax. Tiny precomputed table (~17k rows total),
-//    rebuilt at the end of each populateManagers run. Trade-off vs. the
-//    previous "complete-coverage-only most-captained": partial-coverage
-//    managers contribute their captain choices for ingested GWs, so a
-//    minority of partially-ingested managers can shift the argmax. In
-//    practice the most-captained over a range is a high-popularity
-//    player and this drift is rare; the captain_average_partial flag
-//    surfaced in the response notes lets the UI hedge the label when
-//    coverage is below threshold.
+// Hot path note: avg_bonus is now computed from stratum_captain_picks_gw
+// and the small player-history slice. Avoid joining manager_cumulative here;
+// that production query scanned hundreds of thousands of rows per request.
+// Most-captained also comes from stratum_captain_picks_gw by summing the
+// range and taking the most frequent captain among played-captain rows.
 const sampleCaptainAggregate = async (
   startGw: number,
   endGw: number,
@@ -546,7 +529,8 @@ const sampleCaptainAggregate = async (
   avg_bonus: number | null;
   most_captained_id: number | null;
   most_captained_name: string | null;
-  complete_managers: number;
+  min_gw_sample: number;
+  gws_with_data: number;
 }> => {
   const strata =
     stratumFilter === "stratum1"
@@ -558,39 +542,51 @@ const sampleCaptainAggregate = async (
   const minimum = captainSampleMinimum(stratumFilter);
 
   const [bonusRows, mostRows] = await Promise.all([
-    // Two anchored lookups (gw=endGw and gw=startGw-1) joined by
-    // entry_id, filtered to managers whose picks_count_cum delta equals
-    // expectedGws (full coverage in the range). Range captain bonus per
-    // manager = cumulative_captain_bonus[end] − cumulative_captain_bonus[start-1].
-    // start row is null for ranges starting at GW 1 — COALESCE to 0.
+    // Per-GW expected captain bonus from pre-aggregated captain-pick counts.
+    // Covers the range without scanning manager_cumulative snapshots.
     prisma.$queryRawUnsafe<
-      Array<{ avg_bonus: number | null; complete_managers: number }>
+      Array<{
+        avg_bonus: number | null;
+        min_gw_sample: number | null;
+        gws_with_data: number;
+      }>
     >(
       `
-      WITH e AS (
-        SELECT entry_id, cumulative_captain_bonus, picks_count_cum
-        FROM manager_cumulative
-        WHERE gw = $2 AND stratum = ANY($3::int[])
-      ),
-      s AS (
-        SELECT entry_id, cumulative_captain_bonus, picks_count_cum
-        FROM manager_cumulative
-        WHERE gw = $1 - 1 AND stratum = ANY($3::int[])
+      WITH player_points AS (
+        SELECT footballer_id, round, SUM(total_points)::int AS total_points
+        FROM history
+        WHERE round BETWEEN $1 AND $2
+        GROUP BY footballer_id, round
+      ), per_gw AS (
+        SELECT
+          sc.gw,
+          SUM(
+            sc.picks
+              * COALESCE(pp.total_points, 0)
+              * GREATEST(sc.captain_multiplier - 1, 0)
+          )::float AS bonus_sum,
+          SUM(sc.picks)::int AS sample_size
+        FROM stratum_captain_picks_gw sc
+        LEFT JOIN player_points pp
+          ON pp.footballer_id = sc.captain_element AND pp.round = sc.gw
+        WHERE sc.stratum = ANY($3::int[])
+          AND sc.gw BETWEEN $1 AND $2
+        GROUP BY sc.gw
       )
       SELECT
-        AVG(
-          e.cumulative_captain_bonus
-            - COALESCE(s.cumulative_captain_bonus, 0)
+        SUM(
+          CASE
+            WHEN sample_size > 0 THEN bonus_sum / sample_size
+            ELSE 0
+          END
         )::float AS avg_bonus,
-        COUNT(*)::int AS complete_managers
-      FROM e
-      LEFT JOIN s USING (entry_id)
-      WHERE (e.picks_count_cum - COALESCE(s.picks_count_cum, 0)) = $4
+        MIN(sample_size)::int AS min_gw_sample,
+        COUNT(*)::int AS gws_with_data
+      FROM per_gw
       `,
       startGw,
       endGw,
       strata,
-      expectedGws,
     ),
     // Most-captained over the range from the precomputed pick-counts
     // table. Filters captain_multiplier >= 2 to exclude rows where the
@@ -614,13 +610,15 @@ const sampleCaptainAggregate = async (
   ]);
 
   const bonusRow = bonusRows[0];
-  const completeManagers = bonusRow?.complete_managers ?? 0;
-  if (completeManagers < minimum) {
+  const minGwSample = bonusRow?.min_gw_sample ?? 0;
+  const gwsWithData = bonusRow?.gws_with_data ?? 0;
+  if (gwsWithData < expectedGws || minGwSample < minimum) {
     return {
       avg_bonus: null,
       most_captained_id: null,
       most_captained_name: null,
-      complete_managers: completeManagers,
+      min_gw_sample: minGwSample,
+      gws_with_data: gwsWithData,
     };
   }
 
@@ -629,7 +627,8 @@ const sampleCaptainAggregate = async (
     avg_bonus: bonusRow?.avg_bonus ?? null,
     most_captained_id: mostId,
     most_captained_name: await footballerName(mostId),
-    complete_managers: completeManagers,
+    min_gw_sample: minGwSample,
+    gws_with_data: gwsWithData,
   };
 };
 
@@ -977,7 +976,7 @@ export const getManagerComparison = async (
       // themselves that some of their own picks weren't fetched).
       captain_average_partial:
         userPicks.incomplete ||
-        (activeCaptainAgg.complete_managers > 0 &&
+        (activeCaptainAgg.gws_with_data > 0 &&
           activeCaptainAgg.avg_bonus === null),
       // Transfers-per-manager backfill is still trickling in via
       // backfillManagerTransfers / per-visit ingestTransfersForEntry; gate

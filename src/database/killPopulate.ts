@@ -63,7 +63,9 @@ const main = async (): Promise<void> => {
     return;
   }
 
-  console.info(`[killPopulate] Sending SIGTERM to populate-managers PID ${pid}…`);
+  console.info(
+    `[killPopulate] Sending SIGTERM to populate-managers PID ${pid}…`,
+  );
   try {
     process.kill(pid, "SIGTERM");
   } catch (err) {

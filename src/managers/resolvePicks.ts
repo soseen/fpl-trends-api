@@ -39,7 +39,7 @@ export type ResolvedPicks = {
   incomplete: boolean;
 };
 
-const readPersistedPicks = async (
+export const readPersistedPicks = async (
   entryId: number,
   startGw: number,
   endGw: number,
