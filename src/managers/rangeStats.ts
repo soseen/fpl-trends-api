@@ -144,46 +144,57 @@ export const rangeDensityFromCumulative = async (
   const hi = userOverallTotal + halfWindow;
   const startMinusOne = startGw - 1;
 
-  const [rows, trueSize] = await Promise.all([
+  const [densityRows, averageRows, trueSize] = await Promise.all([
     prisma.$queryRawUnsafe<
       Array<{
-        sample_size: bigint | number | null;
         neighbours: bigint | number | null;
-        sum_range_total: bigint | number | null;
       }>
     >(
       `
       SELECT
-        COUNT(*)::bigint AS sample_size,
-        COUNT(*) FILTER (
-          WHERE c_end.cumulative_points BETWEEN $4 AND $5
-        )::bigint AS neighbours,
-        SUM(
-          c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0)
-        )::bigint AS sum_range_total
+        COUNT(*)::bigint AS neighbours
       FROM manager_cumulative c_end
-      LEFT JOIN manager_cumulative c_start
-        ON c_start.entry_id = c_end.entry_id AND c_start.gw = $6
-      WHERE c_end.stratum = $1 AND c_end.gw = $3
+      WHERE c_end.stratum = $1
+        AND c_end.gw = $3
+        AND c_end.cumulative_points BETWEEN $4 AND $5
       `,
       stratum,
       startGw,
       endGw,
       lo,
       hi,
+    ),
+    prisma.$queryRawUnsafe<
+      Array<{
+        sample_size: number | null;
+        sum_range_total: bigint | number | null;
+      }>
+    >(
+      `
+      SELECT
+        e.sample_size,
+        e.sum_cum_points - COALESCE(s.sum_cum_points, 0)::bigint
+          AS sum_range_total
+      FROM stratum_gw_running_stats e
+      LEFT JOIN stratum_gw_running_stats s
+        ON s.stratum = e.stratum AND s.gw = $2
+      WHERE e.stratum = $1 AND e.gw = $3
+      `,
+      stratum,
       startMinusOne,
+      endGw,
     ),
     trueStratumSizes(endGw),
   ]);
 
-  const row = rows[0];
-  const sampleSize = toNumber(row?.sample_size);
-  if (!row || sampleSize === 0) {
+  const averageRow = averageRows[0];
+  const sampleSize = averageRow?.sample_size ?? 0;
+  if (!averageRow || sampleSize === 0) {
     return { rankPerPoint: null, stratumAverage: null };
   }
 
-  const neighbours = toNumber(row.neighbours);
-  const sumRangeTotal = toNumber(row.sum_range_total);
+  const neighbours = toNumber(densityRows[0]?.neighbours);
+  const sumRangeTotal = toNumber(averageRow.sum_range_total);
   const density = neighbours / Math.max(1, 2 * halfWindow);
   const extrapolation = trueSize[stratum] / sampleSize;
   const rankPerPoint = density * extrapolation;
