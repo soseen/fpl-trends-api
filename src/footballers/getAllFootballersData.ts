@@ -26,6 +26,7 @@ export const getFootballersWithHistoryAndFixtures = async () => {
       assists: true,
       clean_sheets: true,
       expected_goals_per_90: true,
+      expected_assists_per_90: true,
       expected_goal_involvements_per_90: true,
       expected_goals_conceded_per_90: true,
       defensive_contribution: true,
