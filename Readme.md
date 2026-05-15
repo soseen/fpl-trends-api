@@ -116,18 +116,18 @@ prisma/
 
 10 tables, all defined in `prisma/schema.prisma`.
 
-| Table | Purpose | Key fields |
-|---|---|---|
-| `app_metadata` | Application state KV store | `key`, `value` (stores `current_season`, manager ingest cursors) |
-| `footballers` | Player data (~100+ columns) | `id`, `web_name`, `team_id`, `now_cost`, `total_points`, `xG`, `xA`, `xGI`, `ICT`, `form`, `status`, per-90 variants |
-| `history` | Per-match player stats | composite PK `(footballer_id, fixture_id)`, `total_points`, goals, assists, xG, xGI, xGC, minutes, opponent |
-| `footballer_fixtures` | Upcoming fixtures per player | `footballer_id`, `fixture_id`, `difficulty`, `is_home`, `team_h`, `team_a` |
-| `teams` | Club data + strength ratings | `id`, `name`, `short_name`, `strength_*` (attack/defence × home/away) |
-| `team_history` | Aggregated team stats per GW | composite PK `(team_id, round)`, `teamXGS`, `teamXGC`, `goals`, `goals_conceded` |
-| `events` | Gameweek metadata | `id`, `name`, `finished`, `is_current`, `deadline_time`, `most_selected`, `top_element`, `ranked_count`, `chip_plays` |
-| `manager_summary` | One row per FPL manager evaluated for the rank-estimation sample | `entry_id`, `overall_rank`, `total_points`, `stratum` (1/2/3), `rejected_reason`, `last_checked_gw` |
-| `manager_history` | Per-GW net points + transfer/bench data for sampled managers (all classifications) | composite PK `(entry_id, gw)`, `points`, `event_transfers`, `event_transfers_cost`, `points_on_bench` |
-| `manager_picks` | Per-GW captain choice + active chip per sampled manager | composite PK `(entry_id, gw)`, `captain_element`, `vice_captain_element`, `captain_multiplier`, `active_chip` |
+| Table                 | Purpose                                                                            | Key fields                                                                                                            |
+| --------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `app_metadata`        | Application state KV store                                                         | `key`, `value` (stores `current_season`, manager ingest cursors)                                                      |
+| `footballers`         | Player data (~100+ columns)                                                        | `id`, `web_name`, `team_id`, `now_cost`, `total_points`, `xG`, `xA`, `xGI`, `ICT`, `form`, `status`, per-90 variants  |
+| `history`             | Per-match player stats                                                             | composite PK `(footballer_id, fixture_id)`, `total_points`, goals, assists, xG, xGI, xGC, minutes, opponent           |
+| `footballer_fixtures` | Upcoming fixtures per player                                                       | `footballer_id`, `fixture_id`, `difficulty`, `is_home`, `team_h`, `team_a`                                            |
+| `teams`               | Club data + strength ratings                                                       | `id`, `name`, `short_name`, `strength_*` (attack/defence × home/away)                                                 |
+| `team_history`        | Aggregated team stats per GW                                                       | composite PK `(team_id, round)`, `teamXGS`, `teamXGC`, `goals`, `goals_conceded`                                      |
+| `events`              | Gameweek metadata                                                                  | `id`, `name`, `finished`, `is_current`, `deadline_time`, `most_selected`, `top_element`, `ranked_count`, `chip_plays` |
+| `manager_summary`     | One row per FPL manager evaluated for the rank-estimation sample                   | `entry_id`, `overall_rank`, `total_points`, `stratum` (1/2/3), `rejected_reason`, `last_checked_gw`                   |
+| `manager_history`     | Per-GW net points + transfer/bench data for sampled managers (all classifications) | composite PK `(entry_id, gw)`, `points`, `event_transfers`, `event_transfers_cost`, `points_on_bench`                 |
+| `manager_picks`       | Per-GW captain choice + active chip per sampled manager                            | composite PK `(entry_id, gw)`, `captain_element`, `vice_captain_element`, `captain_multiplier`, `active_chip`         |
 
 Cascade delete is set on the `footballers → history`, `footballers → footballer_fixtures`, `teams → team_history`, `manager_summary → manager_history`, and `manager_summary → manager_picks` relations. The three manager tables are wiped on season change (they're season-scoped — points and picks only make sense within the season they were earned).
 
@@ -139,18 +139,18 @@ Cascade delete is set on the `footballers → history`, `footballers → footbal
 
 Read endpoints are intentionally unauthenticated — the data they serve is public FPL data and the app has no user accounts. The privileged `/api/populate` route requires `Authorization: Bearer $ADMIN_TOKEN`. CORS allowlist is configured via `ALLOWED_ORIGINS`. All `/api/*` routes are rate-limited to **60 requests per minute per IP**; exceeding the limit returns `429` with `RateLimit-*` headers.
 
-| Method | Path | Auth | Returns |
-|---|---|---|---|
-| `GET` | `/api/health` | — | Liveness + DB ping. `200` if DB reachable, `503` otherwise |
-| `GET` | `/api/footballersData` | — | All players with team, history, and fixtures (Prisma `include`) |
-| `GET` | `/api/teamsData` | — | All teams with `team_history` |
-| `GET` | `/api/totalPlayersCount` | — | `{ totalPlayers: number }` |
-| `GET` | `/api/eventsData` | — | Gameweek events |
-| `GET` | `/api/populate` | **Bearer** | Triggers a full data refresh from the FPL API |
-| `GET` | `/api/manager/:id/summary` | — | Manager identity + season totals (proxies `/api/entry/{id}/`) |
-| `GET` | `/api/manager/:id/range-rank?start=X&end=Y` | — | Estimated rank within GW range (see [Manager rank estimation](#manager-rank-estimation-my-trends)) |
-| `GET` | `/api/manager/:id/trajectory?start=X&end=Y` | — | Per-GW cumulative rank trajectory for the chart on `/my-trends` |
-| `GET` | `/api/manager/:id/comparison?start=X&end=Y` | — | Stats vs sample average + top-10k (see [Manager comparison](#manager-comparison-sample-averages--top-10k)) |
+| Method | Path                                        | Auth       | Returns                                                                                                    |
+| ------ | ------------------------------------------- | ---------- | ---------------------------------------------------------------------------------------------------------- |
+| `GET`  | `/api/health`                               | —          | Liveness + DB ping. `200` if DB reachable, `503` otherwise                                                 |
+| `GET`  | `/api/footballersData`                      | —          | All players with team, history, and fixtures (Prisma `include`)                                            |
+| `GET`  | `/api/teamsData`                            | —          | All teams with `team_history`                                                                              |
+| `GET`  | `/api/totalPlayersCount`                    | —          | `{ totalPlayers: number }`                                                                                 |
+| `GET`  | `/api/eventsData`                           | —          | Gameweek events                                                                                            |
+| `GET`  | `/api/populate`                             | **Bearer** | Triggers a full data refresh from the FPL API                                                              |
+| `GET`  | `/api/manager/:id/summary`                  | —          | Manager identity + season totals (proxies `/api/entry/{id}/`)                                              |
+| `GET`  | `/api/manager/:id/range-rank?start=X&end=Y` | —          | Estimated rank within GW range (see [Manager rank estimation](#manager-rank-estimation-my-trends))         |
+| `GET`  | `/api/manager/:id/trajectory?start=X&end=Y` | —          | Per-GW cumulative rank trajectory for the chart on `/my-trends`                                            |
+| `GET`  | `/api/manager/:id/comparison?start=X&end=Y` | —          | Stats vs sample average + top-10k (see [Manager comparison](#manager-comparison-sample-averages--top-10k)) |
 
 The manager endpoints validate `:id` (positive integer ≤ 20M) and `start`/`end` (1 ≤ start ≤ end ≤ 38). They return `400` on invalid input, `404` if FPL doesn't recognise the entry, `502` on upstream FPL failures.
 
@@ -418,11 +418,11 @@ sudo systemctl reload nginx
 
 #### 10. DNS (at registrar — currently Porkbun → Cloudflare)
 
-| Type | Host | Value |
-|---|---|---|
-| A | `@` | `91.98.145.120` |
-| A | `www` | `91.98.145.120` |
-| AAAA | `@` | `2a01:4f8:c013:a22c::1` |
+| Type | Host  | Value                   |
+| ---- | ----- | ----------------------- |
+| A    | `@`   | `91.98.145.120`         |
+| A    | `www` | `91.98.145.120`         |
+| AAAA | `@`   | `2a01:4f8:c013:a22c::1` |
 | AAAA | `www` | `2a01:4f8:c013:a22c::1` |
 
 Wait until `nslookup fpltrends.live` resolves to the IP before running certbot.
@@ -553,14 +553,14 @@ If the health check returns `503` with `db.status: "down"`, the `.env` and the p
 
 ### Logs
 
-| What | Where |
-|---|---|
+| What              | Where                                                       |
+| ----------------- | ----------------------------------------------------------- |
 | API stdout/stderr | `pm2 logs fpl-trends-api` (also files under `~/.pm2/logs/`) |
-| nginx access | `/var/log/nginx/access.log` |
-| nginx error | `/var/log/nginx/error.log` |
-| populate cron | `/home/deploy/populate.log` |
-| Postgres | `/var/log/postgresql/` |
-| auth/SSH | `journalctl -u ssh` |
+| nginx access      | `/var/log/nginx/access.log`                                 |
+| nginx error       | `/var/log/nginx/error.log`                                  |
+| populate cron     | `/home/deploy/populate.log`                                 |
+| Postgres          | `/var/log/postgresql/`                                      |
+| auth/SSH          | `journalctl -u ssh`                                         |
 
 ---
 
@@ -611,25 +611,25 @@ For an incoming request:
 1. Fetch the user live from FPL: `GET /entry/{id}/` and `GET /entry/{id}/history/`.
 2. Compute `userRangeTotal = Σ (points − event_transfers_cost)` over each GW in `[start, end]`.
 3. Resolve `STRATUM_C_MAX` dynamically as `MAX(events.ranked_count)` over finished GWs (currently ~12.6M and growing through the season).
-4. For each of the three strata, run a single SQL aggregate against `manager_history` to count how many *sampled* managers in that stratum scored ≥ `userRangeTotal` over the range.
+4. For each of the three strata, run a single SQL aggregate against `manager_history` to count how many _sampled_ managers in that stratum scored ≥ `userRangeTotal` over the range.
 5. Treat each stratum as a Bernoulli urn: extrapolate `higher_in_sample × STRATUM_TRUE_SIZE / total_probes` per stratum, then sum across all three. The denominator is **total probes** (active + inactive + trolling + fetch_failed), not the active subset — inactives' deleted-or-zero history sits below threshold and contributes to the denominator without inflating the numerator.
 6. **Cap** the final value at `events.ranked_count[endGw]`. Especially relevant for early-season ranges (only ~5.7M had ranks after GW 7).
 
 This replaced the older "scale within current stratum + flat 100k offset for strata above" approach (commits `820920d`, `023c25e`). Two head-to-head test cases against official FPL after the change:
 
-| Range | Pre-fix output | Final output | Official |
-|---|---|---|---|
-| GW 1–7 | 2,187,021 (+57%) | ≈ 1,420k–1,460k | 1,424,951 |
-| GW 1–15 | 751,000 (+73%) | ≈ 420k–460k | 434,000 |
+| Range   | Pre-fix output   | Final output    | Official  |
+| ------- | ---------------- | --------------- | --------- |
+| GW 1–7  | 2,187,021 (+57%) | ≈ 1,420k–1,460k | 1,424,951 |
+| GW 1–15 | 751,000 (+73%)   | ≈ 420k–460k     | 434,000   |
 
 ### Strata
 
-| Stratum | Overall rank band | Sampling | Typical scaling factor |
-|---|---|---|---|
-| A | 1 – 10,000 | full census via standings pages 1–200 | ~1× |
-| B | 10,001 – 100,000 | every 5th page from 201–2000 (1-in-5) | ~5× |
-| C | 100,001 – `MAX(events.ranked_count)` | random ID probing in `[1, 15,000,000]`, filtered to C range | depends on probe count (~1000–2500×) |
-| — | beyond `MAX(events.ranked_count)` | not addressable — endpoint returns the user's overall rank with `confidence: "approximate"` | — |
+| Stratum | Overall rank band                    | Sampling                                                                                    | Typical scaling factor               |
+| ------- | ------------------------------------ | ------------------------------------------------------------------------------------------- | ------------------------------------ |
+| A       | 1 – 10,000                           | full census via standings pages 1–200                                                       | ~1×                                  |
+| B       | 10,001 – 100,000                     | every 5th page from 201–2000 (1-in-5)                                                       | ~5×                                  |
+| C       | 100,001 – `MAX(events.ranked_count)` | random ID probing in `[1, 15,000,000]`, filtered to C range                                 | depends on probe count (~1000–2500×) |
+| —       | beyond `MAX(events.ranked_count)`    | not addressable — endpoint returns the user's overall rank with `confidence: "approximate"` | —                                    |
 
 `STRATUM_C_MAX` is dynamic. We previously hard-coded 10.4M, but FPL's ranked tail grows through the season — anyone past the static bound was silently un-rankable. Reading from `events.ranked_count` keeps stratum 3 sized to the actual population without redeploying every few weeks.
 
@@ -643,7 +643,7 @@ Each candidate's history is classified before insertion (see `src/managers/activ
 
 The flag is recorded on `manager_summary.rejected_reason`, but per-GW history is **kept for every classification**. That's the change that fixed the 35% GW1–5 undercount — currently-inactive managers who scored well early were invisible to the rank count when their history was deleted.
 
-> **Why keep troll history too?** A "trolling" manager's net points (`points − event_transfers_cost`) is normal-or-below — a -20 hit cost in one GW pulls net *down*, not up. They don't systematically beat anyone, and forcibly excluding them via `rejected_reason` would re-introduce a small undercount. The flag still gates *comparison-average* queries (hits/bench) where a single 60-hit account would skew the mean.
+> **Why keep troll history too?** A "trolling" manager's net points (`points − event_transfers_cost`) is normal-or-below — a -20 hit cost in one GW pulls net _down_, not up. They don't systematically beat anyone, and forcibly excluding them via `rejected_reason` would re-introduce a small undercount. The flag still gates _comparison-average_ queries (hits/bench) where a single 60-hit account would skew the mean.
 
 ### Defensive ingestion
 
@@ -677,11 +677,11 @@ Stratum C is intentionally always given budget so the deep tail starts to fill f
 
 ### Cursors stored in `app_metadata`
 
-| Key | Tracks |
-|---|---|
-| `manager_ingest_cursor_a` | Next page (1–200) for stratum A's standings walk |
-| `manager_ingest_cursor_b` | Next page (201–2000, advancing by 5) for stratum B |
-| _none for C_ | Stratum C uses random probing in `[1, 15_000_000]` — no cursor; just keeps probing |
+| Key                       | Tracks                                                                             |
+| ------------------------- | ---------------------------------------------------------------------------------- |
+| `manager_ingest_cursor_a` | Next page (1–200) for stratum A's standings walk                                   |
+| `manager_ingest_cursor_b` | Next page (201–2000, advancing by 5) for stratum B                                 |
+| _none for C_              | Stratum C uses random probing in `[1, 15_000_000]` — no cursor; just keeps probing |
 
 When stratum A or B is fully covered, its cursor wraps back to its start page so the sample refreshes over time.
 
@@ -740,16 +740,16 @@ GROUP BY ms.stratum;
 
 ### Stats returned
 
-| Stat | User-side source | Sample / top-10k source |
-|---|---|---|
-| **Total points** | sum of `netPointsForEvent(ev)` over range | `AVG(SUM(mh.points))` per manager in stratum |
-| **Avg GW score** | range total ÷ GWs in range | `AVG(AVG(mh.points))` per manager — mean of per-manager means |
-| **Captain bonus** | per-GW picks fetch from FPL × captain GW points × `(multiplier − 1)` | `manager_picks ⨝ history` join, sum per manager, average across stratum |
-| **Most captained** | mode of captain elements across the range | mode of `mp.captain_element` across the stratum sample |
-| **Transfers made** | sum of `event_transfers` from FPL history | `AVG(SUM(mh.event_transfers))` per manager |
-| **Wildcards / Free hits / Bench boosts** | did the user play it in range? (0 / 1) | overall avg falls back to `events.chip_plays` rates; top-10k uses `manager_picks.active_chip` |
-| **Hits taken** | sum of `floor(event_transfers_cost / 4)` | `AVG(SUM(event_transfers_cost) / 4)` per manager |
-| **Points benched** | sum of `points_on_bench` | `AVG(SUM(points_on_bench))` per manager |
+| Stat                                     | User-side source                                                     | Sample / top-10k source                                                                       |
+| ---------------------------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| **Total points**                         | sum of `netPointsForEvent(ev)` over range                            | `AVG(SUM(mh.points))` per manager in stratum                                                  |
+| **Avg GW score**                         | range total ÷ GWs in range                                           | `AVG(AVG(mh.points))` per manager — mean of per-manager means                                 |
+| **Captain bonus**                        | per-GW picks fetch from FPL × captain GW points × `(multiplier − 1)` | `manager_picks ⨝ history` join, sum per manager, average across stratum                       |
+| **Most captained**                       | mode of captain elements across the range                            | mode of `mp.captain_element` across the stratum sample                                        |
+| **Transfers made**                       | sum of `event_transfers` from FPL history                            | `AVG(SUM(mh.event_transfers))` per manager                                                    |
+| **Wildcards / Free hits / Bench boosts** | did the user play it in range? (0 / 1)                               | overall avg falls back to `events.chip_plays` rates; top-10k uses `manager_picks.active_chip` |
+| **Hits taken**                           | sum of `floor(event_transfers_cost / 4)`                             | `AVG(SUM(event_transfers_cost) / 4)` per manager                                              |
+| **Points benched**                       | sum of `points_on_bench`                                             | `AVG(SUM(points_on_bench))` per manager                                                       |
 
 ### Captain stats (user-side)
 
@@ -791,7 +791,7 @@ For columns built on per-manager `manager_history` fields (hits, bench, transfer
 
 ### Why top-10k is "current top 10k", not "top 10k after GW X"
 
-Reconstructing per-GW historical leaderboards for 10k+ managers is impractical without storing ranks per GW. We use the *currently* top-10k cohort as the reference, which is — empirically — close to "best-of-season" for medium ranges and skews slightly toward "best-late-season" for short early ranges. For the comparison-table use case (i.e. "how do I stack up against the elite right now") this is the right framing.
+Reconstructing per-GW historical leaderboards for 10k+ managers is impractical without storing ranks per GW. We use the _currently_ top-10k cohort as the reference, which is — empirically — close to "best-of-season" for medium ranges and skews slightly toward "best-late-season" for short early ranges. For the comparison-table use case (i.e. "how do I stack up against the elite right now") this is the right framing.
 
 ---
 

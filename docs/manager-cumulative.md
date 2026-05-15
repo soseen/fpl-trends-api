@@ -41,12 +41,13 @@ data-coverage flags (`has_transfers`, `has_hits`, `has_bench`).
 1. **Schema** (see `prisma/schema.prisma`): primary key `(entry_id, gw)`,
    `stratum` and `rejected_reason` denormalised from `manager_summary` so
    the read path needs no join. Three indexes:
+
    - `(stratum, gw)` — for c_start (`WHERE stratum = X AND gw < Y` as a
      contiguous range).
    - `(stratum, rejected_reason, gw)` — same for the active-only c_start
      in `computeRankPerPoint` and `sampleStratumAggregates`.
    - `(stratum, entry_id, gw DESC)` — for c_end (`DISTINCT ON (entry_id)
-     ORDER BY entry_id, gw DESC` over a stratum partition). Without this
+ORDER BY entry_id, gw DESC` over a stratum partition). Without this
      index PG picks the primary key `(entry_id, gw)` and post-filters
      `stratum`, scanning the full table and Incremental-Sorting 12M+ rows.
 
@@ -64,7 +65,7 @@ data-coverage flags (`has_transfers`, `has_hits`, `has_bench`).
    `INSERT … SELECT … window function` batched by `entry_id` in chunks
    of 10k, populating the whole table from existing `manager_history`
    (plus joins for chips and captain bonus). `ON CONFLICT (entry_id, gw)
-   DO UPDATE` makes it safe to interrupt and rerun.
+DO UPDATE` makes it safe to interrupt and rerun.
 
 4. **Read paths**: `stratumCounts` and `computeRankPerPoint` (rank math),
    plus `sampleStratumAggregates` (comparison endpoint) all use

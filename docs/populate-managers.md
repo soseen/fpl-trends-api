@@ -16,11 +16,11 @@ After a few days running, the database holds enough breadth to estimate any user
 
 ## The three strata
 
-| Stratum | Whose ranks | How we sample them |
-|---|---|---|
-| **A** | top 10,000 overall | full census — pages 1–200 of FPL's "Overall" league |
-| **B** | 10,001 – 100,000 | every 5th page (1-in-5 sampling) of pages 201–2000 |
-| **C** | 100,001 – `MAX(events.ranked_count)` (~12.6M) | random entry-ID probing in `[1, 15,000,000]` |
+| Stratum | Whose ranks                                   | How we sample them                                  |
+| ------- | --------------------------------------------- | --------------------------------------------------- |
+| **A**   | top 10,000 overall                            | full census — pages 1–200 of FPL's "Overall" league |
+| **B**   | 10,001 – 100,000                              | every 5th page (1-in-5 sampling) of pages 201–2000  |
+| **C**   | 100,001 – `MAX(events.ranked_count)` (~12.6M) | random entry-ID probing in `[1, 15,000,000]`        |
 
 Stratum A is a full census so we know exactly. B is sampled densely enough that scaling × 5 is essentially direct measurement. C is the deep tail — sparse, extrapolated heavily.
 
@@ -33,7 +33,7 @@ For every manager the run touches:
 3. **Classify.** Active / inactive / trolling — recorded on `manager_summary.rejected_reason` (active = NULL).
 4. **Write history rows.** One per GW into `manager_history`, regardless of classification. (We need inactives' early scores for the rank count to be accurate.)
 5. **Fetch latest GW's picks.** If `manager_picks` is missing the current GW, hit `/entry/{id}/event/{currentGw}/picks/` — record captain, vice-captain, multiplier, active chip. Just the latest GW; historical depth is the picks-backfill's job.
-6. **Update `last_checked_gw`** so we skip them on subsequent runs *until a new GW finishes*.
+6. **Update `last_checked_gw`** so we skip them on subsequent runs _until a new GW finishes_.
 
 ## Budget allocation
 

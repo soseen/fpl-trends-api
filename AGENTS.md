@@ -22,8 +22,12 @@ Common commands:
 ```bash
 npm run dev
 npm run build
+npm run typecheck
 npm run lint
 npm run lint:fix
+npm run format
+npm run format:check
+npm run check
 npm run migrate
 npm run populate
 npm run populate-managers
@@ -37,6 +41,27 @@ npm run check-local-state
 Every tsx/node entrypoint that reads env vars must import
 `dotenv/config` at the top. Prisma CLI loads `.env`; `tsx` and compiled
 `node` do not.
+
+## Code Quality Workflow
+
+Before finishing changes, format and lint the files you touched:
+
+```bash
+npx prettier --write --ignore-unknown <changed files>
+npx eslint --fix <changed files>
+```
+
+Use `npm run lint` for a whole-API lint pass, `npm run typecheck` for a
+plain TypeScript check, and `npm run check` when you need the full local
+quality gate. ESLint is for code quality/import correctness; Prettier is
+the formatter.
+
+Type-only imports are required, but mixed value/type imports should stay
+clean with inline type specifiers when possible:
+
+```ts
+import express, { type Request, type Response } from "express";
+```
 
 ## Main Structure
 
@@ -153,4 +178,3 @@ than scanning `manager_history` or `manager_picks` on every request.
 - No production backups
 - Schema and manager analytics are evolving; prefer clear invariants in
   comments when touching cumulative/range logic
-

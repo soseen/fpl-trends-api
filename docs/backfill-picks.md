@@ -38,7 +38,7 @@ disown
 What each piece does:
 
 - `nohup` — survive SIGHUP when the SSH session ends.
-- `> backfill-picks.log 2>&1` — capture stdout *and* stderr to a file (otherwise they'd vanish when your terminal closes).
+- `> backfill-picks.log 2>&1` — capture stdout _and_ stderr to a file (otherwise they'd vanish when your terminal closes).
 - `&` — run in the background; you get your shell prompt back immediately.
 - `disown` — extra belt-and-braces; removes the job from the shell's job table.
 
@@ -139,7 +139,7 @@ The picks-fetch path is bottlenecked on FPL API throughput, not our DB or the go
 
 - **Once, after the schema migration that adds `manager_picks`** (commit `023c25e` includes the migration).
 - **Once after `npm run reset-season`** — the migration leaves the table; reset-season truncates it. Run picks backfill to refill.
-- **Optionally after expanding the sample** — e.g. you bumped `STRATUM_C_ID_MAX` in [`populateManagers.ts`](../src/database/populateManagers.ts) and want to retroactively backfill picks for newly-eligible managers (the cron's inline ingestion will only catch up their *current-GW* picks).
+- **Optionally after expanding the sample** — e.g. you bumped `STRATUM_C_ID_MAX` in [`populateManagers.ts`](../src/database/populateManagers.ts) and want to retroactively backfill picks for newly-eligible managers (the cron's inline ingestion will only catch up their _current-GW_ picks).
 
 ## When NOT to run it
 

@@ -2,7 +2,6 @@ import globals from "globals";
 import pluginJs from "@eslint/js";
 import tseslint from "typescript-eslint";
 import eslintConfigPrettier from "eslint-config-prettier";
-import eslintPluginPrettier from "eslint-plugin-prettier";
 
 /** @type {import('eslint').Linter.Config[]} */
 export default [
@@ -24,22 +23,7 @@ export default [
   ...tseslint.configs.recommendedTypeChecked,
   eslintConfigPrettier,
   {
-    plugins: {
-      prettier: eslintPluginPrettier,
-    },
     rules: {
-      /* Prettier integration */
-      "prettier/prettier": [
-        "error",
-        {
-          tabWidth: 2,
-          useTabs: false,
-          semi: true,
-          singleQuote: false,
-          endOfLine: "lf",
-        },
-      ],
-
       /* TypeScript strictness */
       "@typescript-eslint/no-explicit-any": "warn",
       "@typescript-eslint/no-unused-vars": [
@@ -48,7 +32,7 @@ export default [
       ],
       "@typescript-eslint/consistent-type-imports": [
         "error",
-        { prefer: "type-imports" },
+        { prefer: "type-imports", fixStyle: "inline-type-imports" },
       ],
 
       /* Valuable type-checked rules (keep) */
@@ -72,7 +56,7 @@ export default [
       "no-console": ["warn", { allow: ["warn", "error", "info"] }],
       "no-duplicate-imports": "error",
       "no-template-curly-in-string": "warn",
-      eqeqeq: ["error", "always"],
+      eqeqeq: ["error", "always", { null: "ignore" }],
     },
   },
   {

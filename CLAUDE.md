@@ -120,28 +120,35 @@ prisma/
 ## Database Schema
 
 ### app_metadata
+
 Key-value store for application state. Currently stores `current_season` (e.g. "2025-26") for season change detection.
 
 ### footballers
+
 Primary player table. ~100+ columns. Key fields: `id`, `web_name`, `first_name`, `second_name`, `team_id`, `now_cost`, `total_points`, `goals_scored`, `assists`, `expected_goals`, `expected_assists`, `expected_goal_involvements`, `expected_goals_conceded`, per-90 variants, ICT index fields with ranks, `form`, `status`, `selected_by_percent`, `minutes`, `starts`.
 
 Relations: `teams` (belongsTo via team_id), `history` (hasMany), `footballer_fixtures` (hasMany). Cascade delete on children.
 
 ### history
+
 Composite PK: `(footballer_id, fixture_id)`. Fields: `total_points`, `goals_scored`, `assists`, `clean_sheets`, `bonus`, `bps`, `expected_goals`, `expected_assists`, `expected_goals_conceded`, `expected_goal_involvements`, `opponent_team`, `was_home`, `round`, `kickoff_time`, `minutes`, `value`, `selected`, `transfers_in`, `transfers_out`.
 
 ### footballer_fixtures
+
 Fields: `id`, `footballer_id`, `fixture_id`, `team_h`, `team_a`, `team_h_score`, `team_a_score`, `difficulty`, `is_home`, `kickoff_time`, `event`, `finished`, `minutes`.
 
 ### teams
+
 Fields: `id`, `code`, `name`, `short_name`, `strength`, `strength_overall_home/away`, `strength_attack_home/away`, `strength_defence_home/away`, `points`, `position`, `played`, `win`, `draw`, `loss`, `form`.
 
 Relations: `footballers` (hasMany), `team_history` (hasMany).
 
 ### team_history
+
 Composite PK: `(team_id, round)`. Fields: `teamXGC` (max xGC across players), `teamXGS` (sum of player xG), `goals`, `goals_conceded`.
 
 ### events
+
 Fields: `id`, `name`, `finished`, `is_current`, `is_previous`, `is_next`, `average_entry_score`, `highest_score`, `most_selected`, `most_transferred_in`, `top_element`, `most_captained`, `deadline_time_epoch`.
 
 ## Season Management
@@ -203,16 +210,18 @@ All `/api/*` routes are rate-limited per IP via `express-rate-limit` (`src/middl
 ## FPL API Fetching
 
 Two external endpoints used:
+
 - `https://fantasy.premierleague.com/api/bootstrap-static/` — teams, events, player list
 - `https://fantasy.premierleague.com/api/element-summary/{id}/` — per-player details
 
-Batching: 32 players/batch, 60ms delay between batches, 3 retries with exponential backoff (500ms + retries * 2000ms). Raw responses cached to JSON files in `src/data/`.
+Batching: 32 players/batch, 60ms delay between batches, 3 retries with exponential backoff (500ms + retries \* 2000ms). Raw responses cached to JSON files in `src/data/`.
 
 All database inserts use Prisma `upsert` (insert or update by code/ID).
 
 ## Team History Aggregation Logic
 
 In `insertTeamHistory.ts`:
+
 - **teamXGS**: Sum of all player `expected_goals` in that round
 - **teamXGC**: Maximum `expected_goals_conceded` across all players (team-level defensive exposure)
 - **goals**: Sum of all player `goals_scored` in round

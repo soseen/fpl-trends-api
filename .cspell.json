@@ -1,13 +1,6 @@
 {
-    "version": "0.2",
-    "language": "en",
-    "words": [
-      "gameweek",
-      "gameweeks" 
-    ],
-    "ignorePaths": [
-      "node_modules/**",
-      "files/**"
-    ]
+  "version": "0.2",
+  "language": "en",
+  "words": ["gameweek", "gameweeks"],
+  "ignorePaths": ["node_modules/**", "files/**"]
 }
-  

@@ -10,13 +10,15 @@ Before commit `023c25e`, `populateManagers.processEntry` did this on classificat
 
 ```ts
 if (klass !== "active") {
-  await prisma.manager_summary.upsert({ /* with rejected_reason */ });
+  await prisma.manager_summary.upsert({
+    /* with rejected_reason */
+  });
   await prisma.manager_history.deleteMany({ where: { entry_id: entryId } });
   return klass;
 }
 ```
 
-That `deleteMany` blinded the range-rank count to managers who played early then quit — even though their early-GW scores were real and often *did* beat the user. The fix keeps the `rejected_reason` flag (so comparison-average queries still skip trolls) but stops deleting history.
+That `deleteMany` blinded the range-rank count to managers who played early then quit — even though their early-GW scores were real and often _did_ beat the user. The fix keeps the `rejected_reason` flag (so comparison-average queries still skip trolls) but stops deleting history.
 
 The fix only affects **future** ingest runs. To repair the existing data we re-fetch history for the affected managers.
 
