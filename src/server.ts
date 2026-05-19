@@ -64,7 +64,7 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-app.get("/api/player-image/:size/:code.png", getPlayerImage);
+app.get("/api/player-image/:size/:code", getPlayerImage);
 
 app.use("/api", apiRateLimit);
 
