@@ -23,6 +23,7 @@ import { getCaptainImpact } from "./managers/getCaptainImpact.js";
 import { requireAdminToken } from "./middleware/requireAdminToken.js";
 import { apiRateLimit } from "./middleware/rateLimit.js";
 import { getHealth } from "./health/getHealth.js";
+import { getPlayerImage } from "./images/playerImageProxy.js";
 
 const app = express();
 const PORT = parseInt(process.env["PORT"] as string) || 3000;
@@ -62,6 +63,8 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
+
+app.get("/api/player-image/:size/:code.png", getPlayerImage);
 
 app.use("/api", apiRateLimit);
 
