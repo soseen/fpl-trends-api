@@ -1149,6 +1149,18 @@ const rebuildManagerRangeScoreBucketsForEndGw = async (
   endGw: number,
 ): Promise<void> => {
   const operations = [
+    prisma.$executeRawUnsafe(
+      `DROP TABLE IF EXISTS tmp_manager_range_bucket_end`,
+    ),
+    prisma.$executeRaw`
+      CREATE TEMP TABLE tmp_manager_range_bucket_end
+      ON COMMIT DROP
+      AS
+      SELECT entry_id, stratum, cumulative_points
+      FROM manager_cumulative
+      WHERE gw = ${endGw}
+    `,
+    prisma.$executeRawUnsafe(`ANALYZE tmp_manager_range_bucket_end`),
     prisma.$executeRaw`
       DELETE FROM manager_range_score_buckets
       WHERE end_gw = ${endGw}
@@ -1156,6 +1168,25 @@ const rebuildManagerRangeScoreBucketsForEndGw = async (
   ];
 
   for (let startGw = 1; startGw <= endGw; startGw += 1) {
+    if (startGw === 1) {
+      operations.push(
+        prisma.$executeRaw`
+          INSERT INTO manager_range_score_buckets
+            (stratum, start_gw, end_gw, range_total, managers, last_rebuilt)
+          SELECT
+            c_end.stratum,
+            ${startGw}::int AS start_gw,
+            ${endGw}::int AS end_gw,
+            c_end.cumulative_points::int AS range_total,
+            COUNT(*)::int AS managers,
+            NOW() AS last_rebuilt
+          FROM tmp_manager_range_bucket_end c_end
+          GROUP BY c_end.stratum, c_end.cumulative_points
+        `,
+      );
+      continue;
+    }
+
     operations.push(
       prisma.$executeRaw`
         INSERT INTO manager_range_score_buckets
@@ -1165,14 +1196,16 @@ const rebuildManagerRangeScoreBucketsForEndGw = async (
           ${startGw}::int AS start_gw,
           ${endGw}::int AS end_gw,
           (c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0))::int
-            AS range_total,
+          AS range_total,
           COUNT(*)::int AS managers,
           NOW() AS last_rebuilt
-        FROM manager_cumulative c_end
-        LEFT JOIN manager_cumulative c_start
-          ON c_start.entry_id = c_end.entry_id
-         AND c_start.gw = ${startGw - 1}
-        WHERE c_end.gw = ${endGw}
+        FROM tmp_manager_range_bucket_end c_end
+        LEFT JOIN LATERAL (
+          SELECT cumulative_points
+          FROM manager_cumulative c_start
+          WHERE c_start.entry_id = c_end.entry_id
+            AND c_start.gw = ${startGw - 1}
+        ) c_start ON TRUE
         GROUP BY
           c_end.stratum,
           c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0)
