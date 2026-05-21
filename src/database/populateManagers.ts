@@ -1148,9 +1148,12 @@ type RangeScoreBucketRebuildOptions = {
 const rebuildManagerRangeScoreBucketsForEndGw = async (
   endGw: number,
 ): Promise<void> => {
-  const operations = [
+  await prisma.$transaction([
     prisma.$executeRawUnsafe(
       `DROP TABLE IF EXISTS tmp_manager_range_bucket_end`,
+    ),
+    prisma.$executeRawUnsafe(
+      `DROP TABLE IF EXISTS tmp_manager_range_bucket_start`,
     ),
     prisma.$executeRaw`
       CREATE TEMP TABLE tmp_manager_range_bucket_end
@@ -1160,60 +1163,50 @@ const rebuildManagerRangeScoreBucketsForEndGw = async (
       FROM manager_cumulative
       WHERE gw = ${endGw}
     `,
+    prisma.$executeRaw`
+      CREATE TEMP TABLE tmp_manager_range_bucket_start
+      ON COMMIT DROP
+      AS
+      SELECT c.entry_id, c.gw, c.cumulative_points
+      FROM manager_cumulative c
+      JOIN tmp_manager_range_bucket_end e ON e.entry_id = c.entry_id
+      WHERE c.gw >= 1 AND c.gw < ${endGw}
+    `,
+    prisma.$executeRawUnsafe(
+      `CREATE INDEX tmp_manager_range_bucket_start_idx
+       ON tmp_manager_range_bucket_start (entry_id, gw)`,
+    ),
     prisma.$executeRawUnsafe(`ANALYZE tmp_manager_range_bucket_end`),
+    prisma.$executeRawUnsafe(`ANALYZE tmp_manager_range_bucket_start`),
     prisma.$executeRaw`
       DELETE FROM manager_range_score_buckets
       WHERE end_gw = ${endGw}
     `,
-  ];
-
-  for (let startGw = 1; startGw <= endGw; startGw += 1) {
-    if (startGw === 1) {
-      operations.push(
-        prisma.$executeRaw`
-          INSERT INTO manager_range_score_buckets
-            (stratum, start_gw, end_gw, range_total, managers, last_rebuilt)
-          SELECT
-            c_end.stratum,
-            ${startGw}::int AS start_gw,
-            ${endGw}::int AS end_gw,
-            c_end.cumulative_points::int AS range_total,
-            COUNT(*)::int AS managers,
-            NOW() AS last_rebuilt
-          FROM tmp_manager_range_bucket_end c_end
-          GROUP BY c_end.stratum, c_end.cumulative_points
-        `,
-      );
-      continue;
-    }
-
-    operations.push(
-      prisma.$executeRaw`
-        INSERT INTO manager_range_score_buckets
-          (stratum, start_gw, end_gw, range_total, managers, last_rebuilt)
-        SELECT
-          c_end.stratum,
-          ${startGw}::int AS start_gw,
-          ${endGw}::int AS end_gw,
-          (c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0))::int
+    prisma.$executeRaw`
+      INSERT INTO manager_range_score_buckets
+        (stratum, start_gw, end_gw, range_total, managers, last_rebuilt)
+      WITH starts AS (
+        SELECT generate_series(1, ${endGw})::int AS start_gw
+      )
+      SELECT
+        c_end.stratum,
+        starts.start_gw,
+        ${endGw}::int AS end_gw,
+        (c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0))::int
           AS range_total,
-          COUNT(*)::int AS managers,
-          NOW() AS last_rebuilt
-        FROM tmp_manager_range_bucket_end c_end
-        LEFT JOIN LATERAL (
-          SELECT cumulative_points
-          FROM manager_cumulative c_start
-          WHERE c_start.entry_id = c_end.entry_id
-            AND c_start.gw = ${startGw - 1}
-        ) c_start ON TRUE
-        GROUP BY
-          c_end.stratum,
-          c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0)
-      `,
-    );
-  }
-
-  await prisma.$transaction(operations);
+        COUNT(*)::int AS managers,
+        NOW() AS last_rebuilt
+      FROM tmp_manager_range_bucket_end c_end
+      CROSS JOIN starts
+      LEFT JOIN tmp_manager_range_bucket_start c_start
+        ON c_start.entry_id = c_end.entry_id
+       AND c_start.gw = starts.start_gw - 1
+      GROUP BY
+        c_end.stratum,
+        starts.start_gw,
+        c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0)
+    `,
+  ]);
 };
 
 export const rebuildManagerRangeScoreBuckets = async ({
