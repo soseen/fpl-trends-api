@@ -4,10 +4,16 @@ import { prisma } from "./client.js";
 import { rebuildManagerReadModels } from "./populateManagers.js";
 
 const main = async (): Promise<void> => {
+  const rangeBucketArg = process.argv.find((arg) =>
+    arg.startsWith("--range-buckets="),
+  );
+  const rangeBuckets =
+    rangeBucketArg?.split("=")[1] === "latest" ? "latest" : "all";
+
   console.info("[rebuildManagerReadModels] Starting...");
   const startedAt = Date.now();
 
-  await rebuildManagerReadModels();
+  await rebuildManagerReadModels({ rangeBuckets });
 
   const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
   const counts = await prisma.$queryRaw<

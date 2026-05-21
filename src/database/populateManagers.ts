@@ -1141,7 +1141,51 @@ export const rebuildStratumRangeXferAvg = async (options?: {
   }
 };
 
-export const rebuildManagerRangeScoreBuckets = async (): Promise<void> => {
+type RangeScoreBucketRebuildOptions = {
+  endGwOnly?: number;
+};
+
+const rebuildManagerRangeScoreBucketsForEndGw = async (
+  endGw: number,
+): Promise<void> => {
+  const operations = [
+    prisma.$executeRaw`
+      DELETE FROM manager_range_score_buckets
+      WHERE end_gw = ${endGw}
+    `,
+  ];
+
+  for (let startGw = 1; startGw <= endGw; startGw += 1) {
+    operations.push(
+      prisma.$executeRaw`
+        INSERT INTO manager_range_score_buckets
+          (stratum, start_gw, end_gw, range_total, managers, last_rebuilt)
+        SELECT
+          c_end.stratum,
+          ${startGw}::int AS start_gw,
+          ${endGw}::int AS end_gw,
+          (c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0))::int
+            AS range_total,
+          COUNT(*)::int AS managers,
+          NOW() AS last_rebuilt
+        FROM manager_cumulative c_end
+        LEFT JOIN manager_cumulative c_start
+          ON c_start.entry_id = c_end.entry_id
+         AND c_start.gw = ${startGw - 1}
+        WHERE c_end.gw = ${endGw}
+        GROUP BY
+          c_end.stratum,
+          c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0)
+      `,
+    );
+  }
+
+  await prisma.$transaction(operations);
+};
+
+export const rebuildManagerRangeScoreBuckets = async ({
+  endGwOnly,
+}: RangeScoreBucketRebuildOptions = {}): Promise<void> => {
   const sampledGw = await prisma.manager_cumulative.aggregate({
     _max: { gw: true },
   });
@@ -1151,43 +1195,59 @@ export const rebuildManagerRangeScoreBuckets = async (): Promise<void> => {
     return;
   }
 
-  await prisma.$transaction([
-    prisma.$executeRawUnsafe(`TRUNCATE manager_range_score_buckets`),
-    prisma.$executeRawUnsafe(
-      `
-      INSERT INTO manager_range_score_buckets
-        (stratum, start_gw, end_gw, range_total, managers, last_rebuilt)
-      WITH bounds AS (
-        SELECT s.start_gw, e.end_gw
-        FROM generate_series(1, $1::int) AS s(start_gw)
-        CROSS JOIN LATERAL generate_series(s.start_gw, $1::int) AS e(end_gw)
-      )
-      SELECT
-        c_end.stratum,
-        bounds.start_gw,
-        bounds.end_gw,
-        (c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0))::int
-          AS range_total,
-        COUNT(*)::int AS managers,
-        NOW() AS last_rebuilt
-      FROM bounds
-      JOIN manager_cumulative c_end
-        ON c_end.gw = bounds.end_gw
-      LEFT JOIN manager_cumulative c_start
-        ON c_start.entry_id = c_end.entry_id
-       AND c_start.gw = bounds.start_gw - 1
-      GROUP BY
-        c_end.stratum,
-        bounds.start_gw,
-        bounds.end_gw,
-        c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0)
-      `,
-      currentGw,
-    ),
-  ]);
+  if (endGwOnly !== undefined) {
+    const endGw = Math.min(Math.max(endGwOnly, 1), currentGw);
+    await rebuildManagerRangeScoreBucketsForEndGw(endGw);
+    return;
+  }
+
+  await prisma.$executeRaw`
+    DELETE FROM manager_range_score_buckets
+    WHERE end_gw > ${currentGw}
+  `;
+  for (let endGw = 1; endGw <= currentGw; endGw += 1) {
+    await rebuildManagerRangeScoreBucketsForEndGw(endGw);
+  }
 };
 
-export const rebuildManagerReadModels = async (): Promise<void> => {
+export const rangeScoreBucketsNeedRefresh = async (
+  endGw: number,
+): Promise<boolean> => {
+  const rows = await prisma.$queryRaw<
+    Array<{
+      cumulative_sample: number;
+      bucket_sample: number;
+    }>
+  >`
+    WITH cumulative AS (
+      SELECT stratum, COUNT(*)::int AS sample_size
+      FROM manager_cumulative
+      WHERE gw = ${endGw}
+      GROUP BY stratum
+    ),
+    buckets AS (
+      SELECT stratum, SUM(managers)::int AS sample_size
+      FROM manager_range_score_buckets
+      WHERE start_gw = 1 AND end_gw = ${endGw}
+      GROUP BY stratum
+    )
+    SELECT
+      COALESCE(c.sample_size, 0)::int AS cumulative_sample,
+      COALESCE(b.sample_size, 0)::int AS bucket_sample
+    FROM cumulative c
+    FULL OUTER JOIN buckets b ON b.stratum = c.stratum
+  `;
+
+  return rows.some((row) => row.cumulative_sample !== row.bucket_sample);
+};
+
+type ManagerReadModelRebuildOptions = {
+  rangeBuckets?: "all" | "latest";
+};
+
+export const rebuildManagerReadModels = async ({
+  rangeBuckets = "all",
+}: ManagerReadModelRebuildOptions = {}): Promise<void> => {
   const captainStarted = Date.now();
   await rebuildStratumCaptainPicks();
   console.info(
@@ -1207,9 +1267,17 @@ export const rebuildManagerReadModels = async (): Promise<void> => {
   );
 
   const bucketStarted = Date.now();
-  await rebuildManagerRangeScoreBuckets();
+  const sampledGw = await prisma.manager_cumulative.aggregate({
+    _max: { gw: true },
+  });
+  const currentGw = sampledGw._max.gw ?? 0;
+  await rebuildManagerRangeScoreBuckets(
+    rangeBuckets === "latest" && currentGw >= 1
+      ? { endGwOnly: currentGw }
+      : undefined,
+  );
   console.info(
-    `[populateManagers] manager_range_score_buckets rebuilt in ${Math.round((Date.now() - bucketStarted) / 1000)}s`,
+    `[populateManagers] manager_range_score_buckets rebuilt${rangeBuckets === "latest" && currentGw >= 1 ? ` (end_gw=${currentGw})` : ""} in ${Math.round((Date.now() - bucketStarted) / 1000)}s`,
   );
 
   // Refresh only the latest end_gw column of stratum_range_xfer_avg —
@@ -1220,10 +1288,6 @@ export const rebuildManagerReadModels = async (): Promise<void> => {
   // ranges anchor at the current GW), so this is where freshness matters
   // most.
   const xferStarted = Date.now();
-  const sampledGw = await prisma.manager_cumulative.aggregate({
-    _max: { gw: true },
-  });
-  const currentGw = sampledGw._max.gw ?? 0;
   if (currentGw >= 1) {
     await rebuildStratumRangeXferAvg({ endGwOnly: currentGw });
     console.info(
@@ -1352,13 +1416,15 @@ export const populateManagers = async (
       });
     }
 
-    // Refresh all manager analytics read models once at the end of an ingest
-    // run. Request paths read the small snapshots instead of grouping over
-    // manager history/cumulative tables.
+    // Refresh manager analytics read models once at the end of an ingest
+    // run. Range-score buckets are refreshed for the latest end GW only:
+    // this is the hot UI path, and it keeps the cron bounded as the sample
+    // grows. Historical end GWs stay available and can be fully refreshed
+    // out-of-band via `npm run rebuild-manager-read-models`.
     if (stats.processed > 0 && !governor.shouldAbort) {
       const readModelsStarted = Date.now();
       try {
-        await rebuildManagerReadModels();
+        await rebuildManagerReadModels({ rangeBuckets: "latest" });
         console.info(
           `[populateManagers] manager read models rebuilt in ${Math.round((Date.now() - readModelsStarted) / 1000)}s`,
         );
@@ -1367,6 +1433,23 @@ export const populateManagers = async (
           "[populateManagers] manager read model rebuild failed:",
           (err as Error).message,
         );
+      }
+    } else if (!governor.shouldAbort) {
+      const bucketStale =
+        currentGw >= 1 && (await rangeScoreBucketsNeedRefresh(currentGw));
+      if (bucketStale) {
+        const bucketStarted = Date.now();
+        try {
+          await rebuildManagerRangeScoreBuckets({ endGwOnly: currentGw });
+          console.info(
+            `[populateManagers] manager_range_score_buckets repaired (end_gw=${currentGw}) in ${Math.round((Date.now() - bucketStarted) / 1000)}s`,
+          );
+        } catch (err) {
+          console.error(
+            "[populateManagers] manager range bucket repair failed:",
+            (err as Error).message,
+          );
+        }
       }
     }
 
