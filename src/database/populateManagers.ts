@@ -135,6 +135,7 @@ const CURSOR_KEY_A = "manager_ingest_cursor_a";
 const CURSOR_KEY_B = "manager_ingest_cursor_b";
 const CURSOR_KEY_C = "manager_ingest_cursor_c";
 const SAMPLE_GW_KEY = "manager_sample_gw";
+const SAMPLE_GW_FINALIZED_KEY = "manager_sample_gw_finalized";
 // Bumped when cursor semantics change in a way that pre-existing cursor
 // values would be silently misinterpreted or when steady-state enrichment
 // needs a one-time same-GW repair pass. v1 = raw page number (pre
@@ -371,6 +372,7 @@ const processEntry = async (
   stratum: 1 | 2 | 3,
   currentGw: number,
   isLiveCurrentGw: boolean,
+  forceRefreshCurrentGw: boolean,
   governor: RateLimitGovernor,
 ): Promise<ProcessOutcome> => {
   const existing = await prisma.manager_summary.findUnique({
@@ -390,6 +392,7 @@ const processEntry = async (
   const needsTransferHistory =
     INGEST_SAMPLE_TRANSFERS && !existing?.has_transfer_history;
   if (
+    !forceRefreshCurrentGw &&
     !isLiveCurrentGw &&
     alreadyCheckedCurrentGw &&
     existing.has_chip_history &&
@@ -770,6 +773,7 @@ const ingestFromStandings = async ({
   budget,
   currentGw,
   isLiveCurrentGw,
+  forceRefreshCurrentGw,
   governor,
   stats,
 }: {
@@ -777,6 +781,7 @@ const ingestFromStandings = async ({
   budget: number;
   currentGw: number;
   isLiveCurrentGw: boolean;
+  forceRefreshCurrentGw: boolean;
   governor: RateLimitGovernor;
   stats: Stats;
 }): Promise<void> => {
@@ -832,6 +837,7 @@ const ingestFromStandings = async ({
               walk.stratum,
               currentGw,
               isLiveCurrentGw,
+              forceRefreshCurrentGw,
               governor,
             );
           } catch {
@@ -1357,9 +1363,13 @@ export const populateManagers = async (
     // run after the format bump so the new walks start fresh.
     const cursorVersion = await readIntCursor(CURSOR_FORMAT_KEY, 0);
     const sampleGw = await readIntCursor(SAMPLE_GW_KEY, 0);
+    const sampleGwFinalized = await readIntCursor(SAMPLE_GW_FINALIZED_KEY, 0);
+    const needsFinalizedPass =
+      !isLiveCurrentGw && sampleGw === currentGw && sampleGwFinalized === 0;
     if (
       cursorVersion < CURRENT_CURSOR_FORMAT_VERSION ||
-      sampleGw !== currentGw
+      sampleGw !== currentGw ||
+      needsFinalizedPass
     ) {
       console.info(
         `[populateManagers] Cursor format ${cursorVersion} → ${CURRENT_CURSOR_FORMAT_VERSION}: resetting walk cursors.`,
@@ -1368,8 +1378,12 @@ export const populateManagers = async (
       await writeIntCursor(CURSOR_KEY_B, 0);
       await writeIntCursor(CURSOR_KEY_C, 0);
       await writeIntCursor(SAMPLE_GW_KEY, currentGw);
+      await writeIntCursor(SAMPLE_GW_FINALIZED_KEY, isLiveCurrentGw ? 0 : 2);
       await writeIntCursor(CURSOR_FORMAT_KEY, CURRENT_CURSOR_FORMAT_VERSION);
     }
+    const forceRefreshCurrentGw =
+      !isLiveCurrentGw &&
+      (await readIntCursor(SAMPLE_GW_FINALIZED_KEY, 0)) !== 1;
 
     // Cursors are now iteration indices (0-based) within their walk's
     // `numSteps`. Old deploys stored raw page numbers; values out of
@@ -1413,6 +1427,7 @@ export const populateManagers = async (
         budget: target,
         currentGw,
         isLiveCurrentGw,
+        forceRefreshCurrentGw,
         governor,
         stats,
       });
@@ -1425,6 +1440,7 @@ export const populateManagers = async (
         budget: target,
         currentGw,
         isLiveCurrentGw,
+        forceRefreshCurrentGw,
         governor,
         stats,
       });
@@ -1437,9 +1453,25 @@ export const populateManagers = async (
         budget: target,
         currentGw,
         isLiveCurrentGw,
+        forceRefreshCurrentGw,
         governor,
         stats,
       });
+    }
+
+    if (!isLiveCurrentGw) {
+      const [finalAIdx, finalBIdx, finalCIdx] = await Promise.all([
+        readIntCursor(CURSOR_KEY_A, 0),
+        readIntCursor(CURSOR_KEY_B, 0),
+        readIntCursor(CURSOR_KEY_C, 0),
+      ]);
+      if (
+        finalAIdx >= STRATUM_A_WALK.numSteps &&
+        finalBIdx >= STRATUM_B_WALK.numSteps &&
+        finalCIdx >= STRATUM_C_WALK.numSteps
+      ) {
+        await writeIntCursor(SAMPLE_GW_FINALIZED_KEY, 1);
+      }
     }
 
     // Refresh manager analytics read models once at the end of an ingest
