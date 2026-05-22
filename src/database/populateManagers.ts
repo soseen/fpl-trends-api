@@ -1459,7 +1459,10 @@ export const populateManagers = async (
     }
     const remainingAfterA = MAX_MANAGERS_PER_RUN - budgetA;
     if (!bDone) {
-      budgetB = Math.min(BUDGET_B_WHILE_RUNNING, remainingAfterA);
+      // Once C has reached its target for this GW, spend the idle capacity
+      // on B so finalization converges in a few cron ticks instead of hours.
+      const budgetBCap = cDone ? remainingAfterA : BUDGET_B_WHILE_RUNNING;
+      budgetB = Math.min(budgetBCap, remainingAfterA);
     }
     const budgetC = cDone ? 0 : MAX_MANAGERS_PER_RUN - budgetA - budgetB;
 

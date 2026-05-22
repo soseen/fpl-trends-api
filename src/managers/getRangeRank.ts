@@ -2,8 +2,10 @@ import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import {
   estimateRangeRankFromBuckets,
+  managerSampleFreshnessForEndGw,
   pickStratum as pickRankStratum,
   stratumCMax as currentStratumCMax,
+  type ManagerSampleStatus,
 } from "./rangeStats.js";
 
 export type RangeRankResponse = {
@@ -37,6 +39,8 @@ export type RangeRankResponse = {
   stratum_used: 1 | 2 | 3 | null;
   confidence: "exact" | "estimated" | "approximate";
   sample_size: number;
+  sample_status: ManagerSampleStatus;
+  sample_finalized: boolean;
 };
 
 export const getRangeRank = async (
@@ -83,25 +87,31 @@ export const getRangeRank = async (
   // weight because it includes ~7M late-joiners who couldn't have been
   // ranked at GW 4. Falling back to cMax keeps behaviour sensible if the
   // events table is missing a row for endGw (boot state, missed populate).
-  const estimate = await estimateRangeRankFromBuckets(
-    startGw,
-    endGw,
-    rangeTotal,
-  );
+  const [estimate, sampleFreshness] = await Promise.all([
+    estimateRangeRankFromBuckets(startGw, endGw, rangeTotal),
+    managerSampleFreshnessForEndGw(endGw),
+  ]);
+  const canUseSampleEstimate = sampleFreshness.status !== "stale";
 
   // The UI's accuracy meter only cares about the user's own stratum
   // probe count — three separate count() queries to feed it was wasteful.
   // For stratum-1 census detection we only need to know if S1 specifically
   // is full; that check happens inline below using the per-stratum result.
   const userStratumProbes =
-    stratum === null ? 0 : estimate.sampleSizeByStratum[stratum];
-  const rangeRank = estimate.rangeRank ?? rangeRankOfficial;
+    stratum === null || !canUseSampleEstimate
+      ? 0
+      : estimate.sampleSizeByStratum[stratum];
+  const rangeRank = canUseSampleEstimate
+    ? (estimate.rangeRank ?? rangeRankOfficial)
+    : rangeRankOfficial;
   const confidence: "exact" | "estimated" | "approximate" =
-    estimate.rangeRank !== null
-      ? "estimated"
-      : rangeRankOfficial !== null
-        ? "exact"
-        : "approximate";
+    rangeRankOfficial !== null && !canUseSampleEstimate
+      ? "exact"
+      : estimate.rangeRank !== null && sampleFreshness.status === "final"
+        ? "estimated"
+        : rangeRankOfficial !== null
+          ? "exact"
+          : "approximate";
 
   // Boot state: no managers ingested in the user's stratum yet. Surface
   // null so the UI shows "—" rather than a fabricated rank from an empty
@@ -122,6 +132,8 @@ export const getRangeRank = async (
       stratum_used: stratum,
       confidence,
       sample_size: 0,
+      sample_status: sampleFreshness.status,
+      sample_finalized: sampleFreshness.finalized,
     };
   }
 
@@ -139,5 +151,7 @@ export const getRangeRank = async (
     stratum_used: stratum,
     confidence,
     sample_size: userStratumProbes,
+    sample_status: sampleFreshness.status,
+    sample_finalized: sampleFreshness.finalized,
   };
 };

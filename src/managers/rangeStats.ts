@@ -1,11 +1,15 @@
 import { prisma } from "../database/client.js";
 
 export type Stratum = 1 | 2 | 3;
+export type ManagerSampleStatus = "final" | "refreshing" | "stale";
 
 export const STRATUM_A_MAX = 10_000;
 export const STRATUM_B_MAX = 100_000;
 const STRATUM_C_MAX_FALLBACK = 15_000_000;
 const ALL_STRATA: readonly Stratum[] = [1, 2, 3];
+const SAMPLE_GW_KEY = "manager_sample_gw";
+const SAMPLE_GW_FINALIZED_KEY = "manager_sample_gw_finalized";
+const SAMPLE_GW_CLEANED_KEY = "manager_sample_gw_cleaned";
 
 export const stratumCMax = async (): Promise<number> => {
   const row = await prisma.events.aggregate({
@@ -20,6 +24,63 @@ export const rankedCountForGw = async (gw: number): Promise<number | null> => {
     select: { ranked_count: true },
   });
   return ev?.ranked_count ?? null;
+};
+
+const readIntMetadata = async (
+  key: string,
+  fallback: number,
+): Promise<number> => {
+  const rows = await prisma.$queryRaw<Array<{ value: string }>>`
+    SELECT value FROM app_metadata WHERE key = ${key}
+  `;
+  const parsed = Number.parseInt(rows[0]?.value ?? "", 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+export type ManagerSampleFreshness = {
+  status: ManagerSampleStatus;
+  finalized: boolean;
+};
+
+export const managerSampleFreshnessForEndGw = async (
+  endGw: number,
+): Promise<ManagerSampleFreshness> => {
+  const event = await prisma.events.findFirst({
+    where: {
+      OR: [{ is_current: true }, { finished: true }],
+    },
+    select: { id: true, finished: true, is_current: true },
+    orderBy: { id: "desc" },
+  });
+
+  if (!event || endGw !== event.id) {
+    return { status: "final", finalized: true };
+  }
+
+  const [sampleGw, cleanedGw, finalizedState] = await Promise.all([
+    readIntMetadata(SAMPLE_GW_KEY, 0),
+    readIntMetadata(SAMPLE_GW_CLEANED_KEY, 0),
+    readIntMetadata(SAMPLE_GW_FINALIZED_KEY, 0),
+  ]);
+  const isLiveCurrentGw = event.is_current && !event.finished;
+
+  if (sampleGw !== event.id) {
+    return { status: "stale", finalized: false };
+  }
+
+  if (isLiveCurrentGw) {
+    return { status: "refreshing", finalized: false };
+  }
+
+  if (cleanedGw !== event.id) {
+    return { status: "stale", finalized: false };
+  }
+
+  if (finalizedState === 1) {
+    return { status: "final", finalized: true };
+  }
+
+  return { status: "refreshing", finalized: false };
 };
 
 export const pickStratum = (
