@@ -1275,10 +1275,12 @@ export const rangeScoreBucketsNeedRefresh = async (
 
 type ManagerReadModelRebuildOptions = {
   rangeBuckets?: "all" | "latest";
+  transferAverages?: "latest" | "skip";
 };
 
 export const rebuildManagerReadModels = async ({
   rangeBuckets = "all",
+  transferAverages = "latest",
 }: ManagerReadModelRebuildOptions = {}): Promise<void> => {
   const captainStarted = Date.now();
   await rebuildStratumCaptainPicks();
@@ -1313,18 +1315,17 @@ export const rebuildManagerReadModels = async ({
   );
 
   // Refresh only the latest end_gw column of stratum_range_xfer_avg —
-  // older end_gws drift slowly and are kept fresh by the manual backfill
-  // script (npm run backfill-stratum-range-xfer-avg). Full rebuild here
-  // would add ~10-30 min to every cron tick, blowing past the 15-min
-  // cycle budget. End_gw=current is what most users query (default UI
-  // ranges anchor at the current GW), so this is where freshness matters
-  // most.
+  // In cron, transferAverages="skip" bypasses this block so rank refreshes
+  // are not held hostage by transfer-average maintenance. Run
+  // backfill-stratum-range-xfer-avg when those rows need a full resync.
   const xferStarted = Date.now();
-  if (currentGw >= 1) {
+  if (transferAverages === "latest" && currentGw >= 1) {
     await rebuildStratumRangeXferAvg({ endGwOnly: currentGw });
     console.info(
       `[populateManagers] stratum_range_xfer_avg (end_gw=${currentGw}) rebuilt in ${Math.round((Date.now() - xferStarted) / 1000)}s`,
     );
+  } else if (transferAverages === "skip") {
+    console.info("[populateManagers] stratum_range_xfer_avg rebuild skipped");
   }
 };
 
@@ -1482,7 +1483,10 @@ export const populateManagers = async (
     if (stats.processed > 0 && !governor.shouldAbort) {
       const readModelsStarted = Date.now();
       try {
-        await rebuildManagerReadModels({ rangeBuckets: "latest" });
+        await rebuildManagerReadModels({
+          rangeBuckets: "latest",
+          transferAverages: "skip",
+        });
         console.info(
           `[populateManagers] manager read models rebuilt in ${Math.round((Date.now() - readModelsStarted) / 1000)}s`,
         );

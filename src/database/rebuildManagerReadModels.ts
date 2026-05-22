@@ -9,11 +9,16 @@ const main = async (): Promise<void> => {
   );
   const rangeBuckets =
     rangeBucketArg?.split("=")[1] === "latest" ? "latest" : "all";
+  const transferAverageArg = process.argv.find((arg) =>
+    arg.startsWith("--transfer-averages="),
+  );
+  const transferAverages =
+    transferAverageArg?.split("=")[1] === "skip" ? "skip" : "latest";
 
   console.info("[rebuildManagerReadModels] Starting...");
   const startedAt = Date.now();
 
-  await rebuildManagerReadModels({ rangeBuckets });
+  await rebuildManagerReadModels({ rangeBuckets, transferAverages });
 
   const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
   const counts = await prisma.$queryRaw<
