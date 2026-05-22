@@ -7,6 +7,7 @@ const MANAGER_CURSOR_KEYS = [
   "manager_ingest_cursor_b",
   "manager_ingest_cursor_c",
   "manager_sample_gw",
+  "manager_sample_gw_finalized",
   "manager_walk_cursor_version",
 ] as const;
 

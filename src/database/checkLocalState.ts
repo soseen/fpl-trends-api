@@ -6,6 +6,22 @@ import { prisma } from "./client.js";
 // My Trends endpoints depend on, so it's obvious which backfill (if any)
 // still needs to run. Read-only.
 
+const MANAGER_METADATA_KEYS = [
+  "manager_ingest_cursor_a",
+  "manager_ingest_cursor_b",
+  "manager_ingest_cursor_c",
+  "manager_sample_gw",
+  "manager_sample_gw_finalized",
+  "manager_walk_cursor_version",
+] as const;
+
+const finalizedLabel = (value: string | undefined): string => {
+  if (value === "1") return "complete";
+  if (value === "2") return "in progress";
+  if (value === "0") return "not finalized";
+  return "missing";
+};
+
 const main = async (): Promise<void> => {
   const summary = await prisma.$queryRaw<
     Array<{ stratum: number; rows: bigint; chip_history: bigint }>
@@ -84,18 +100,55 @@ const main = async (): Promise<void> => {
   `;
 
   const events = await prisma.$queryRaw<
-    Array<{ finished: bigint; max_gw: number | null }>
+    Array<{
+      finished: bigint;
+      max_gw: number | null;
+      current_gw: number | null;
+      current_finished: boolean | null;
+    }>
   >`
     SELECT COUNT(*) FILTER (WHERE finished)::bigint AS finished,
-           MAX(id) FILTER (WHERE finished) AS max_gw
+           MAX(id) FILTER (WHERE finished) AS max_gw,
+           MAX(id) FILTER (WHERE is_current) AS current_gw,
+           BOOL_OR(finished) FILTER (WHERE is_current) AS current_finished
     FROM events
   `;
+
+  const managerMetadata = await prisma.$queryRaw<
+    Array<{ key: string; value: string }>
+  >`
+    SELECT key, value
+    FROM app_metadata
+    WHERE key IN (
+      'manager_ingest_cursor_a',
+      'manager_ingest_cursor_b',
+      'manager_ingest_cursor_c',
+      'manager_sample_gw',
+      'manager_sample_gw_finalized',
+      'manager_walk_cursor_version'
+    )
+    ORDER BY key
+  `;
+  const managerMetadataByKey = new Map(
+    managerMetadata.map((row) => [row.key, row.value]),
+  );
 
   console.info("\n=== Local DB readiness ===\n");
 
   console.info("Events:");
   console.info(
     `  finished GWs: ${events[0]?.finished ?? 0n} (latest: ${events[0]?.max_gw ?? "?"})`,
+  );
+  console.info(
+    `  current GW: ${events[0]?.current_gw ?? "?"} (${events[0]?.current_finished ? "finished" : "live/not finished"})`,
+  );
+
+  console.info("\nmanager ingest cursors:");
+  for (const key of MANAGER_METADATA_KEYS) {
+    console.info(`  ${key}: ${managerMetadataByKey.get(key) ?? "missing"}`);
+  }
+  console.info(
+    `  sample finalization: ${finalizedLabel(managerMetadataByKey.get("manager_sample_gw_finalized"))}`,
   );
 
   console.info("\nmanager_summary (sample membership):");
@@ -189,6 +242,16 @@ const main = async (): Promise<void> => {
     );
   } else {
     console.info("  ✅ manager_cumulative populated.");
+  }
+
+  const currentGw = events[0]?.current_gw ?? null;
+  const currentFinished = events[0]?.current_finished ?? false;
+  const sampleGw = Number(managerMetadataByKey.get("manager_sample_gw") ?? 0);
+  const finalized = managerMetadataByKey.get("manager_sample_gw_finalized");
+  if (currentFinished && (currentGw !== sampleGw || finalized !== "1")) {
+    console.info(
+      "  WARNING current GW sample is stale or not finalized - keep running `populate-managers` until manager_sample_gw matches the current GW and manager_sample_gw_finalized=1.",
+    );
   }
 
   if (picksRows === 0) {
