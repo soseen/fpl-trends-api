@@ -136,6 +136,7 @@ const CURSOR_KEY_B = "manager_ingest_cursor_b";
 const CURSOR_KEY_C = "manager_ingest_cursor_c";
 const SAMPLE_GW_KEY = "manager_sample_gw";
 const SAMPLE_GW_FINALIZED_KEY = "manager_sample_gw_finalized";
+const SAMPLE_GW_CLEANED_KEY = "manager_sample_gw_cleaned";
 // Bumped when cursor semantics change in a way that pre-existing cursor
 // values would be silently misinterpreted or when steady-state enrichment
 // needs a one-time same-GW repair pass. v1 = raw page number (pre
@@ -269,6 +270,41 @@ const writeIntCursor = async (key: string, value: number): Promise<void> => {
     VALUES (${key}, ${v})
     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
   `;
+};
+
+const clearCurrentGwSampleRows = async (gw: number): Promise<void> => {
+  console.info(
+    `[populateManagers] Clearing live-sampled GW${gw} manager rows before final pass.`,
+  );
+  await prisma.$transaction([
+    prisma.$executeRaw`
+      DELETE FROM manager_range_score_buckets WHERE end_gw = ${gw}
+    `,
+    prisma.$executeRaw`
+      DELETE FROM rank_band_player_exposure_gw WHERE gw = ${gw}
+    `,
+    prisma.$executeRaw`
+      DELETE FROM stratum_captain_picks_gw WHERE gw = ${gw}
+    `,
+    prisma.$executeRaw`
+      DELETE FROM stratum_gw_running_stats WHERE gw = ${gw}
+    `,
+    prisma.$executeRaw`
+      DELETE FROM stratum_range_xfer_avg WHERE end_gw = ${gw}
+    `,
+    prisma.$executeRaw`
+      DELETE FROM manager_pick_elements WHERE gw = ${gw}
+    `,
+    prisma.$executeRaw`
+      DELETE FROM manager_picks WHERE gw = ${gw}
+    `,
+    prisma.$executeRaw`
+      DELETE FROM manager_cumulative WHERE gw = ${gw}
+    `,
+    prisma.$executeRaw`
+      DELETE FROM manager_history WHERE gw = ${gw}
+    `,
+  ]);
 };
 
 type SampleGameweek = {
@@ -1365,16 +1401,26 @@ export const populateManagers = async (
     const cursorVersion = await readIntCursor(CURSOR_FORMAT_KEY, 0);
     const sampleGw = await readIntCursor(SAMPLE_GW_KEY, 0);
     const sampleGwFinalized = await readIntCursor(SAMPLE_GW_FINALIZED_KEY, 0);
-    const needsFinalizedPass =
-      !isLiveCurrentGw && sampleGw === currentGw && sampleGwFinalized === 0;
+    const sampleGwCleaned = await readIntCursor(SAMPLE_GW_CLEANED_KEY, 0);
+    // Live-GW rows are partial. Once that same GW becomes finished, drop
+    // the partial current-GW sample and rebuild it from finalized FPL data.
+    const needsFinishedSampleReset =
+      !isLiveCurrentGw &&
+      (sampleGw !== currentGw ||
+        sampleGwFinalized === 0 ||
+        (sampleGwFinalized === 2 && sampleGwCleaned !== currentGw));
     if (
       cursorVersion < CURRENT_CURSOR_FORMAT_VERSION ||
       sampleGw !== currentGw ||
-      needsFinalizedPass
+      needsFinishedSampleReset
     ) {
       console.info(
         `[populateManagers] Cursor format ${cursorVersion} → ${CURRENT_CURSOR_FORMAT_VERSION}: resetting walk cursors.`,
       );
+      if (needsFinishedSampleReset) {
+        await clearCurrentGwSampleRows(currentGw);
+        await writeIntCursor(SAMPLE_GW_CLEANED_KEY, currentGw);
+      }
       await writeIntCursor(CURSOR_KEY_A, 0);
       await writeIntCursor(CURSOR_KEY_B, 0);
       await writeIntCursor(CURSOR_KEY_C, 0);
