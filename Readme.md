@@ -570,8 +570,11 @@ If the health check returns `503` with `db.status: "down"`, the `.env` and the p
 
 1. Fetches `bootstrap-static` (teams, events, all players' bulk fields).
 2. Detects whether the FPL season has changed. If yes → wipes all game tables, clears cached JSON, stores the new season key.
-3. Batch-fetches per-player summaries (32 players/batch, 60 ms delay, 3 retries with exponential backoff).
-4. Upserts every table.
+3. Detects whether the current season is closed. Once the final bootstrap event is `finished && data_checked`, the jobs keep running through `SEASON_END_GRACE_DAYS` (default `5`) and then each job performs one final successful run before stamping itself closed.
+4. Batch-fetches per-player summaries (32 players/batch, 60 ms delay, 3 retries with exponential backoff).
+5. Upserts every table.
+
+After the bulk job is stamped closed for the season, future cron ticks still fetch `bootstrap-static` so a new FPL season can be detected automatically, but they skip the expensive player/team/history refresh until the first event belongs to a new season. The manager sampler uses the same bootstrap-observed season-end signal and stamps itself closed only after the final GW manager sample has fully finalized.
 
 Each entrypoint that runs via `tsx` or compiled `node` loads `.env` automatically (`import "dotenv/config"` at the top of `populateDatabase.ts`, `resetSeason.ts`, `server.ts`). This means cron and pm2 don't need a sourced shell.
 

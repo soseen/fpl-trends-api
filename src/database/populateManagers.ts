@@ -23,6 +23,10 @@ import {
   type GovernorConfig,
 } from "../managers/rateLimitGovernor.js";
 import { delay } from "../utils.js";
+import {
+  evaluateObservedSeasonClosure,
+  markSeasonClosureJobComplete,
+} from "./seasonManager.js";
 
 // Stratum A: full census of the top 10k. 200 pages × 50 entries.
 const readEnvInt = (key: string, fallback: number, min = 1): number => {
@@ -1384,6 +1388,18 @@ export const populateManagers = async (
   const stats = newStats();
 
   try {
+    const seasonClosureDecision =
+      await evaluateObservedSeasonClosure("manager-ingest");
+    if (!seasonClosureDecision.shouldRun) {
+      console.info(
+        `[populateManagers] Season ingest skipped: ${seasonClosureDecision.reason}.`,
+      );
+      return;
+    }
+    console.info(
+      `[populateManagers] Season ingest allowed: ${seasonClosureDecision.reason}.`,
+    );
+
     const { gw: currentGw, isLive: isLiveCurrentGw } =
       await getCurrentSampleGameweek();
     if (currentGw < 1) {
@@ -1561,6 +1577,26 @@ export const populateManagers = async (
             (err as Error).message,
           );
         }
+      }
+    }
+
+    if (
+      seasonClosureDecision.shouldCloseAfterRun &&
+      seasonClosureDecision.season
+    ) {
+      const finalizationState = await readIntCursor(SAMPLE_GW_FINALIZED_KEY, 0);
+      if (!isLiveCurrentGw && finalizationState === 1) {
+        await markSeasonClosureJobComplete(
+          "manager-ingest",
+          seasonClosureDecision.season,
+        );
+        console.info(
+          `[populateManagers] Final manager ingest complete for ${seasonClosureDecision.season}; future runs will skip until the next season reset.`,
+        );
+      } else {
+        console.info(
+          `[populateManagers] Season-end grace elapsed, but final GW${currentGw} sample is not finalized yet; keeping cron active.`,
+        );
       }
     }
 

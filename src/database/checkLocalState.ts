@@ -7,6 +7,12 @@ import { prisma } from "./client.js";
 // still needs to run. Read-only.
 
 const MANAGER_METADATA_KEYS = [
+  "current_season",
+  "season_end_observed_at",
+  "season_end_season",
+  "season_end_event_id",
+  "season_end_bulk_closed_for_season",
+  "season_end_manager_ingest_closed_for_season",
   "manager_ingest_cursor_a",
   "manager_ingest_cursor_b",
   "manager_ingest_cursor_c",
@@ -127,7 +133,13 @@ const main = async (): Promise<void> => {
       'manager_sample_gw',
       'manager_sample_gw_cleaned',
       'manager_sample_gw_finalized',
-      'manager_walk_cursor_version'
+      'manager_walk_cursor_version',
+      'current_season',
+      'season_end_observed_at',
+      'season_end_season',
+      'season_end_event_id',
+      'season_end_bulk_closed_for_season',
+      'season_end_manager_ingest_closed_for_season'
     )
     ORDER BY key
   `;
@@ -145,7 +157,7 @@ const main = async (): Promise<void> => {
     `  current GW: ${events[0]?.current_gw ?? "?"} (${events[0]?.current_finished ? "finished" : "live/not finished"})`,
   );
 
-  console.info("\nmanager ingest cursors:");
+  console.info("\ningest metadata:");
   for (const key of MANAGER_METADATA_KEYS) {
     console.info(`  ${key}: ${managerMetadataByKey.get(key) ?? "missing"}`);
   }

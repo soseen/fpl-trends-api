@@ -109,6 +109,7 @@ A run that hit rate limits and backed off:
 - **Lockfile** at `<os.tmpdir()>/fpl-populate-managers.lock` prevents two runs from overlapping if a tick is slow.
 - **Adaptive backoff** in [`rateLimitGovernor.ts`](../src/managers/rateLimitGovernor.ts) — on `429` / `503` it pauses 5 minutes and doubles the inter-batch delay. After 3 consecutive errors the run aborts cleanly.
 - **Cursors in `app_metadata`** (`manager_ingest_cursor_a`, `manager_ingest_cursor_b`) so each run resumes where the last one stopped. Wraps to start when fully covered.
+- **End-of-season closure** follows the bootstrap-observed season-end signal from the bulk populate job. After `SEASON_END_GRACE_DAYS` (default `5`), `populate-managers` keeps running until `manager_sample_gw_finalized=1` for the final GW, then writes `season_end_manager_ingest_closed_for_season` and future cron ticks skip.
 
 ## Inspecting progress
 

@@ -10,7 +10,12 @@ import { fetchFootballers } from "../footballers/fetchFootballers.js";
 import { insertEvents } from "../events/insertEvents.js";
 import { insertTeamHistory } from "./insertTeamHistory.js";
 import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
-import { detectSeasonChange, performSeasonReset } from "./seasonManager.js";
+import {
+  detectSeasonChange,
+  evaluateSeasonClosure,
+  markSeasonClosureJobComplete,
+  performSeasonReset,
+} from "./seasonManager.js";
 import { prisma } from "./client.js";
 
 const DATA_REFRESH_VERSION_KEY = "bulk_data_refresh_version";
@@ -33,7 +38,13 @@ export const populateDatabase = async () => {
     // 2. Season detection: read events from the freshly fetched bootstrap data
     const bootstrapRaw = fs.readFileSync(RAW_BOOTSTRAP_STATIC_FILE, "utf-8");
     const bootstrapData = JSON.parse(bootstrapRaw) as {
-      events: Array<{ deadline_time?: string; deadline_time_epoch?: number }>;
+      events: Array<{
+        id?: number;
+        finished?: boolean;
+        data_checked?: boolean;
+        deadline_time?: string;
+        deadline_time_epoch?: number;
+      }>;
     };
 
     const seasonCheck = await detectSeasonChange(bootstrapData.events);
@@ -50,6 +61,20 @@ export const populateDatabase = async () => {
     } else {
       console.info(`📋 Current season: ${seasonCheck.currentSeason}`);
     }
+
+    const closureDecision = await evaluateSeasonClosure(
+      bootstrapData.events,
+      "bulk-data",
+    );
+    if (!closureDecision.shouldRun) {
+      console.info(
+        `[populateDatabase] Season refresh skipped: ${closureDecision.reason}.`,
+      );
+      return;
+    }
+    console.info(
+      `[populateDatabase] Season refresh allowed: ${closureDecision.reason}.`,
+    );
 
     // 3. Fetch individual footballer data
     console.info("Fetching footballers...");
@@ -75,6 +100,13 @@ export const populateDatabase = async () => {
     await insertFootballersHistory();
 
     await markBulkDataRefreshComplete();
+
+    if (closureDecision.shouldCloseAfterRun && closureDecision.season) {
+      await markSeasonClosureJobComplete("bulk-data", closureDecision.season);
+      console.info(
+        `[populateDatabase] Final bulk refresh complete for ${closureDecision.season}; future runs will skip until a new season is detected.`,
+      );
+    }
 
     console.info("✅ Database populated successfully!");
   } catch (error) {

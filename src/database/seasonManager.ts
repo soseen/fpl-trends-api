@@ -1,4 +1,5 @@
 import fs from "fs";
+import { Prisma } from "@prisma/client";
 import { prisma } from "./client.js";
 import {
   RAW_BOOTSTRAP_STATIC_FILE,
@@ -6,6 +7,107 @@ import {
 } from "../file.helpers.js";
 
 const SEASON_KEY = "current_season";
+const SEASON_END_OBSERVED_AT_KEY = "season_end_observed_at";
+const SEASON_END_SEASON_KEY = "season_end_season";
+const SEASON_END_EVENT_ID_KEY = "season_end_event_id";
+const SEASON_END_BULK_CLOSED_KEY = "season_end_bulk_closed_for_season";
+const SEASON_END_MANAGER_CLOSED_KEY =
+  "season_end_manager_ingest_closed_for_season";
+const DEFAULT_SEASON_END_GRACE_DAYS = 5;
+const MS_PER_DAY = 24 * 60 * 60 * 1000;
+
+export type SeasonClosureJob = "bulk-data" | "manager-ingest";
+
+export type SeasonClosureDecision =
+  | {
+      shouldRun: false;
+      shouldCloseAfterRun: false;
+      season: string;
+      finalEventId: number;
+      reason: string;
+    }
+  | {
+      shouldRun: true;
+      shouldCloseAfterRun: boolean;
+      season: string | null;
+      finalEventId: number | null;
+      reason: string;
+    };
+
+type SeasonClosureEvent = {
+  id?: number;
+  finished?: boolean;
+  data_checked?: boolean;
+  deadline_time?: string;
+  deadline_time_epoch?: number;
+};
+
+const jobClosedKey = (job: SeasonClosureJob): string =>
+  job === "bulk-data"
+    ? SEASON_END_BULK_CLOSED_KEY
+    : SEASON_END_MANAGER_CLOSED_KEY;
+
+const getMetadataValue = async (key: string): Promise<string | null> => {
+  try {
+    const rows = await prisma.$queryRaw<Array<{ value: string }>>`
+      SELECT value FROM app_metadata WHERE key = ${key}
+    `;
+    return rows[0]?.value ?? null;
+  } catch {
+    return null;
+  }
+};
+
+const setMetadataValue = async (key: string, value: string): Promise<void> => {
+  await prisma.$executeRaw`
+    INSERT INTO app_metadata (key, value)
+    VALUES (${key}, ${value})
+    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+  `;
+};
+
+const deleteMetadataKeys = async (keys: string[]): Promise<void> => {
+  await prisma.$executeRaw`
+    DELETE FROM app_metadata WHERE key IN (${Prisma.join(keys)})
+  `;
+};
+
+const readSeasonEndGraceDays = (): number => {
+  const raw = process.env["SEASON_END_GRACE_DAYS"];
+  if (!raw) return DEFAULT_SEASON_END_GRACE_DAYS;
+
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return DEFAULT_SEASON_END_GRACE_DAYS;
+  }
+
+  return parsed;
+};
+
+const latestEvent = (
+  events: SeasonClosureEvent[],
+): SeasonClosureEvent | null => {
+  const withIds = events.filter((event) => Number.isInteger(event.id));
+  if (withIds.length === 0) return null;
+
+  return withIds.reduce((latest, event) =>
+    (event.id ?? 0) > (latest.id ?? 0) ? event : latest,
+  );
+};
+
+const eventDeadlineDate = (event: SeasonClosureEvent): Date | null => {
+  if (event.deadline_time) {
+    const parsed = new Date(event.deadline_time);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+
+  if (event.deadline_time_epoch) {
+    const parsed = new Date(event.deadline_time_epoch * 1000);
+    if (!Number.isNaN(parsed.getTime())) return parsed;
+  }
+
+  return null;
+};
 
 /**
  * Derives the FPL season identifier from the first event's deadline.
@@ -46,6 +148,163 @@ export function deriveSeasonFromEvents(
 
   const endYearShort = String((startYear + 1) % 100).padStart(2, "0");
   return `${startYear}-${endYearShort}`;
+}
+
+export async function clearSeasonClosureState(): Promise<void> {
+  await deleteMetadataKeys([
+    SEASON_END_OBSERVED_AT_KEY,
+    SEASON_END_SEASON_KEY,
+    SEASON_END_EVENT_ID_KEY,
+    SEASON_END_BULK_CLOSED_KEY,
+    SEASON_END_MANAGER_CLOSED_KEY,
+  ]);
+}
+
+export async function evaluateSeasonClosure(
+  events: SeasonClosureEvent[],
+  job: SeasonClosureJob,
+  now = new Date(),
+): Promise<SeasonClosureDecision> {
+  const season = deriveSeasonFromEvents(events);
+  if (!season) {
+    return {
+      shouldRun: true,
+      shouldCloseAfterRun: false,
+      season: null,
+      finalEventId: null,
+      reason: "season could not be derived",
+    };
+  }
+
+  const finalEvent = latestEvent(events);
+  if (!finalEvent?.id) {
+    return {
+      shouldRun: true,
+      shouldCloseAfterRun: false,
+      season,
+      finalEventId: null,
+      reason: "no final event found",
+    };
+  }
+
+  const finalEventChecked = Boolean(
+    finalEvent.finished && finalEvent.data_checked,
+  );
+  if (!finalEventChecked) {
+    return {
+      shouldRun: true,
+      shouldCloseAfterRun: false,
+      season,
+      finalEventId: finalEvent.id,
+      reason: `final event ${finalEvent.id} is not checked yet`,
+    };
+  }
+
+  const closedSeason = await getMetadataValue(jobClosedKey(job));
+  if (closedSeason === season) {
+    return {
+      shouldRun: false,
+      shouldCloseAfterRun: false,
+      season,
+      finalEventId: finalEvent.id,
+      reason: `${job} already completed its final ${season} run`,
+    };
+  }
+
+  const observedSeason = await getMetadataValue(SEASON_END_SEASON_KEY);
+  const observedEventId = await getMetadataValue(SEASON_END_EVENT_ID_KEY);
+  const observedAtRaw = await getMetadataValue(SEASON_END_OBSERVED_AT_KEY);
+  let observedAt = observedAtRaw ? new Date(observedAtRaw) : null;
+
+  if (
+    observedSeason !== season ||
+    observedEventId !== String(finalEvent.id) ||
+    !observedAt ||
+    Number.isNaN(observedAt.getTime())
+  ) {
+    const finalDeadline = eventDeadlineDate(finalEvent);
+    observedAt =
+      finalDeadline && finalDeadline.getTime() < now.getTime()
+        ? finalDeadline
+        : now;
+    await Promise.all([
+      setMetadataValue(SEASON_END_SEASON_KEY, season),
+      setMetadataValue(SEASON_END_EVENT_ID_KEY, String(finalEvent.id)),
+      setMetadataValue(SEASON_END_OBSERVED_AT_KEY, observedAt.toISOString()),
+    ]);
+  }
+
+  const graceDays = readSeasonEndGraceDays();
+  const graceEndsAt = new Date(observedAt.getTime() + graceDays * MS_PER_DAY);
+  const shouldCloseAfterRun = now.getTime() >= graceEndsAt.getTime();
+
+  return {
+    shouldRun: true,
+    shouldCloseAfterRun,
+    season,
+    finalEventId: finalEvent.id,
+    reason: shouldCloseAfterRun
+      ? `${graceDays}-day season-end grace period elapsed`
+      : `within ${graceDays}-day season-end grace period until ${graceEndsAt.toISOString()}`,
+  };
+}
+
+export async function evaluateObservedSeasonClosure(
+  job: SeasonClosureJob,
+  now = new Date(),
+): Promise<SeasonClosureDecision> {
+  const season = await getMetadataValue(SEASON_END_SEASON_KEY);
+  const finalEventIdRaw = await getMetadataValue(SEASON_END_EVENT_ID_KEY);
+  const observedAtRaw = await getMetadataValue(SEASON_END_OBSERVED_AT_KEY);
+  const finalEventId = finalEventIdRaw ? Number(finalEventIdRaw) : NaN;
+  const observedAt = observedAtRaw ? new Date(observedAtRaw) : null;
+
+  if (
+    !season ||
+    !Number.isInteger(finalEventId) ||
+    !observedAt ||
+    Number.isNaN(observedAt.getTime())
+  ) {
+    return {
+      shouldRun: true,
+      shouldCloseAfterRun: false,
+      season: null,
+      finalEventId: null,
+      reason: "season end has not been observed from bootstrap data",
+    };
+  }
+
+  const closedSeason = await getMetadataValue(jobClosedKey(job));
+  if (closedSeason === season) {
+    return {
+      shouldRun: false,
+      shouldCloseAfterRun: false,
+      season,
+      finalEventId,
+      reason: `${job} already completed its final ${season} run`,
+    };
+  }
+
+  const graceDays = readSeasonEndGraceDays();
+  const graceEndsAt = new Date(observedAt.getTime() + graceDays * MS_PER_DAY);
+  const shouldCloseAfterRun = now.getTime() >= graceEndsAt.getTime();
+
+  return {
+    shouldRun: true,
+    shouldCloseAfterRun,
+    season,
+    finalEventId,
+    reason: shouldCloseAfterRun
+      ? `${graceDays}-day season-end grace period elapsed`
+      : `within ${graceDays}-day season-end grace period until ${graceEndsAt.toISOString()}`,
+  };
+}
+
+export async function markSeasonClosureJobComplete(
+  job: SeasonClosureJob,
+  season: string,
+): Promise<void> {
+  await setMetadataValue(jobClosedKey(job), season);
 }
 
 /**
@@ -189,6 +448,9 @@ export async function wipeAllSeasonData(): Promise<void> {
   await prisma.$executeRawUnsafe(`TRUNCATE rank_band_player_exposure_gw`);
   console.info("   rank_band_player_exposure_gw cleared");
   console.info("   ✓ stratum_captain_picks_gw cleared");
+
+  await clearSeasonClosureState();
+  console.info("   season closure state cleared");
 
   // Delete cached data files
   const filesToDelete = [RAW_BOOTSTRAP_STATIC_FILE, RAW_FOOTBALLERS_FILE];
