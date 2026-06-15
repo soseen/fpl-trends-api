@@ -90,10 +90,11 @@ export type TransferImpactPlayer = {
   // and tooltip. Clear starters (rate ≥ 50%) round up to full raw
   // (no flag), and bench-role picks (rate < 25%) zero out instead.
   points_approximated: boolean;
-  // Estimated rank movement from this side of the transfer comparison.
-  // IN players are positive point contributions; OUT players are the
-  // counterfactual points left behind, so they are negative. Null when
-  // the manager has no usable rank-density sample.
+  // Estimated rank swing from this side's base point contribution.
+  // IN players are positive; OUT players are the counterfactual points
+  // left behind, so they are negative. Captaincy is intentionally kept
+  // out of this tab and shown by the captain-impact endpoint.
+  // Null when the manager has no usable rank-density sample.
   rank_impact: number | null;
   // Average selected-by percentage across scored fixture GWs in the window.
   avg_ownership_pct: number | null;
@@ -383,92 +384,35 @@ const outPointsInWindow = (
   return Math.round(total);
 };
 
-type RankWindowResult = {
-  excess: number;
-  rankImpact: number | null;
-  avgOwnershipPct: number | null;
-};
-
-const rankResult = (
-  excess: number,
-  ownershipSum: number,
-  ownershipCount: number,
+const rankImpactFromPoints = (
+  points: number,
   rankPerPoint: number | null,
-): RankWindowResult => ({
-  excess,
-  rankImpact: rankPerPoint !== null ? excess * rankPerPoint : null,
-  avgOwnershipPct: ownershipCount > 0 ? ownershipSum / ownershipCount : null,
-});
+): number | null => (rankPerPoint !== null ? points * rankPerPoint : null);
 
-// Transfer rank attribution deliberately excludes armband uplift. The
-// Captaincy tab owns that piece; this tab measures the base ownership
-// decision so the same Salah haul cannot be counted twice.
-const inBaseRankImpactInWindow = (
-  stats: Map<string, PlayerGwRankStat>,
-  multipliers: MultiplierMap,
-  playerId: number,
-  fromGw: number,
-  windowEnd: number,
-  rankPerPoint: number | null,
-): RankWindowResult => {
-  let excess = 0;
-  let ownershipSum = 0;
-  let ownershipCount = 0;
-  for (let gw = fromGw; gw <= windowEnd; gw += 1) {
-    const stat = stats.get(playerGwKey(playerId, gw));
-    if (!stat) continue;
-    const ownership = ownershipPct(stat);
-    const userExposure = (multipliers.get(gw)?.get(playerId) ?? 0) > 0 ? 1 : 0;
-    excess += (userExposure - ownership) * stat.total_points;
-    ownershipSum += ownership;
-    ownershipCount += 1;
-  }
-  return rankResult(excess, ownershipSum, ownershipCount, rankPerPoint);
-};
-
-// `mode` selects which OUT-side excess to compute:
-//   "did_not_have"        — actual scenario: user no longer owns OUT.
-//                           Excess = -EO * starterRate * pts (rank-killer).
-//   "kept_counterfactual" — counterfactual: user kept and started OUT.
-//                           Excess = (1 - EO) * starterRate * pts (Team
-//                           Impact-style attribution). Subtract this from
-//                           the IN-side EO-aware excess to get the swap's
-//                           rank delta — keeps Transfer Impact consistent
-//                           with Team Impact's per-player attribution.
-//
-// Skips FH GWs (other than this transfer's own GW): during a Free Hit
-// the user's normal squad reverts, so the kept-OUT counterfactual is
-// meaningless for FH GWs that fall mid-window. A FH transfer ITSELF
-// (fromGw is a FH GW) keeps its single FH GW in the sum.
-const outBaseRankImpactInWindow = (
+// Average picked percentage for context/tooltips. It is deliberately
+// separate from transfer rank math: transfer rank uses the same direct
+// counterfactual as transfer points, then converts that point swing via
+// rank density. Mixing EO attribution into this number made positive
+// point transfers appear as rank losses.
+const avgOwnershipPctInWindow = (
   stats: Map<string, PlayerGwRankStat>,
   playerId: number,
   fromGw: number,
   windowEnd: number,
-  starterRate: number,
-  rankPerPoint: number | null,
-  fhGws: ReadonlySet<number>,
-  mode: "did_not_have" | "kept_counterfactual" = "did_not_have",
-): RankWindowResult => {
-  let excess = 0;
+  fhGws?: ReadonlySet<number>,
+): number | null => {
   let ownershipSum = 0;
   let ownershipCount = 0;
-  if (starterRate <= 0) return rankResult(0, 0, 0, rankPerPoint);
-  const skipFh = !fhGws.has(fromGw);
+  const skipFh = fhGws !== undefined && !fhGws.has(fromGw);
   for (let gw = fromGw; gw <= windowEnd; gw += 1) {
-    if (skipFh && fhGws.has(gw)) continue;
+    if (skipFh && fhGws?.has(gw)) continue;
     const stat = stats.get(playerGwKey(playerId, gw));
     if (!stat) continue;
     const ownership = ownershipPct(stat);
-    const factor =
-      mode === "kept_counterfactual"
-        ? (1 - ownership) * starterRate
-        : -ownership * starterRate;
-    excess += factor * stat.total_points;
     ownershipSum += ownership;
     ownershipCount += 1;
   }
-  return rankResult(excess, ownershipSum, ownershipCount, rankPerPoint);
+  return ownershipCount > 0 ? ownershipSum / ownershipCount : null;
 };
 
 // For each transfer (player B in at GW X), find the GW B was next
@@ -980,43 +924,19 @@ export const getManagerTransfers = async (
       effectiveRate,
       allFhGws,
     );
-    const inRank = inBaseRankImpactInWindow(
+    const inAvgOwnershipPct = avgOwnershipPctInWindow(
       rankStats,
-      multipliers,
       t.in_element,
       t.gw,
       windowEnd,
-      rankContext.rank_per_point,
     );
-    // outRank (did_not_have) is kept ONLY for its avgOwnershipPct, which the
-    // OUT-tile UI displays. The actual OUT contribution to the swap's rank
-    // delta uses the kept-counterfactual variant below.
-    const outRank = outBaseRankImpactInWindow(
+    // Ownership averages are context only; transfer rank is point-based.
+    const outAvgOwnershipPct = avgOwnershipPctInWindow(
       rankStats,
       t.out_element,
       t.gw,
       windowEnd,
-      effectiveRate,
-      rankContext.rank_per_point,
       allFhGws,
-    );
-    // EO-aware swap attribution: rank delta = (rank impact of having IN) −
-    // (rank impact the user gave up by selling OUT, assuming OUT would've
-    // been started). Subtracting the kept counterfactual gives the swap's
-    // contribution relative to the same baseline Team Impact uses (the
-    // average manager), so Transfer Impact and Team Impact attribute the
-    // same number to the same player. The earlier `netPoints * rpp` formula
-    // measured a different (broader) counterfactual and double-counted
-    // movement that other managers also made.
-    const outKeptCounterfactual = outBaseRankImpactInWindow(
-      rankStats,
-      t.out_element,
-      t.gw,
-      windowEnd,
-      effectiveRate,
-      rankContext.rank_per_point,
-      allFhGws,
-      "kept_counterfactual",
     );
     // Bench-role and approximation flags follow directly from the
     // effective-rate decision above:
@@ -1034,21 +954,18 @@ export const getManagerTransfers = async (
     const inBenchRole =
       inWindowGws >= 2 && inStartedGws / inWindowGws < BENCH_ROLE_THRESHOLD;
     const netPoints = inPts - outPts;
-    const inTransferRankImpact = inRank.rankImpact;
-    const outTransferRankImpact =
-      rankContext.rank_per_point !== null
-        ? -outKeptCounterfactual.excess * rankContext.rank_per_point
-        : null;
-    // combined_net_points (raw point delta) and pairRankImpact (EO-aware)
-    // can disagree in sign for high-EO ↔ low-low-EO swaps — e.g. bringing
-    // in a 6-pt template captain (EO 0.95) while selling a 4-pt deep
-    // differential (EO 0.05) is a positive net-points swap that loses
-    // relative rank because the rest of the cohort made the same trade.
-    // This matches LiveFPL behaviour and is intentional.
-    const pairRankImpact =
-      inTransferRankImpact !== null && outTransferRankImpact !== null
-        ? inTransferRankImpact + outTransferRankImpact
-        : null;
+    const inTransferRankImpact = rankImpactFromPoints(
+      inPts,
+      rankContext.rank_per_point,
+    );
+    const outTransferRankImpact = rankImpactFromPoints(
+      -outPts,
+      rankContext.rank_per_point,
+    );
+    const pairRankImpact = rankImpactFromPoints(
+      netPoints,
+      rankContext.rank_per_point,
+    );
     // sold_gw is informative only for non-FH transfers (FH auto-reverts
     // next GW so showing "GW t+1" on every FH tile is noise). Always
     // shown when the IN player was actually sold, even if the sale was
@@ -1064,7 +981,7 @@ export const getManagerTransfers = async (
         inBenchRole,
         false, // IN side is factual — sum of actually-played GWs — never an approximation
         inTransferRankImpact,
-        inRank.avgOwnershipPct,
+        inAvgOwnershipPct,
       ),
       player_out: toPlayer(
         t.out_element,
@@ -1073,7 +990,7 @@ export const getManagerTransfers = async (
         outBenchRole,
         outPointsApproximated,
         outTransferRankImpact,
-        outRank.avgOwnershipPct,
+        outAvgOwnershipPct,
       ),
       net_points: netPoints,
       net_rank_impact: pairRankImpact,
