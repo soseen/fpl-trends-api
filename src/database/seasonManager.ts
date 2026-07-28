@@ -5,6 +5,7 @@ import {
   RAW_BOOTSTRAP_STATIC_FILE,
   RAW_FOOTBALLERS_FILE,
 } from "../file.helpers.js";
+import { archiveCurrentSeason } from "./seasonArchive.js";
 
 const SEASON_KEY = "current_season";
 const SEASON_END_OBSERVED_AT_KEY = "season_end_observed_at";
@@ -468,10 +469,14 @@ export async function wipeAllSeasonData(): Promise<void> {
 /**
  * Full season reset: wipe data, then store the new season identifier.
  */
-export async function performSeasonReset(newSeason: string): Promise<void> {
+export async function performSeasonReset(
+  newSeason: string,
+  outgoingSeason: string | null = null,
+): Promise<void> {
   console.info(
     `\n🔄 SEASON CHANGE DETECTED — performing full data reset for ${newSeason}...\n`,
   );
+  await archiveCurrentSeason(outgoingSeason ?? (await getStoredSeason()));
   await wipeAllSeasonData();
   await storeCurrentSeason(newSeason);
   console.info(`📋 Season updated to ${newSeason}.\n`);

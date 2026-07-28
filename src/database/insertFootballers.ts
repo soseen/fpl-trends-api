@@ -1,6 +1,10 @@
 import fs from "fs";
-import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
+import {
+  RAW_BOOTSTRAP_STATIC_FILE,
+  RAW_FOOTBALLERS_FILE,
+} from "../file.helpers.js";
 import type { BootstrapStaticData } from "../bootstrapStatic/types.js";
+import type { Footballer } from "../footballers/types.js";
 import { prisma } from "./client.js";
 
 export const insertFootballers = async () => {
@@ -10,8 +14,15 @@ export const insertFootballers = async () => {
     )
       ? JSON.parse(fs.readFileSync(RAW_BOOTSTRAP_STATIC_FILE, "utf8"))
       : {};
+    const footballerSummaries: Record<string, Footballer> = fs.existsSync(
+      RAW_FOOTBALLERS_FILE,
+    )
+      ? JSON.parse(fs.readFileSync(RAW_FOOTBALLERS_FILE, "utf8"))
+      : {};
 
     for (const footballer of rawData.elements) {
+      const historyPast =
+        footballerSummaries[String(footballer.id)]?.history_past ?? [];
       const footballerObject = {
         web_name: footballer.web_name,
         first_name: footballer.first_name,
@@ -110,6 +121,7 @@ export const insertFootballers = async () => {
         defensive_contribution: footballer.defensive_contribution ?? null,
         defensive_contribution_per_90:
           footballer.defensive_contribution_per_90 ?? null,
+        history_past: historyPast,
       };
       await prisma.footballers.upsert({
         where: { code: footballer.code },

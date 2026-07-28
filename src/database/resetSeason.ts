@@ -13,14 +13,16 @@
  */
 
 import "dotenv/config";
-import { wipeAllSeasonData } from "./seasonManager.js";
+import { getStoredSeason, wipeAllSeasonData } from "./seasonManager.js";
 import { prisma } from "./client.js";
+import { archiveCurrentSeason } from "./seasonArchive.js";
 
 async function main() {
   console.info("\n⚠️  MANUAL SEASON RESET\n");
   console.info("This will delete ALL game data from the database.");
   console.info("Run `npm run populate` afterwards to re-fetch fresh data.\n");
 
+  await archiveCurrentSeason(await getStoredSeason());
   await wipeAllSeasonData();
 
   // Also clear the stored season so it gets re-detected on next populate

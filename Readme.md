@@ -38,7 +38,7 @@ The API has three responsibilities:
 
 Ingest is **manual** — there's no scheduler in the Node process itself. In production we rely on a system **cron** to call the populate script on a schedule (see [Data refresh](#data-refresh--populate)).
 
-The system is **season-aware**: every populate run detects whether the FPL season has changed (by reading the first event's deadline year and comparing it against `app_metadata.current_season` in the DB). On change, all game data tables are wiped and re-populated from scratch.
+The system is **season-aware**: every populate run detects whether the FPL season has changed (by reading the first event's deadline year and comparing it against `app_metadata.current_season` in the DB). On change, the outgoing bulk API payloads are saved in `season_archives` before the live game tables are wiped and re-populated.
 
 In addition to the per-player ingest, the API maintains a **stratified sample of FPL managers** in `manager_summary` and `manager_history` tables. This powers the [My Trends](#manager-rank-estimation-my-trends) feature on the frontend, which estimates a user's rank within a chosen gameweek range. Sample collection is incremental and runs via a separate cron-friendly script (`npm run populate-managers`).
 
@@ -136,6 +136,11 @@ Cascade delete is set on the `footballers → history`, `footballers → footbal
 ---
 
 ## API endpoints
+
+`GET /api/seasons` reports the current season, archived seasons, preseason
+state, and default analytics season. The four bulk endpoints accept an optional
+`?season=YYYY-YY`; archived requests return the same payload shape as the live
+endpoints and return `404` if the archive does not exist.
 
 Read endpoints are intentionally unauthenticated — the data they serve is public FPL data and the app has no user accounts. The privileged `/api/populate` route requires `Authorization: Bearer $ADMIN_TOKEN`. CORS allowlist is configured via `ALLOWED_ORIGINS`. All `/api/*` routes are rate-limited to **60 requests per minute per IP**; exceeding the limit returns `429` with `RateLimit-*` headers.
 
@@ -852,10 +857,11 @@ When a new Premier League season begins (typically mid-August), the FPL API rese
 
 Just wait for the next scheduled populate. `seasonManager.ts` derives the season from the first event's deadline year (e.g. an Aug 2026 first deadline → season `"2026-27"`) and compares it to `app_metadata.current_season`. On mismatch:
 
-1. All game data tables are truncated (`footballers`, `history`, `footballer_fixtures`, `teams`, `team_history`, `events`, plus `manager_history` and `manager_summary` since they're season-scoped).
-2. Cached JSON files in `src/data/` are deleted.
-3. The new season key is stored.
-4. A fresh populate runs.
+1. The outgoing footballer, team, event, and total-player payloads are written to `season_archives`. A non-empty outgoing dataset must archive successfully or the reset aborts.
+2. All live game data tables are truncated (`footballers`, `history`, `footballer_fixtures`, `teams`, `team_history`, `events`, plus manager tables since they're season-scoped).
+3. Cached JSON files in `src/data/` are deleted.
+4. The new season key is stored.
+5. A fresh populate runs. Player `history_past` from the new FPL player summaries is retained for the frontend's aggregate preseason mode.
 
 You'll see this in the populate logs:
 

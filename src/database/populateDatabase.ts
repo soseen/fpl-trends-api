@@ -53,7 +53,7 @@ export const populateDatabase = async () => {
       console.info(
         `🔄 Season changed: ${seasonCheck.oldSeason ?? "none"} → ${seasonCheck.newSeason}`,
       );
-      await performSeasonReset(seasonCheck.newSeason);
+      await performSeasonReset(seasonCheck.newSeason, seasonCheck.oldSeason);
 
       // Re-fetch bootstrap since we deleted the file during wipe
       console.info("Re-fetching Bootstrap Static after season reset...");

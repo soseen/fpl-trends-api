@@ -24,6 +24,14 @@ import { requireAdminToken } from "./middleware/requireAdminToken.js";
 import { apiRateLimit } from "./middleware/rateLimit.js";
 import { getHealth } from "./health/getHealth.js";
 import { getPlayerImage } from "./images/playerImageProxy.js";
+import {
+  getSeasonArchiveDataset,
+  getSeasonCatalog,
+  normalizeSeason,
+  SeasonArchiveNotFoundError,
+  type SeasonArchiveDataset,
+} from "./database/seasonArchive.js";
+import { getStoredSeason } from "./database/seasonManager.js";
 
 const app = express();
 const PORT = parseInt(process.env["PORT"] as string) || 3000;
@@ -70,47 +78,123 @@ app.use("/api", apiRateLimit);
 
 app.get("/api/health", getHealth);
 
+app.get("/api/seasons", async (_req: Request, res: Response) => {
+  try {
+    res.status(200).json(await getSeasonCatalog());
+  } catch (error: unknown) {
+    console.error("Error fetching season catalog:", error);
+    res.status(500).json({ error: "Failed to fetch season catalog." });
+  }
+});
+
+type ParsedSeasonRequest =
+  | { valid: true; season: string | null }
+  | { valid: false };
+
+const parseRequestedSeason = (
+  req: Request,
+  res: Response,
+): ParsedSeasonRequest => {
+  const rawSeason = req.query["season"];
+  if (rawSeason === undefined) return { valid: true, season: null };
+
+  const season = normalizeSeason(rawSeason);
+  if (!season) {
+    res.status(400).json({ error: "Invalid season. Expected YYYY-YY." });
+    return { valid: false };
+  }
+
+  return { valid: true, season };
+};
+
+const loadSeasonAwareData = async (
+  season: string | null,
+  dataset: SeasonArchiveDataset,
+  currentLoader: () => Promise<unknown>,
+): Promise<unknown> => {
+  if (!season || season === (await getStoredSeason())) {
+    return currentLoader();
+  }
+  return getSeasonArchiveDataset(season, dataset);
+};
+
+const handleBulkDataError = (
+  res: Response,
+  error: unknown,
+  message: string,
+): void => {
+  if (error instanceof SeasonArchiveNotFoundError) {
+    res.status(404).json({ error: error.message });
+    return;
+  }
+  console.error(message, error);
+  res.status(500).json({ error: "Failed to fetch data." });
+};
+
 app.get("/api/footballersData", async (req: Request, res: Response) => {
+  const parsed = parseRequestedSeason(req, res);
+  if (!parsed.valid) return;
+
   try {
     await cachedJson(
       req,
       res,
-      "footballersData",
-      getFootballersWithHistoryAndFixtures,
+      `footballersData:${parsed.season ?? "current"}`,
+      () =>
+        loadSeasonAwareData(
+          parsed.season,
+          "footballers_data",
+          getFootballersWithHistoryAndFixtures,
+        ),
     );
   } catch (error: unknown) {
-    console.error("Error fetching footballers data:", error);
-    res.status(500).json({ error: "Failed to fetch data." });
+    handleBulkDataError(res, error, "Error fetching footballers data:");
   }
 });
 
 app.get("/api/teamsData", async (req: Request, res: Response) => {
+  const parsed = parseRequestedSeason(req, res);
+  if (!parsed.valid) return;
+
   try {
-    await cachedJson(req, res, "teamsData", getTeamsData);
+    await cachedJson(req, res, `teamsData:${parsed.season ?? "current"}`, () =>
+      loadSeasonAwareData(parsed.season, "teams_data", getTeamsData),
+    );
   } catch (error: unknown) {
-    console.error("Error fetching teams data:", error);
-    res.status(500).json({ error: "Failed to fetch data." });
+    handleBulkDataError(res, error, "Error fetching teams data:");
   }
 });
 
 app.get("/api/totalPlayersCount", async (req: Request, res: Response) => {
+  const parsed = parseRequestedSeason(req, res);
+  if (!parsed.valid) return;
+
   try {
-    await cachedJson(req, res, "totalPlayersCount", async () => {
-      const data = await getBasicInfo();
-      return data.totalPlayers;
-    });
+    await cachedJson(
+      req,
+      res,
+      `totalPlayersCount:${parsed.season ?? "current"}`,
+      () =>
+        loadSeasonAwareData(parsed.season, "total_players", async () => {
+          const data = await getBasicInfo();
+          return data.totalPlayers;
+        }),
+    );
   } catch (error: unknown) {
-    console.error("Error fetching total players count:", error);
-    res.status(500).json({ error: "Failed to fetch data." });
+    handleBulkDataError(res, error, "Error fetching total players count:");
   }
 });
 
 app.get("/api/eventsData", async (req: Request, res: Response) => {
+  const parsed = parseRequestedSeason(req, res);
+  if (!parsed.valid) return;
+
   try {
-    await cachedJson(req, res, "eventsData", getEvents);
+    await cachedJson(req, res, `eventsData:${parsed.season ?? "current"}`, () =>
+      loadSeasonAwareData(parsed.season, "events_data", getEvents),
+    );
   } catch (error: unknown) {
-    console.error("Error fetching events data:", error);
-    res.status(500).json({ error: "Failed to fetch data." });
+    handleBulkDataError(res, error, "Error fetching events data:");
   }
 });
 

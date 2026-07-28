@@ -127,6 +127,7 @@ model footballers {
   clean_sheets_per_90                  Float?
   defensive_contribution               Int?
   defensive_contribution_per_90        Float?
+  history_past                         Json?
   footballer_fixtures                  footballer_fixtures[]
   teams                                teams?                @relation(fields: [team_id], references: [id], onUpdate: NoAction, map: "fk_team")
   history                              history[]
@@ -223,6 +224,19 @@ model app_metadata {
   value String @db.VarChar(500)
 
   @@map("app_metadata")
+}
+
+// Immutable bulk-response snapshots retained across the destructive live
+// season reset. The SPA already performs its range calculations from these
+// four payloads, so preserving the API contract here avoids duplicating the
+// entire season-scoped relational model.
+model season_archives {
+  season           String   @id @db.VarChar(10)
+  footballers_data Json
+  teams_data       Json
+  events_data      Json
+  total_players    Int
+  archived_at      DateTime @default(now())
 }
 
 model events {

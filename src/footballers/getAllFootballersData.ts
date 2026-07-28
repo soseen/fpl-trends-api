@@ -14,6 +14,7 @@ export const getFootballersWithHistoryAndFixtures = async () => {
       element_type: true,
       now_cost: true,
       total_points: true,
+      points_per_game: true,
       selected_by_percent: true,
       status: true,
       chance_of_playing_next_round: true,
@@ -32,6 +33,7 @@ export const getFootballersWithHistoryAndFixtures = async () => {
       expected_goals_conceded_per_90: true,
       defensive_contribution: true,
       defensive_contribution_per_90: true,
+      history_past: true,
       teams: {
         select: {
           id: true,

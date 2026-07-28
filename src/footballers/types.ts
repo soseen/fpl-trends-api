@@ -84,6 +84,7 @@ export type HistoryPast = {
   expected_assists: string;
   expected_goal_involvements: string;
   expected_goals_conceded: string;
+  defensive_contribution?: number | null;
 };
 
 export type Footballer = {
