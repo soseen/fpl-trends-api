@@ -8,19 +8,15 @@ export const getFootballersIds = () => {
   const rawData = fs.readFileSync(RAW_BOOTSTRAP_STATIC_FILE, "utf-8");
   const bootstrapStaticData: BootstrapStaticData = JSON.parse(rawData);
 
-  const lastFootballer = bootstrapStaticData.elements.at(-1);
-  if (!lastFootballer) {
+  if (bootstrapStaticData.elements.length === 0) {
     throw new Error("No footballers found in the elements array.");
   }
 
-  const lastFootballerId = lastFootballer.id;
-
-  const footballerIds = Array.from(
-    { length: lastFootballerId },
-    (_, i) => i + 1,
-  );
-
-  return footballerIds;
+  // bootstrap-static is grouped by club, not sorted by element ID. Players
+  // added after the initial release can therefore have IDs greater than the
+  // final array item's ID. Read the actual IDs so every listed player gets an
+  // element-summary request.
+  return bootstrapStaticData.elements.map((footballer) => footballer.id);
 };
 
 export const getFootballer = async (footballerID: number) => {
