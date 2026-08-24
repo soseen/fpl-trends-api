@@ -77,7 +77,7 @@ export type PlayerImpact = {
   web_name: string;
   team_code: number;
   element_type: number;
-  points_for_user: number; // sum of (multiplier × gw_pts) for GWs the player started
+  points_for_user: number; // sum of (multiplier x gw_pts) for GWs the user scored
   raw_points: number; // sum of gw_pts (no multiplier) for GWs the user owned them
   starts: number;
   captaincies: number;
@@ -160,8 +160,9 @@ const CAPTAIN_FALLBACK_SAMPLE_THRESHOLD = 10;
 // display.
 const RANK_DENSITY_HALF_WINDOW = 25;
 
-// Frequency-XI repair: a "started" GW means the user fielded the player
-// (multiplier ≥ 1 — autosubs included).
+// Frequency-XI repair: a "started" GW means the user selected the player in
+// the starting XI. Autosubs and bench boost can score with multiplier > 0, but
+// they are bench appearances rather than starts.
 
 // ----------------------------------------------------------------------------
 // Helpers
@@ -1080,10 +1081,12 @@ export const getTeamImpact = async (
     }
 
     acc.raw_points += points;
+    if (pick.position >= 1 && pick.position <= 11) {
+      acc.starts += 1;
+    }
     if (pick.multiplier > 0) {
       acc.points_for_user += pick.multiplier * points;
       acc.played_count += 1;
-      acc.starts += 1;
       if (pick.multiplier === 2) acc.captaincies += 1;
       if (pick.multiplier === 3) acc.triple_captaincies += 1;
     }
