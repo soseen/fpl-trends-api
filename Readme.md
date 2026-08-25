@@ -4,7 +4,7 @@ Backend for **FPL Trends** (https://fpltrends.live) — a Fantasy Premier League
 
 Fetches data from the official FPL API, stores it in PostgreSQL via Prisma, and exposes it through a small REST API consumed by [`fpl-trends-app`](https://github.com/soseen/fpl-trends-app).
 
-> **Operator-focused per-flow docs** for the more complicated jobs live under [`docs/`](./docs/) — see [`populate-managers.md`](./docs/populate-managers.md), [`backfill-nonactive-history.md`](./docs/backfill-nonactive-history.md), and [`backfill-picks.md`](./docs/backfill-picks.md). Read those first if you're trying to operate the system rather than understand the architecture.
+> **Operator-focused per-flow docs** for the more complicated jobs live under [`docs/`](./docs/) — see [`local-season-reset.md`](./docs/local-season-reset.md), [`populate-managers.md`](./docs/populate-managers.md), [`backfill-nonactive-history.md`](./docs/backfill-nonactive-history.md), and [`backfill-picks.md`](./docs/backfill-picks.md). Read those first if you're trying to operate the system rather than understand the architecture.
 
 ---
 
@@ -850,6 +850,9 @@ cd ~/fpl-trends-app && npm run deploy            # frontend
 ---
 
 ## Start-of-season runbook
+
+For the complete local database procedure, verification steps, and preseason
+notes, see [`docs/local-season-reset.md`](./docs/local-season-reset.md).
 
 When a new Premier League season begins (typically mid-August), the FPL API resets to the new season. The system **should** detect this automatically on the next populate, but here's the manual path if it doesn't.
 
