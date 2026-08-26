@@ -9,8 +9,9 @@ their non-penalty equivalents.
 - FPL supplies fixture histories, xG, xA, xGI, and missed-penalty counts.
 - The official Premier League public feed supplies completed fixtures, Opta
   fixture/player IDs, and penalty goal events (`P`).
-- Historical deep syncs read individual fixture events for both scored (`P`)
-  and missed (`MP`) penalties.
+- Historical deep syncs read individual fixture events for scored (`P`),
+  off-target missed (`MP`), and saved (`SP`) penalties. `MP` and `SP` are
+  normalized to FPL's single `penalties_missed` definition.
 - Premier League fixture Opta IDs (`g123`) join to FPL fixture `code=123`;
   player Opta IDs (`p456`) join to FPL player `code=456`.
 

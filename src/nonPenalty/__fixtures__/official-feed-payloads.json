@@ -16,7 +16,8 @@
     "teams": [{ "team": { "id": 131 } }, { "team": { "id": 12 } }],
     "events": [
       { "type": "P", "personId": 50727, "teamId": 131 },
-      { "type": "MP", "personId": 2100, "teamId": 131 },
+      { "type": "SP", "personId": 2100, "teamId": 131 },
+      { "type": "MP", "personId": 3452, "teamId": 12 },
       { "type": "G", "personId": 9999, "teamId": 12 }
     ],
     "teamLists": [

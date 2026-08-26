@@ -160,7 +160,9 @@ const parsePenaltyEvents = (
     .map((item) => object(item, "fixture event"))
     .filter((item) => allowedTypes.has(String(item["type"])))
     .map((item) => ({
-      type: String(item["type"]) as "P" | "MP",
+      // The feed distinguishes an off-target miss (MP) from a saved penalty
+      // (SP). FPL counts both as penalties_missed, so normalize both here.
+      type: String(item["type"]) === "P" ? "P" : "MP",
       personId: integer(item["personId"], "penalty event personId"),
       teamId: eventTeamId(item),
     }));
@@ -246,7 +248,11 @@ export const fetchFixturePenaltyEvents = async (
   const payload = await feedGet<unknown>(`/fixtures/${fixtureId}`, {
     params: { altIds: true },
   });
-  return parsePremierLeagueFixture(payload, "events", new Set(["P", "MP"]));
+  return parsePremierLeagueFixture(
+    payload,
+    "events",
+    new Set(["P", "MP", "SP"]),
+  );
 };
 
 export const resolvePlayerOptaCode = async (

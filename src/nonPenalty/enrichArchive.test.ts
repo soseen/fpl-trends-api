@@ -94,11 +94,11 @@ void describe("official feed joins and archive enrichment", () => {
     const detailed = parsePremierLeagueFixture(
       officialPayloads.detailedFixture,
       "events",
-      new Set(["P", "MP"]),
+      new Set(["P", "MP", "SP"]),
     );
     assert.deepEqual(
       detailed.goals.map((event) => event.type),
-      ["P", "MP"],
+      ["P", "MP", "MP"],
     );
     assert.deepEqual(detailed.playerTeams, [
       { playerCode: 231416, teamId: 131 },
