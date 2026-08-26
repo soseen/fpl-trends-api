@@ -62,8 +62,10 @@ const historyPastSeasons = (footballers: unknown): Set<string> => {
 };
 
 const ensureCurrentSourceFiles = async (): Promise<void> => {
-  if (!fs.existsSync(RAW_BOOTSTRAP_STATIC_FILE)) await fetchBootstrapStatic();
-  if (!fs.existsSync(RAW_FOOTBALLERS_FILE)) await fetchFootballers();
+  // A repeatable production backfill must reconcile against the live FPL
+  // snapshot, not whichever cache happened to be left by the prior cron run.
+  await fetchBootstrapStatic();
+  await fetchFootballers();
 };
 
 const backfillCurrentRows = async (
