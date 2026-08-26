@@ -27,19 +27,22 @@ export const pickRankBand = (
   );
 };
 
-// SQL equivalent of pickRankBand(). The expression assumes the
-// manager_summary table is aliased as `ms`.
-export const RANK_BAND_SQL_CASE = `
+// SQL equivalent of pickRankBand() for an arbitrary integer expression.
+// Keep the legacy constant for callers that still intentionally compare
+// against the manager's current rank.
+export const rankBandSqlCase = (rankExpression: string): string => `
   CASE
-    WHEN ms.overall_rank IS NULL THEN NULL
-    WHEN ms.overall_rank <= 10000 THEN 1
-    WHEN ms.overall_rank <= 50000 THEN 2
-    WHEN ms.overall_rank <= 100000 THEN 3
-    WHEN ms.overall_rank <= 250000 THEN 4
-    WHEN ms.overall_rank <= 500000 THEN 5
-    WHEN ms.overall_rank <= 1000000 THEN 6
-    WHEN ms.overall_rank <= 2000000 THEN 7
-    WHEN ms.overall_rank <= 4000000 THEN 8
+    WHEN ${rankExpression} IS NULL OR ${rankExpression} <= 0 THEN NULL
+    WHEN ${rankExpression} <= 10000 THEN 1
+    WHEN ${rankExpression} <= 50000 THEN 2
+    WHEN ${rankExpression} <= 100000 THEN 3
+    WHEN ${rankExpression} <= 250000 THEN 4
+    WHEN ${rankExpression} <= 500000 THEN 5
+    WHEN ${rankExpression} <= 1000000 THEN 6
+    WHEN ${rankExpression} <= 2000000 THEN 7
+    WHEN ${rankExpression} <= 4000000 THEN 8
     ELSE 9
   END
 `;
+
+export const RANK_BAND_SQL_CASE = rankBandSqlCase("ms.overall_rank");

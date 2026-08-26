@@ -15,7 +15,7 @@ import {
   summarizePicks,
 } from "../managers/fetchPicks.js";
 import { persistPickElements } from "../managers/persistPickElements.js";
-import { RANK_BAND_SQL_CASE } from "../managers/rankBands.js";
+import { rankBandSqlCase } from "../managers/rankBands.js";
 import { fetchEntryTransfers } from "../managers/fetchTransfers.js";
 import {
   RateLimitGovernor,
@@ -421,6 +421,11 @@ const processEntry = async (
       last_checked_gw: true,
       has_chip_history: true,
       has_transfer_history: true,
+      history: {
+        where: { overall_rank: null },
+        select: { gw: true },
+        take: 1,
+      },
     },
   });
 
@@ -436,6 +441,7 @@ const processEntry = async (
     !isLiveCurrentGw &&
     alreadyCheckedCurrentGw &&
     existing.has_chip_history &&
+    existing.history.length === 0 &&
     currentGwPicksComplete &&
     !needsTransferHistory
   ) {
@@ -507,6 +513,7 @@ const processEntry = async (
       where: { entry_id_gw: { entry_id: entryId, gw: ev.event } },
       update: {
         points: netPointsForEvent(ev),
+        overall_rank: ev.overall_rank,
         event_transfers: ev.event_transfers,
         event_transfers_cost: ev.event_transfers_cost,
         points_on_bench: ev.points_on_bench,
@@ -516,6 +523,7 @@ const processEntry = async (
         entry_id: entryId,
         gw: ev.event,
         points: netPointsForEvent(ev),
+        overall_rank: ev.overall_rank,
         event_transfers: ev.event_transfers,
         event_transfers_cost: ev.event_transfers_cost,
         points_on_bench: ev.points_on_bench,
@@ -937,30 +945,32 @@ export const rebuildStratumCaptainPicks = async (): Promise<void> => {
 // actual EO from final multipliers rather than global selected-by plus a
 // separate captain estimate.
 export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
+  const previousRankBand = rankBandSqlCase("mh_previous.overall_rank");
   await prisma.$transaction([
     prisma.$executeRawUnsafe(`TRUNCATE rank_band_player_exposure_gw`),
     prisma.$executeRawUnsafe(`
       INSERT INTO rank_band_player_exposure_gw
         (rank_band, gw, element_id, sample_size, squad_picks, active_picks,
          effective_multiplier_sum, last_rebuilt)
-      WITH pick_rows AS (
+      WITH causal_pick_rows AS (
         SELECT
-          ${RANK_BAND_SQL_CASE} AS rank_band,
+          CASE WHEN mpe.gw = 1 THEN 0 ELSE ${previousRankBand} END AS rank_band,
           mpe.gw,
           mpe.entry_id,
           mpe.element_id,
           mpe.multiplier
         FROM manager_pick_elements mpe
-        JOIN manager_summary ms ON ms.entry_id = mpe.entry_id
-        WHERE ms.overall_rank IS NOT NULL
+        LEFT JOIN manager_history mh_previous
+          ON mh_previous.entry_id = mpe.entry_id
+         AND mh_previous.gw = mpe.gw - 1
       ),
       samples AS (
         SELECT
           rank_band,
           gw,
           COUNT(DISTINCT entry_id)::int AS sample_size
-        FROM pick_rows
-        WHERE rank_band IS NOT NULL
+        FROM causal_pick_rows
+        WHERE rank_band BETWEEN 1 AND 9
         GROUP BY rank_band, gw
       ),
       player_exposure AS (
@@ -971,9 +981,85 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
           COUNT(*)::int AS squad_picks,
           COUNT(*) FILTER (WHERE multiplier > 0)::int AS active_picks,
           COALESCE(SUM(multiplier), 0)::int AS effective_multiplier_sum
-        FROM pick_rows
-        WHERE rank_band IS NOT NULL
+        FROM causal_pick_rows
+        WHERE rank_band BETWEEN 1 AND 9
         GROUP BY rank_band, gw, element_id
+      ),
+      gw1_pick_rows AS (
+        SELECT
+          mpe.entry_id,
+          mpe.element_id,
+          mpe.multiplier,
+          CASE
+            WHEN mh_end.overall_rank <= 10000 THEN 1
+            WHEN mh_end.overall_rank <= 100000 THEN 2
+            ELSE 3
+          END AS outcome_stratum
+        FROM manager_pick_elements mpe
+        JOIN manager_history mh_end
+          ON mh_end.entry_id = mpe.entry_id
+         AND mh_end.gw = mpe.gw
+        WHERE mpe.gw = 1
+          AND mh_end.overall_rank > 0
+      ),
+      gw1_samples AS (
+        SELECT outcome_stratum, COUNT(DISTINCT entry_id)::int AS sample_size
+        FROM gw1_pick_rows
+        GROUP BY outcome_stratum
+      ),
+      gw1_population AS (
+        SELECT 1 AS outcome_stratum,
+               LEAST(ranked_count, 10000)::numeric AS population
+        FROM events WHERE id = 1
+        UNION ALL
+        SELECT 2,
+               GREATEST(LEAST(ranked_count, 100000) - 10000, 0)::numeric
+        FROM events WHERE id = 1
+        UNION ALL
+        SELECT 3,
+               GREATEST(ranked_count - 100000, 0)::numeric
+        FROM events WHERE id = 1
+      ),
+      gw1_covered_population AS (
+        SELECT SUM(p.population)::numeric AS population
+        FROM gw1_population p
+        JOIN gw1_samples s USING (outcome_stratum)
+        WHERE s.sample_size > 0 AND p.population > 0
+      ),
+      gw1_player_exposure AS (
+        SELECT
+          outcome_stratum,
+          element_id,
+          COUNT(*)::int AS squad_picks,
+          COUNT(*) FILTER (WHERE multiplier > 0)::int AS active_picks,
+          COALESCE(SUM(multiplier), 0)::int AS effective_multiplier_sum
+        FROM gw1_pick_rows
+        GROUP BY outcome_stratum, element_id
+      ),
+      gw1_weighted AS (
+        SELECT
+          0::int AS rank_band,
+          1::int AS gw,
+          pe.element_id,
+          1000000::int AS sample_size,
+          ROUND(
+            SUM(pe.squad_picks::numeric / s.sample_size * p.population)
+              / cp.population * 1000000
+          )::int AS squad_picks,
+          ROUND(
+            SUM(pe.active_picks::numeric / s.sample_size * p.population)
+              / cp.population * 1000000
+          )::int AS active_picks,
+          ROUND(
+            SUM(pe.effective_multiplier_sum::numeric / s.sample_size * p.population)
+              / cp.population * 1000000
+          )::int AS effective_multiplier_sum
+        FROM gw1_player_exposure pe
+        JOIN gw1_samples s USING (outcome_stratum)
+        JOIN gw1_population p USING (outcome_stratum)
+        CROSS JOIN gw1_covered_population cp
+        WHERE cp.population > 0
+        GROUP BY pe.element_id, cp.population
       )
       SELECT
         pe.rank_band,
@@ -986,6 +1072,17 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
         NOW() AS last_rebuilt
       FROM player_exposure pe
       JOIN samples s ON s.rank_band = pe.rank_band AND s.gw = pe.gw
+      UNION ALL
+      SELECT
+        rank_band,
+        gw,
+        element_id,
+        sample_size,
+        squad_picks,
+        active_picks,
+        effective_multiplier_sum,
+        NOW() AS last_rebuilt
+      FROM gw1_weighted
     `),
   ]);
 };
@@ -1205,9 +1302,22 @@ const rebuildManagerRangeScoreBucketsForEndGw = async (
       CREATE TEMP TABLE tmp_manager_range_bucket_end
       ON COMMIT DROP
       AS
-      SELECT entry_id, stratum, cumulative_points
-      FROM manager_cumulative
-      WHERE gw = ${endGw}
+      SELECT
+        mc.entry_id,
+        COALESCE(
+          CASE
+            WHEN mh.overall_rank > 0 AND mh.overall_rank <= 10000 THEN 1
+            WHEN mh.overall_rank > 10000 AND mh.overall_rank <= 100000 THEN 2
+            WHEN mh.overall_rank > 100000 THEN 3
+            ELSE NULL
+          END,
+          mc.stratum
+        )::int AS stratum,
+        mc.cumulative_points
+      FROM manager_cumulative mc
+      LEFT JOIN manager_history mh
+        ON mh.entry_id = mc.entry_id AND mh.gw = mc.gw
+      WHERE mc.gw = ${endGw}
     `,
     prisma.$executeRaw`
       CREATE TEMP TABLE tmp_manager_range_bucket_start

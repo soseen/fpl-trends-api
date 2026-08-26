@@ -1,4 +1,8 @@
 import { prisma } from "../database/client.js";
+import {
+  createRankMovementEstimator,
+  type RankMovementEstimator,
+} from "./rankMovement.js";
 
 export type Stratum = 1 | 2 | 3;
 export type ManagerSampleStatus = "final" | "refreshing" | "stale";
@@ -175,6 +179,52 @@ export const estimateRangeRankFromBuckets = async (
 export type RangeDensity = {
   rankPerPoint: number | null;
   stratumAverage: number | null;
+};
+
+type OverallRankMilestoneRow = {
+  score: number;
+  rank: number;
+};
+
+// Overall-rank movement is non-linear: four points can cross far more teams
+// than four times a one-point estimate. Sampled managers already carry an
+// official rank, so median score/rank milestones give us a calibrated local
+// curve without assuming that the manager sample is distributionally uniform.
+export const overallRankMovementEstimator = async (
+  endGw: number,
+): Promise<RankMovementEstimator | null> => {
+  const latest = await prisma.manager_cumulative.aggregate({
+    _max: { gw: true },
+  });
+  const canUseCurrentRankFallback = latest._max.gw === endGw;
+  const rows = await prisma.$queryRawUnsafe<OverallRankMilestoneRow[]>(
+    `
+    WITH ranked_managers AS (
+      SELECT
+        mc.cumulative_points AS score,
+        COALESCE(
+          mh.overall_rank,
+          CASE WHEN $2::boolean THEN ms.overall_rank ELSE NULL END
+        ) AS official_rank
+      FROM manager_cumulative mc
+      JOIN manager_summary ms ON ms.entry_id = mc.entry_id
+      LEFT JOIN manager_history mh
+        ON mh.entry_id = mc.entry_id AND mh.gw = mc.gw
+      WHERE mc.gw = $1
+    )
+    SELECT
+      score,
+      PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY official_rank)::float AS rank
+    FROM ranked_managers
+    WHERE official_rank > 0
+    GROUP BY score
+    ORDER BY score
+    `,
+    endGw,
+    canUseCurrentRankFallback,
+  );
+
+  return createRankMovementEstimator(rows);
 };
 
 // Density of OVERALL season totals at the user's overall total (at end_gw)

@@ -2,12 +2,13 @@ import { prisma } from "../database/client.js";
 import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks } from "./resolvePicks.js";
-import { rangeDensityFromCumulative, type Stratum } from "./rangeStats.js";
 import {
-  pickRankBand,
-  RANK_BAND_SQL_CASE,
-  type RankBand,
-} from "./rankBands.js";
+  overallRankMovementEstimator,
+  rangeDensityFromCumulative,
+  type Stratum,
+} from "./rangeStats.js";
+import { pickRankBand, rankBandSqlCase, type RankBand } from "./rankBands.js";
+import type { RankMovementEstimator } from "./rankMovement.js";
 
 // ----------------------------------------------------------------------------
 // Public response types. Mirrored on the frontend in
@@ -144,21 +145,9 @@ const SMALL_SAMPLE_THRESHOLD = 50;
 // 100k-250k manager into the whole tail and massively understate template EO.
 const CAPTAIN_FALLBACK_SAMPLE_THRESHOLD = 10;
 
-// Density window for rank_per_point. We count sample managers within
-// ±W points of the user, divide by 2W to get managers-per-point, and
-// scale that by the stratum's true population. Width is a noise-vs-
-// locality trade-off:
-//   W=5  → tight locality, but users in sparse tails (or wide ranges
-//          where the mode is well off the user's total) get 0 neighbours
-//          and the whole attribution collapses to 0.
-//   W=25 → averages over a 50-point band — still a small slice of any
-//          stratum's spread, but reliably non-empty even in tails.
-// Bumped from 5 to 25 after observing that the same player's
-// rank_impact would swing 100× between adjacent ranges (e.g. 1-34 vs
-// 8-34) for the same entry just because one window happened to be
-// empty. Stability matters more than perfect locality for an attribution
-// display.
-const RANK_DENSITY_HALF_WINDOW = 25;
+// rangeDensityFromCumulative still supplies the display-only comparison
+// average. Its old linear density is no longer used for player attribution.
+const AVERAGE_DENSITY_WINDOW = 1;
 
 // Frequency-XI repair: a "started" GW means the user fielded the player
 // (multiplier ≥ 1 — autosubs included).
@@ -497,8 +486,10 @@ const fetchCaptainRatesInStratum = async (
   return { rates, perGwSampleSize };
 };
 
+type ComparisonRankBand = RankBand | 0;
+
 const fetchCaptainRatesInRankBand = async (
-  rankBand: RankBand | null,
+  comparisonBandByGw: ReadonlyMap<number, ComparisonRankBand | null>,
   startGw: number,
   endGw: number,
 ): Promise<{
@@ -507,29 +498,49 @@ const fetchCaptainRatesInRankBand = async (
 }> => {
   const rates = new Map<string, { cap_rate: number; tc_rate: number }>();
   const perGwSampleSize = new Map<number, number>();
-  if (rankBand === null) return { rates, perGwSampleSize };
+  const bands = Array.from(
+    new Set(
+      Array.from(comparisonBandByGw.values()).filter(
+        (band): band is ComparisonRankBand => band !== null,
+      ),
+    ),
+  );
+  if (bands.length === 0) return { rates, perGwSampleSize };
+
+  const causalBand = `CASE WHEN mp.gw = 1 THEN 0 ELSE ${rankBandSqlCase(
+    "mh_previous.overall_rank",
+  )} END`;
 
   const sampleRows = await prisma.$queryRawUnsafe<
-    Array<{ gw: number; sample_size: number }>
+    Array<{ rank_band: number; gw: number; sample_size: number }>
   >(
     `
-    SELECT mp.gw, COUNT(*)::int AS sample_size
+    SELECT
+      (${causalBand})::int AS rank_band,
+      mp.gw,
+      COUNT(*)::int AS sample_size
     FROM manager_picks mp
-    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+    LEFT JOIN manager_history mh_previous
+      ON mh_previous.entry_id = mp.entry_id
+     AND mh_previous.gw = mp.gw - 1
     WHERE mp.gw BETWEEN $1 AND $2
       AND mp.captain_element IS NOT NULL
       AND mp.captain_multiplier IS NOT NULL
-      AND (${RANK_BAND_SQL_CASE}) = $3
-    GROUP BY mp.gw
+      AND (${causalBand}) = ANY($3::int[])
+    GROUP BY rank_band, mp.gw
     `,
     startGw,
     endGw,
-    rankBand,
+    bands,
   );
-  for (const r of sampleRows) perGwSampleSize.set(r.gw, r.sample_size);
+  for (const r of sampleRows) {
+    if (comparisonBandByGw.get(r.gw) !== r.rank_band) continue;
+    perGwSampleSize.set(r.gw, r.sample_size);
+  }
 
   const captainRows = await prisma.$queryRawUnsafe<
     Array<{
+      rank_band: number;
       gw: number;
       captain_element: number;
       captain_multiplier: number;
@@ -538,23 +549,27 @@ const fetchCaptainRatesInRankBand = async (
   >(
     `
     SELECT
+      (${causalBand})::int AS rank_band,
       mp.gw,
       mp.captain_element,
       mp.captain_multiplier,
       COUNT(*)::int AS n
     FROM manager_picks mp
-    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+    LEFT JOIN manager_history mh_previous
+      ON mh_previous.entry_id = mp.entry_id
+     AND mh_previous.gw = mp.gw - 1
     WHERE mp.gw BETWEEN $1 AND $2
       AND mp.captain_element IS NOT NULL
       AND mp.captain_multiplier IS NOT NULL
-      AND (${RANK_BAND_SQL_CASE}) = $3
-    GROUP BY mp.gw, mp.captain_element, mp.captain_multiplier
+      AND (${causalBand}) = ANY($3::int[])
+    GROUP BY rank_band, mp.gw, mp.captain_element, mp.captain_multiplier
     `,
     startGw,
     endGw,
-    rankBand,
+    bands,
   );
   for (const r of captainRows) {
+    if (comparisonBandByGw.get(r.gw) !== r.rank_band) continue;
     const sample = perGwSampleSize.get(r.gw) ?? 0;
     if (sample === 0) continue;
     const key = `${r.captain_element}:${r.gw}`;
@@ -576,7 +591,7 @@ type PlayerExposure = {
 };
 
 const fetchPlayerExposureInRankBand = async (
-  rankBand: RankBand | null,
+  comparisonBandByGw: ReadonlyMap<number, ComparisonRankBand | null>,
   playerIds: number[],
   startGw: number,
   endGw: number,
@@ -586,28 +601,39 @@ const fetchPlayerExposureInRankBand = async (
 }> => {
   const exposures = new Map<string, PlayerExposure>();
   const perGwSampleSize = new Map<number, number>();
-  if (rankBand === null || playerIds.length === 0) {
+  const bands = Array.from(
+    new Set(
+      Array.from(comparisonBandByGw.values()).filter(
+        (band): band is ComparisonRankBand => band !== null,
+      ),
+    ),
+  );
+  if (bands.length === 0 || playerIds.length === 0) {
     return { exposures, perGwSampleSize };
   }
 
   const sampleRows = await prisma.$queryRawUnsafe<
-    Array<{ gw: number; sample_size: number }>
+    Array<{ rank_band: number; gw: number; sample_size: number }>
   >(
     `
-    SELECT gw, MAX(sample_size)::int AS sample_size
+    SELECT rank_band, gw, MAX(sample_size)::int AS sample_size
     FROM rank_band_player_exposure_gw
-    WHERE rank_band = $1
+    WHERE rank_band = ANY($1::int[])
       AND gw BETWEEN $2 AND $3
-    GROUP BY gw
+    GROUP BY rank_band, gw
     `,
-    rankBand,
+    bands,
     startGw,
     endGw,
   );
-  for (const row of sampleRows) perGwSampleSize.set(row.gw, row.sample_size);
+  for (const row of sampleRows) {
+    if (comparisonBandByGw.get(row.gw) !== row.rank_band) continue;
+    perGwSampleSize.set(row.gw, row.sample_size);
+  }
 
   const rows = await prisma.$queryRawUnsafe<
     Array<{
+      rank_band: number;
       element_id: number;
       gw: number;
       sample_size: number;
@@ -617,23 +643,25 @@ const fetchPlayerExposureInRankBand = async (
   >(
     `
     SELECT
+      rank_band,
       element_id,
       gw,
       sample_size,
       squad_picks,
       effective_multiplier_sum
     FROM rank_band_player_exposure_gw
-    WHERE rank_band = $1
+    WHERE rank_band = ANY($1::int[])
       AND gw BETWEEN $2 AND $3
       AND element_id = ANY($4::int[])
     `,
-    rankBand,
+    bands,
     startGw,
     endGw,
     playerIds,
   );
 
   for (const row of rows) {
+    if (comparisonBandByGw.get(row.gw) !== row.rank_band) continue;
     const sample = row.sample_size || 0;
     if (sample <= 0) continue;
     exposures.set(`${row.element_id}:${row.gw}`, {
@@ -646,36 +674,60 @@ const fetchPlayerExposureInRankBand = async (
   return { exposures, perGwSampleSize };
 };
 
-// rank_per_point coefficient at the user's overall total.
-//
-// Density = sample managers in stratum whose cumulative_points at end_gw is
-// within ±RANK_DENSITY_HALF_WINDOW of the user's overall total at end_gw,
-// divided by (2 × half-window). Multiply by stratum extrapolation factor
-// (trueSize / sampleSize) to get rank places per point.
-//
-// Uses overall totals (not range totals) because adding +1 to a range total
-// adds +1 to the season total, and the rank movement is governed by the
-// local density of OVERALL totals around the user. See rangeStats.ts.
-//
-// Returns null if stratum can't be determined or the sample has no
-// neighbours of the user (e.g. very early in the season with sparse data).
-const computeRankPerPoint = async (
+// Build the non-linear overall-rank curve plus the display-only stratum
+// average. `rank_per_point` remains in the response for compatibility and is
+// now the exact one-point movement on that curve at the user's total.
+const computeRankInfo = async (
   stratum: number | null,
   startGw: number,
   endGw: number,
   userOverallTotal: number | null,
-): Promise<{ rank_per_point: number | null; stratum_avg: number | null }> => {
-  const density = await rangeDensityFromCumulative(
-    stratum as Stratum | null,
-    startGw,
-    endGw,
-    userOverallTotal,
-    RANK_DENSITY_HALF_WINDOW,
-  );
+): Promise<{
+  rank_per_point: number | null;
+  stratum_avg: number | null;
+  estimator: RankMovementEstimator | null;
+}> => {
+  const [density, estimator] = await Promise.all([
+    rangeDensityFromCumulative(
+      stratum as Stratum | null,
+      startGw,
+      endGw,
+      userOverallTotal,
+      AVERAGE_DENSITY_WINDOW,
+    ),
+    overallRankMovementEstimator(endGw),
+  ]);
+  const rankPerPoint =
+    estimator !== null && userOverallTotal !== null
+      ? estimator.impactForExcess(userOverallTotal, 1)
+      : null;
   return {
-    rank_per_point: density.rankPerPoint,
+    rank_per_point:
+      rankPerPoint !== null && rankPerPoint > 0 ? rankPerPoint : null,
     stratum_avg: density.stratumAverage,
+    estimator,
   };
+};
+
+const applyRankMovement = (
+  rows: PlayerImpactGwBreakdown[],
+  userOverallTotal: number | null,
+  estimator: RankMovementEstimator | null,
+): number => {
+  if (userOverallTotal === null || estimator === null) return 0;
+
+  let cumulativeExcess = 0;
+  let previousImpact = 0;
+  for (const row of rows.sort((a, b) => a.gw - b.gw)) {
+    cumulativeExcess += row.excess;
+    const cumulativeImpact = estimator.impactForExcess(
+      userOverallTotal,
+      cumulativeExcess,
+    );
+    row.rank_impact_gw = cumulativeImpact - previousImpact;
+    previousImpact = cumulativeImpact;
+  }
+  return previousImpact;
 };
 
 // Greedy "most-played XI" selection. Mirrors the formation constraints and
@@ -884,6 +936,20 @@ const exposureForPlayerGw = (
   const exposureSample = exposureInfo.perGwSampleSize.get(gw) ?? 0;
   if (exposureSample >= SMALL_SAMPLE_THRESHOLD) {
     const exposure = exposureInfo.exposures.get(key);
+    if (gw === 1) {
+      // Everyone enters GW1 unranked, so ownership must be global rather than
+      // selected from a post-GW outcome band. Keep official ownership as the
+      // anchor and use the weighted sample only for bench/captain adjustment.
+      const ownershipPct = globalOwnershipPct(stat);
+      const multiplierAdjustment = exposure
+        ? exposure.eo - exposure.ownership_pct
+        : 0;
+      return {
+        ownershipPct,
+        eo: Math.max(0, Math.min(3, ownershipPct + multiplierAdjustment)),
+        usedRankBandExposure: true,
+      };
+    }
     return {
       ownershipPct: exposure?.ownership_pct ?? 0,
       eo: exposure?.eo ?? 0,
@@ -892,6 +958,9 @@ const exposureForPlayerGw = (
   }
 
   const ownershipPct = globalOwnershipPct(stat);
+  if (gw === 1) {
+    return { ownershipPct, eo: ownershipPct, usedRankBandExposure: false };
+  }
   const rankBandCap = rankBandCapInfo.rates.get(key);
   const rankBandCapSample = rankBandCapInfo.perGwSampleSize.get(gw) ?? 0;
   const stratumCap = stratumCapInfo.rates.get(key);
@@ -981,9 +1050,18 @@ export const getTeamImpact = async (
   // Prefer the user's rank at the end of this range, falling back to current
   // rank for unusual payloads.
   const stratum = pickStratum(rankBasisOverallRank);
-  const rankBand = pickRankBand(rankBasisOverallRank);
-  // Cumulative season total at end_gw — the input to rank_per_point density.
-  // See computeRankPerPoint comment for why overall (not range) total.
+  const historicalRankByGw = new Map(
+    (history.current ?? []).map((event) => [event.event, event.overall_rank]),
+  );
+  const comparisonBandByGw = new Map<number, ComparisonRankBand | null>();
+  for (const gw of ingestedGws) {
+    comparisonBandByGw.set(
+      gw,
+      gw === 1 ? 0 : pickRankBand(historicalRankByGw.get(gw - 1)),
+    );
+  }
+  // Cumulative season total at end_gw is the baseline for each player's
+  // counterfactual rank movement on the sampled score curve.
   const userOverallTotal =
     rangeEndEvent?.total_points ?? summary.summary_overall_points;
 
@@ -1007,14 +1085,20 @@ export const getTeamImpact = async (
   ] = await Promise.all([
     fetchFootballerInfo(elementIds),
     fetchPlayerGwStats(elementIds, startGw, endGw),
-    fetchCaptainRatesInRankBand(rankBand, startGw, endGw),
+    fetchCaptainRatesInRankBand(comparisonBandByGw, startGw, endGw),
     fetchCaptainRatesInStratum(stratum, startGw, endGw),
-    fetchPlayerExposureInRankBand(rankBand, elementIds, startGw, endGw),
-    computeRankPerPoint(stratum, startGw, endGw, userOverallTotal),
+    fetchPlayerExposureInRankBand(
+      comparisonBandByGw,
+      elementIds,
+      startGw,
+      endGw,
+    ),
+    computeRankInfo(stratum, startGw, endGw, userOverallTotal),
     fetchPlayerMatches(elementIds, ingestedGws),
   ]);
 
   const smallSampleGws = new Set<number>();
+  let fallbackUsed = stratum === null;
   for (const [gw, n] of exposureInfo.perGwSampleSize.entries()) {
     if (n < SMALL_SAMPLE_THRESHOLD) smallSampleGws.add(gw);
   }
@@ -1056,10 +1140,9 @@ export const getTeamImpact = async (
     );
     const ownershipPct = exposure.ownershipPct;
     const eo = exposure.eo;
+    if (!exposure.usedRankBandExposure) fallbackUsed = true;
 
     const excess = (pick.multiplier - eo) * points;
-    const rankImpactGw =
-      rankInfo.rank_per_point !== null ? excess * rankInfo.rank_per_point : 0;
 
     let acc = accumulators.get(pick.element_id);
     if (!acc) {
@@ -1097,7 +1180,7 @@ export const getTeamImpact = async (
       ownership_pct: ownershipPct,
       eo,
       excess,
-      rank_impact_gw: rankImpactGw,
+      rank_impact_gw: 0,
       // Missing stat row → no fixture this GW (blank). Anything else
       // (including minutes=0 / suspended / injured) is "had fixture
       // but blanked" — the frontend treats these differently.
@@ -1120,6 +1203,12 @@ export const getTeamImpact = async (
   for (const acc of accumulators.values()) {
     if (acc.played_count === 0) continue;
     const denom = acc.per_gw.length || 1;
+    const perGw = acc.per_gw.sort((a, b) => a.gw - b.gw);
+    const rankImpact = applyRankMovement(
+      perGw,
+      userOverallTotal,
+      rankInfo.estimator,
+    );
     players.push({
       player_id: acc.info.id,
       code: acc.info.code,
@@ -1134,11 +1223,8 @@ export const getTeamImpact = async (
       played_count: acc.played_count,
       avg_ownership_pct: acc.ownership_sum / denom,
       avg_eo_in_stratum: acc.eo_sum / denom,
-      rank_impact:
-        rankInfo.rank_per_point !== null
-          ? acc.excess_total * rankInfo.rank_per_point
-          : 0,
-      per_gw: acc.per_gw.sort((a, b) => a.gw - b.gw),
+      rank_impact: rankImpact,
+      per_gw: perGw,
     });
   }
   players.sort((a, b) => b.rank_impact - a.rank_impact);
@@ -1173,7 +1259,7 @@ export const getTeamImpact = async (
       ),
     );
     const killerExposureInfo = await fetchPlayerExposureInRankBand(
-      rankBand,
+      comparisonBandByGw,
       allScoringPlayerIds,
       startGw,
       endGw,
@@ -1207,11 +1293,11 @@ export const getTeamImpact = async (
       );
       const ownershipPct = exposure.ownershipPct;
       const eo = exposure.eo;
+      if (!exposure.usedRankBandExposure) fallbackUsed = true;
 
       if (eo === 0) continue;
 
       const excess = -eo * stat.total_points;
-      const rankImpactGw = excess * rankInfo.rank_per_point;
 
       let acc = killerAccs.get(playerId);
       if (!acc) {
@@ -1235,7 +1321,7 @@ export const getTeamImpact = async (
         ownership_pct: ownershipPct,
         eo,
         excess,
-        rank_impact_gw: rankImpactGw,
+        rank_impact_gw: 0,
         // Rank killers come from `fetchAllPlayerGwStats`, which already
         // filters to rows that exist in `history` (i.e. had a fixture
         // and total_points > 0).
@@ -1290,6 +1376,11 @@ export const getTeamImpact = async (
           matches: killerMatchesMap.get(`${playerId}:${row.gw}`) ?? [],
         }))
         .sort((a, b) => a.gw - b.gw);
+      const rankImpact = applyRankMovement(
+        perGw,
+        userOverallTotal,
+        rankInfo.estimator,
+      );
       rankKillers.push({
         player_id: info.id,
         code: info.code,
@@ -1304,7 +1395,7 @@ export const getTeamImpact = async (
         played_count: 0,
         avg_ownership_pct: acc.ownership_sum / denom,
         avg_eo_in_stratum: acc.eo_sum / denom,
-        rank_impact: acc.excess_total * rankInfo.rank_per_point,
+        rank_impact: rankImpact,
         per_gw: perGw,
       });
     }
@@ -1325,7 +1416,7 @@ export const getTeamImpact = async (
     },
     notes: {
       incomplete_picks: incomplete,
-      fallback_used: stratum === null,
+      fallback_used: fallbackUsed,
       small_sample_gws: Array.from(smallSampleGws).sort((a, b) => a - b),
     },
   };
