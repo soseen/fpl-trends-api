@@ -23,6 +23,7 @@
     "backfill-comparison-picks": "tsx src/database/backfillComparisonPicks.ts",
     "backfill-cumulative": "tsx src/database/backfillManagerCumulative.ts",
     "backfill-manager-chips": "tsx src/database/backfillManagerChips.ts",
+    "backfill-manager-ranks": "tsx src/database/backfillManagerRanks.ts",
     "backfill-manager-transfers": "tsx src/database/backfillManagerTransfers.ts",
     "backfill-stratum-range-xfer-avg": "tsx src/database/backfillStratumRangeXferAvg.ts",
     "backfill-non-penalty": "tsx src/database/backfillNonPenalty.ts",
