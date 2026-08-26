@@ -12,6 +12,9 @@ their non-penalty equivalents.
 - Historical deep syncs read individual fixture events for scored (`P`),
   off-target missed (`MP`), and saved (`SP`) penalties. `MP` and `SP` are
   normalized to FPL's single `penalties_missed` definition.
+- A finalized current season with 380/380 reconciled fixtures is accepted as
+  complete historical coverage at the next season reset, so the new season's
+  `history_past` data does not require a manual backfill.
 - Premier League fixture Opta IDs (`g123`) join to FPL fixture `code=123`;
   player Opta IDs (`p456`) join to FPL player `code=456`.
 

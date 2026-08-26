@@ -17,6 +17,7 @@ import {
   parseOptaCode,
   parsePremierLeagueFixture,
 } from "../penalties/premierLeagueFeed.js";
+import { hasHistoricalPenaltyCoverage } from "../penalties/ledger.js";
 import {
   validateFixtureCoverage,
   validateListedScoredPenalties,
@@ -173,6 +174,36 @@ void describe("official feed joins and archive enrichment", () => {
         new Map(),
         new Set(),
       ),
+    );
+  });
+
+  void it("carries an exact finalized current ledger into the next season", () => {
+    assert.equal(
+      hasHistoricalPenaltyCoverage({
+        deep_event_coverage: false,
+        final_season: true,
+        completed_fixture_count: 380,
+        mapped_fixture_count: 380,
+      }),
+      true,
+    );
+    assert.equal(
+      hasHistoricalPenaltyCoverage({
+        deep_event_coverage: false,
+        final_season: false,
+        completed_fixture_count: 380,
+        mapped_fixture_count: 380,
+      }),
+      false,
+    );
+    assert.equal(
+      hasHistoricalPenaltyCoverage({
+        deep_event_coverage: false,
+        final_season: true,
+        completed_fixture_count: 379,
+        mapped_fixture_count: 379,
+      }),
+      false,
     );
   });
 
