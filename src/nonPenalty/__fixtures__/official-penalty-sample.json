@@ -1,0 +1,165 @@
+{
+  "season": "2025-26",
+  "fixtures": [
+    {
+      "season": "2025-26",
+      "fixture_code": 100,
+      "premier_league_id": 1000,
+      "gameweek": 1,
+      "home_team_pulse_id": 10,
+      "away_team_pulse_id": 20,
+      "updated_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "season": "2025-26",
+      "fixture_code": 101,
+      "premier_league_id": 1001,
+      "gameweek": 2,
+      "home_team_pulse_id": 20,
+      "away_team_pulse_id": 10,
+      "updated_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "season": "2025-26",
+      "fixture_code": 102,
+      "premier_league_id": 1002,
+      "gameweek": 2,
+      "home_team_pulse_id": 30,
+      "away_team_pulse_id": 10,
+      "updated_at": "2026-08-26T00:00:00.000Z"
+    }
+  ],
+  "penalties": [
+    {
+      "season": "2025-26",
+      "fixture_code": 100,
+      "player_code": 999,
+      "gameweek": 1,
+      "team_pulse_id": 10,
+      "opponent_pulse_id": 20,
+      "was_home": true,
+      "scored": 1,
+      "missed": 0,
+      "updated_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "season": "2025-26",
+      "fixture_code": 102,
+      "player_code": 999,
+      "gameweek": 2,
+      "team_pulse_id": 30,
+      "opponent_pulse_id": 10,
+      "was_home": true,
+      "scored": 0,
+      "missed": 1,
+      "updated_at": "2026-08-26T00:00:00.000Z"
+    }
+  ],
+  "fixturePlayers": [
+    {
+      "season": "2025-26",
+      "fixture_code": 100,
+      "player_code": 999,
+      "team_pulse_id": 10,
+      "updated_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "season": "2025-26",
+      "fixture_code": 102,
+      "player_code": 999,
+      "team_pulse_id": 30,
+      "updated_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "season": "2025-26",
+      "fixture_code": 101,
+      "player_code": 888,
+      "team_pulse_id": 10,
+      "updated_at": "2026-08-26T00:00:00.000Z"
+    },
+    {
+      "season": "2025-26",
+      "fixture_code": 102,
+      "player_code": 888,
+      "team_pulse_id": 10,
+      "updated_at": "2026-08-26T00:00:00.000Z"
+    }
+  ],
+  "footballers": [
+    {
+      "id": 1,
+      "code": 999,
+      "team_id": 3,
+      "history_past": [],
+      "history": [
+        {
+          "round": 1,
+          "opponent_team": 2,
+          "was_home": true,
+          "minutes": 90,
+          "goals_scored": 1,
+          "expected_goals": "0.79",
+          "expected_goal_involvements": "0.79"
+        },
+        {
+          "round": 2,
+          "opponent_team": 1,
+          "was_home": true,
+          "minutes": 90,
+          "goals_scored": 0,
+          "expected_goals": "0.99",
+          "expected_goal_involvements": "1.09"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "code": 888,
+      "team_id": 1,
+      "history_past": [],
+      "history": [
+        {
+          "round": 2,
+          "opponent_team": 2,
+          "was_home": false,
+          "minutes": 90,
+          "goals_scored": 0,
+          "expected_goals": "0.20",
+          "expected_goal_involvements": "0.30"
+        },
+        {
+          "round": 2,
+          "opponent_team": 3,
+          "was_home": false,
+          "minutes": 90,
+          "goals_scored": 0,
+          "expected_goals": "0.30",
+          "expected_goal_involvements": "0.40"
+        }
+      ]
+    }
+  ],
+  "teams": [
+    {
+      "id": 1,
+      "pulse_id": 10,
+      "team_history": [
+        { "round": 1, "teamXGS": 0.79, "teamXGC": 0 },
+        { "round": 2, "teamXGS": 0.5, "teamXGC": 0 }
+      ]
+    },
+    {
+      "id": 2,
+      "pulse_id": 20,
+      "team_history": [
+        { "round": 1, "teamXGS": 0, "teamXGC": 0.79 },
+        { "round": 2, "teamXGS": 0, "teamXGC": 0.2 }
+      ]
+    },
+    {
+      "id": 3,
+      "pulse_id": 30,
+      "team_history": [{ "round": 2, "teamXGS": 0.99, "teamXGC": 0.3 }]
+    }
+  ]
+}

@@ -15,6 +15,15 @@ export type Fixture = {
   difficulty: number;
 };
 
+export type FplFixture = {
+  id: number;
+  code: number;
+  event: number | null;
+  finished: boolean;
+  team_h: number;
+  team_a: number;
+};
+
 export type History = {
   element: number;
   fixture: number;

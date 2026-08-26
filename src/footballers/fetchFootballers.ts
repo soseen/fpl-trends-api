@@ -60,10 +60,9 @@ export const fetchFootballers = async () => {
             `Error processing batch ${i + 1}. Retry ${retries}/${MAX_RETRIES}. Error: ${(error as Error).message}`,
           );
           if (retries >= MAX_RETRIES) {
-            console.error(
-              `Batch ${i + 1} failed after ${MAX_RETRIES} retries. Exiting process.`,
+            throw new Error(
+              `Batch ${i + 1} failed after ${MAX_RETRIES} retries.`,
             );
-            return; // Exit the entire process if retries exceed max limit
           }
           await delay(500 + retries * 2000);
         }
@@ -75,7 +74,7 @@ export const fetchFootballers = async () => {
     console.error(
       `There was an error trying to fetch footballers: ${(error as Error).message}`,
     );
-    return;
+    throw error;
   }
 
   console.info("Raw footballers data fetching completed.");

@@ -150,6 +150,7 @@ model history {
   own_goals                  Int
   penalties_saved            Int
   penalties_missed           Int
+  penalties_scored           Int         @default(0)
   yellow_cards               Int
   red_cards                  Int
   saves                      Int
@@ -170,6 +171,7 @@ model history {
   transfers_in               Int
   transfers_out              Int
   fixture_id                 Int
+  fixture_code               Int?
   footballer_id              Int
   defensive_contribution     Int?
   footballer                 footballers @relation(fields: [footballer_id], references: [id], onDelete: Cascade)
@@ -211,12 +213,71 @@ model team_history {
   round          Int
   teamXGC        Float
   teamXGS        Float
+  teamNPXG       Float @default(0)
+  teamNPXGA      Float @default(0)
   goals          Int
   goals_conceded Int
 
   team teams @relation(fields: [team_id], references: [id], onDelete: Cascade)
 
   @@unique([team_id, round])
+}
+
+// Season-independent source ledger. These rows intentionally survive the
+// destructive live-season reset so archived/preseason analytics can be
+// rebuilt without losing the official penalty reconciliation.
+model penalty_records {
+  season            String   @db.VarChar(10)
+  fixture_code      Int
+  player_code       Int
+  gameweek          Int?
+  team_pulse_id     Int?
+  opponent_pulse_id Int?
+  was_home          Boolean?
+  scored            Int      @default(0)
+  missed            Int      @default(0)
+  updated_at        DateTime @updatedAt
+
+  @@id([season, fixture_code, player_code])
+  @@index([season, player_code])
+  @@index([season, fixture_code])
+}
+
+model penalty_fixtures {
+  season             String   @db.VarChar(10)
+  fixture_code       Int
+  premier_league_id  Int
+  gameweek           Int?
+  home_team_pulse_id Int
+  away_team_pulse_id Int
+  updated_at         DateTime @updatedAt
+
+  @@id([season, fixture_code])
+  @@unique([season, premier_league_id])
+  @@index([season, gameweek])
+}
+
+model penalty_fixture_players {
+  season        String   @db.VarChar(10)
+  fixture_code  Int
+  player_code   Int
+  team_pulse_id Int
+  updated_at    DateTime @updatedAt
+
+  @@id([season, fixture_code, player_code])
+  @@index([season, player_code])
+}
+
+model penalty_feed_sync {
+  season                  String   @id @db.VarChar(10)
+  competition_season_id   Int
+  completed_fixture_count Int
+  mapped_fixture_count    Int
+  scored_penalties        Int
+  missed_penalties        Int
+  deep_event_coverage     Boolean  @default(false)
+  final_season            Boolean  @default(false)
+  last_successful_refresh DateTime
 }
 
 model app_metadata {

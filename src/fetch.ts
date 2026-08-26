@@ -1,5 +1,6 @@
 import axios from "axios";
 import type { BootstrapStaticData } from "./bootstrapStatic/types.js";
+import type { FplFixture } from "./footballers/types.js";
 
 export const getBootstrapStaticData =
   async (): Promise<BootstrapStaticData> => {
@@ -20,4 +21,16 @@ export const getBasicInfo = async () => {
     (data.events.find((gw) => !gw.finished)?.id ?? 1) - 1;
   const totalPlayers: number = data.total_players ?? 0;
   return { totalPlayers, lastGameweek, events: data.events };
+};
+
+export const getFixturesData = async (): Promise<FplFixture[]> => {
+  try {
+    const response = await axios.get<FplFixture[]>(
+      "https://fantasy.premierleague.com/api/fixtures/",
+    );
+    return response.data;
+  } catch (error) {
+    console.error("Failed to fetch FPL fixtures", (error as Error).message);
+    throw error;
+  }
 };

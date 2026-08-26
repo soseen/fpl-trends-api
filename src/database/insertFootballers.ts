@@ -1,4 +1,5 @@
 import fs from "fs";
+import { type Prisma } from "@prisma/client";
 import {
   RAW_BOOTSTRAP_STATIC_FILE,
   RAW_FOOTBALLERS_FILE,
@@ -6,6 +7,11 @@ import {
 import type { BootstrapStaticData } from "../bootstrapStatic/types.js";
 import type { Footballer } from "../footballers/types.js";
 import { prisma } from "./client.js";
+import {
+  getDeepCoveredSeasons,
+  getPlayerSeasonPenaltyTotals,
+} from "../penalties/ledger.js";
+import { enrichHistoryPast } from "../nonPenalty/historyPast.js";
 
 export const insertFootballers = async () => {
   try {
@@ -19,10 +25,22 @@ export const insertFootballers = async () => {
     )
       ? JSON.parse(fs.readFileSync(RAW_FOOTBALLERS_FILE, "utf8"))
       : {};
+    const [penaltyTotals, deepCoveredSeasons] = await Promise.all([
+      getPlayerSeasonPenaltyTotals(),
+      getDeepCoveredSeasons(),
+    ]);
 
     for (const footballer of rawData.elements) {
-      const historyPast =
-        footballerSummaries[String(footballer.id)]?.history_past ?? [];
+      const historyPast = (
+        footballerSummaries[String(footballer.id)]?.history_past ?? []
+      ).map((row) =>
+        enrichHistoryPast(
+          row,
+          footballer.code,
+          penaltyTotals,
+          deepCoveredSeasons,
+        ),
+      );
       const footballerObject = {
         web_name: footballer.web_name,
         first_name: footballer.first_name,
@@ -121,7 +139,9 @@ export const insertFootballers = async () => {
         defensive_contribution: footballer.defensive_contribution ?? null,
         defensive_contribution_per_90:
           footballer.defensive_contribution_per_90 ?? null,
-        history_past: historyPast,
+        history_past: JSON.parse(
+          JSON.stringify(historyPast),
+        ) as Prisma.InputJsonValue,
       };
       await prisma.footballers.upsert({
         where: { code: footballer.code },
@@ -138,6 +158,7 @@ export const insertFootballers = async () => {
       "Couldn't populate the footballers table. Error:",
       (error as Error)?.message,
     );
+    throw error;
   } finally {
     console.info("Footballers populated successfully.");
     await prisma.$disconnect();

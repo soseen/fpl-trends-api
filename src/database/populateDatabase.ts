@@ -9,7 +9,10 @@ import { fetchBootstrapStatic } from "../bootstrapStatic/fetchBootstrapStatic.js
 import { fetchFootballers } from "../footballers/fetchFootballers.js";
 import { insertEvents } from "../events/insertEvents.js";
 import { insertTeamHistory } from "./insertTeamHistory.js";
-import { RAW_BOOTSTRAP_STATIC_FILE } from "../file.helpers.js";
+import {
+  RAW_BOOTSTRAP_STATIC_FILE,
+  RAW_FOOTBALLERS_FILE,
+} from "../file.helpers.js";
 import {
   detectSeasonChange,
   evaluateSeasonClosure,
@@ -17,6 +20,15 @@ import {
   performSeasonReset,
 } from "./seasonManager.js";
 import { prisma } from "./client.js";
+import { getFixturesData } from "../fetch.js";
+import type { BootstrapStaticData } from "../bootstrapStatic/types.js";
+import type { Footballer } from "../footballers/types.js";
+import { syncPenaltyFeed } from "../penalties/syncPenaltyFeed.js";
+import {
+  getDeepCoveredSeasons,
+  getPlayerSeasonPenaltyTotals,
+} from "../penalties/ledger.js";
+import { enrichHistoryPast } from "../nonPenalty/historyPast.js";
 
 const DATA_REFRESH_VERSION_KEY = "bulk_data_refresh_version";
 
@@ -80,6 +92,47 @@ export const populateDatabase = async () => {
     console.info("Fetching footballers...");
     await fetchFootballers();
 
+    // Validate the complete official penalty mapping before publishing any
+    // new game rows. A feed or mapping error deliberately fails this run.
+    const currentBootstrap = JSON.parse(
+      fs.readFileSync(RAW_BOOTSTRAP_STATIC_FILE, "utf-8"),
+    ) as BootstrapStaticData;
+    const footballers = JSON.parse(
+      fs.readFileSync(RAW_FOOTBALLERS_FILE, "utf-8"),
+    ) as Record<string, Footballer>;
+    const fplFixtures = await getFixturesData();
+    const currentSeason = seasonCheck.isNewSeason
+      ? seasonCheck.newSeason
+      : seasonCheck.currentSeason;
+    if (currentSeason === "unknown") {
+      throw new Error("Cannot publish without a valid FPL season identifier.");
+    }
+    console.info("Reconciling official penalty events...");
+    await syncPenaltyFeed({
+      season: currentSeason,
+      bootstrap: currentBootstrap,
+      footballers,
+      fplFixtures,
+      finalSeason: currentBootstrap.events.every(
+        (event) => event.finished && event.data_checked,
+      ),
+    });
+    const [penaltyTotals, deepCoveredSeasons] = await Promise.all([
+      getPlayerSeasonPenaltyTotals(),
+      getDeepCoveredSeasons(),
+    ]);
+    for (const player of currentBootstrap.elements) {
+      for (const historyPast of footballers[String(player.id)]?.history_past ??
+        []) {
+        enrichHistoryPast(
+          historyPast,
+          player.code,
+          penaltyTotals,
+          deepCoveredSeasons,
+        );
+      }
+    }
+
     // 4. Populate database tables (order matters: teams → events → footballers → fixtures → history)
     console.info("Populating teams...");
     await insertTeams();
@@ -94,10 +147,10 @@ export const populateDatabase = async () => {
     await insertFootballersFixtures();
 
     console.info("Populating team history...");
-    await insertTeamHistory();
+    await insertTeamHistory(currentSeason, fplFixtures);
 
     console.info("Populating footballers history...");
-    await insertFootballersHistory();
+    await insertFootballersHistory(currentSeason, fplFixtures);
 
     await markBulkDataRefreshComplete();
 

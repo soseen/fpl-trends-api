@@ -3,6 +3,10 @@ import { getEvents } from "../events/getEvents.js";
 import { getFootballersWithHistoryAndFixtures } from "../footballers/getAllFootballersData.js";
 import { getTeamsData } from "../teams/getTeamsData.js";
 import { prisma } from "./client.js";
+import {
+  assertFootballerAnalyticsShape,
+  assertTeamAnalyticsShape,
+} from "../nonPenalty/apiShape.js";
 
 const SEASON_PATTERN = /^\d{4}-\d{2}$/;
 const CURRENT_SEASON_KEY = "current_season";
@@ -93,7 +97,13 @@ export const getSeasonArchiveDataset = async (
   });
 
   if (!archive) throw new SeasonArchiveNotFoundError(season);
-  return archive[dataset];
+  const value = archive[dataset];
+  if (dataset === "footballers_data") {
+    assertFootballerAnalyticsShape(value, `${season} footballers archive`);
+  } else if (dataset === "teams_data") {
+    assertTeamAnalyticsShape(value, `${season} teams archive`);
+  }
+  return value;
 };
 
 export const getSeasonCatalog = async () => {

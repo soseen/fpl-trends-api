@@ -1,0 +1,35 @@
+{
+  "listedFixture": {
+    "id": 125161,
+    "altIds": { "opta": "g2562265" },
+    "gameweek": { "gameweek": 38 },
+    "teams": [{ "team": { "id": 131 } }, { "team": { "id": 12 } }],
+    "goals": [
+      { "type": "P", "personId": 50727, "teamId": 131 },
+      { "type": "G", "personId": 2100, "teamId": 131 }
+    ]
+  },
+  "detailedFixture": {
+    "id": 125161,
+    "altIds": { "opta": "g2562265" },
+    "gameweek": { "gameweek": 38 },
+    "teams": [{ "team": { "id": 131 } }, { "team": { "id": 12 } }],
+    "events": [
+      { "type": "P", "personId": 50727, "teamId": 131 },
+      { "type": "MP", "personId": 2100, "teamId": 131 },
+      { "type": "G", "personId": 9999, "teamId": 12 }
+    ],
+    "teamLists": [
+      {
+        "teamId": 131,
+        "lineup": [{ "id": 50727, "altIds": { "opta": "p231416" } }],
+        "substitutes": [{ "id": 2100, "altIds": { "opta": "p15157" } }]
+      },
+      {
+        "teamId": 12,
+        "lineup": [{ "id": 3452, "altIds": { "opta": "p50175" } }],
+        "substitutes": []
+      }
+    ]
+  }
+}
