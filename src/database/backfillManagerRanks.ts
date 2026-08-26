@@ -32,6 +32,11 @@ const fetchPendingEntryIds = async (): Promise<number[]> => {
       WHERE mh.entry_id = ms.entry_id
         AND mh.overall_rank IS NULL
     )
+      AND EXISTS (
+        SELECT 1
+        FROM manager_pick_elements mpe
+        WHERE mpe.entry_id = ms.entry_id
+      )
     ORDER BY md5(ms.entry_id::text)
     LIMIT $1
     `,
