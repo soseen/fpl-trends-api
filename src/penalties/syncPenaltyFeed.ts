@@ -42,6 +42,11 @@ const addEvent = (
   playerCode: number,
   event: PremierLeaguePenaltyEvent,
 ): void => {
+  if (event.teamId === null) {
+    throw new Error(
+      `[penaltyFeed] Penalty player ${playerCode} has no team mapping in fixture ${fixture.fixtureCode}.`,
+    );
+  }
   if (
     event.teamId !== fixture.homeTeamId &&
     event.teamId !== fixture.awayTeamId
@@ -71,6 +76,32 @@ const addEvent = (
   if (event.type === "P") row.scored++;
   else row.missed++;
   records.set(key, row);
+};
+
+export const validateListedScoredPenalties = (
+  listed: PremierLeaguePenaltyEvent[],
+  detailed: PremierLeaguePenaltyEvent[],
+  fixtureCode: number,
+): void => {
+  const remaining = detailed.filter((event) => event.type === "P");
+  for (const listedEvent of listed.filter((event) => event.type === "P")) {
+    const matchIndex = remaining.findIndex(
+      (event) =>
+        event.personId === listedEvent.personId &&
+        (listedEvent.teamId === null || event.teamId === listedEvent.teamId),
+    );
+    if (matchIndex < 0) {
+      throw new Error(
+        `[penaltyFeed] Listed/detail scored-penalty mismatch for fixture ${fixtureCode}.`,
+      );
+    }
+    remaining.splice(matchIndex, 1);
+  }
+  if (remaining.length > 0) {
+    throw new Error(
+      `[penaltyFeed] Listed/detail scored-penalty mismatch for fixture ${fixtureCode}.`,
+    );
+  }
 };
 
 const resolvePlayers = async (
@@ -222,19 +253,11 @@ const fetchDeepFixtures = async (
               `[penaltyFeed] Fixture detail mismatch for ${fixture.fixtureCode}.`,
             );
           }
-          const listedPenalties = fixture.goals
-            .filter((event) => event.type === "P")
-            .map((event) => `${event.personId}:${event.teamId}`)
-            .sort();
-          const detailedPenalties = detailed.goals
-            .filter((event) => event.type === "P")
-            .map((event) => `${event.personId}:${event.teamId}`)
-            .sort();
-          if (listedPenalties.join("|") !== detailedPenalties.join("|")) {
-            throw new Error(
-              `[penaltyFeed] Listed/detail scored-penalty mismatch for fixture ${fixture.fixtureCode}.`,
-            );
-          }
+          validateListedScoredPenalties(
+            fixture.goals,
+            detailed.goals,
+            fixture.fixtureCode,
+          );
           return {
             ...detailed,
             gameweek: detailed.gameweek ?? fixture.gameweek,
@@ -245,6 +268,52 @@ const fetchDeepFixtures = async (
     if (index + batchSize < fixtures.length) await delay(250);
   }
   return result;
+};
+
+const resolveCurrentEventTeamId = (
+  event: PremierLeaguePenaltyEvent,
+  fixture: PremierLeagueFixture,
+  playerCode: number,
+  options: Required<
+    Pick<SyncOptions, "bootstrap" | "footballers" | "fplFixtures">
+  >,
+): number => {
+  const player = options.bootstrap.elements.find(
+    (element) => element.code === playerCode,
+  );
+  const fplFixture = options.fplFixtures.find(
+    (candidate) => candidate.code === fixture.fixtureCode,
+  );
+  if (!player || !fplFixture) {
+    throw new Error(
+      `[penaltyFeed] Cannot join penalty player ${playerCode}, fixture ${fixture.fixtureCode} to current FPL data.`,
+    );
+  }
+  const histories = options.footballers[String(player.id)]?.history.filter(
+    (row) => row.fixture === fplFixture.id,
+  );
+  if (histories?.length !== 1 || !histories[0]) {
+    throw new Error(
+      `[penaltyFeed] Penalty player ${playerCode}, fixture ${fixture.fixtureCode} did not join to one FPL history row.`,
+    );
+  }
+  const fplTeamId = histories[0].was_home
+    ? fplFixture.team_h
+    : fplFixture.team_a;
+  const teamId = options.bootstrap.teams.find(
+    (team) => team.id === fplTeamId,
+  )?.pulse_id;
+  if (!teamId) {
+    throw new Error(
+      `[penaltyFeed] Penalty player ${playerCode}, fixture ${fixture.fixtureCode} has no Pulse team mapping.`,
+    );
+  }
+  if (event.teamId !== null && event.teamId !== teamId) {
+    throw new Error(
+      `[penaltyFeed] PL/FPL scored-penalty team conflict for player ${playerCode}, fixture ${fixture.fixtureCode}.`,
+    );
+  }
+  return teamId;
 };
 
 export const syncPenaltyFeed = async (
@@ -264,10 +333,21 @@ export const syncPenaltyFeed = async (
   const fixtures = options.deep
     ? await fetchDeepFixtures(listedFixtures)
     : listedFixtures;
+  const currentSources = options.deep
+    ? null
+    : (() => {
+        const { bootstrap, footballers, fplFixtures } = options;
+        if (!bootstrap || !footballers || !fplFixtures) {
+          throw new Error(
+            "[penaltyFeed] Current-season sync requires bootstrap, player histories, and FPL fixtures.",
+          );
+        }
+        return { bootstrap, footballers, fplFixtures };
+      })();
   const events = fixtures.flatMap((fixture) => fixture.goals);
   const playerCodes = await resolvePlayers(events);
-  const validPlayerCodes = options.bootstrap
-    ? new Set(options.bootstrap.elements.map((player) => player.code))
+  const validPlayerCodes = currentSources
+    ? new Set(currentSources.bootstrap.elements.map((player) => player.code))
     : null;
   const records = new Map<string, PenaltyLedgerRow>();
 
@@ -284,27 +364,31 @@ export const syncPenaltyFeed = async (
           `[penaltyFeed] Opta player ${playerCode} did not join to an FPL player.`,
         );
       }
-      addEvent(records, options.season, fixture, playerCode, event);
+      const reconciledEvent = currentSources
+        ? {
+            ...event,
+            teamId: resolveCurrentEventTeamId(
+              event,
+              fixture,
+              playerCode,
+              currentSources,
+            ),
+          }
+        : event;
+      addEvent(records, options.season, fixture, playerCode, reconciledEvent);
     }
   }
 
-  if (!options.deep) {
-    if (!options.bootstrap || !options.footballers || !options.fplFixtures) {
-      throw new Error(
-        "[penaltyFeed] Current-season sync requires bootstrap, player histories, and FPL fixtures.",
-      );
-    }
+  if (currentSources) {
     addCurrentFplMisses(records, {
       season: options.season,
-      bootstrap: options.bootstrap,
-      footballers: options.footballers,
-      fplFixtures: options.fplFixtures,
+      ...currentSources,
     });
     validateCurrentScoredRows(
       records,
-      options.bootstrap,
-      options.footballers,
-      options.fplFixtures,
+      currentSources.bootstrap,
+      currentSources.footballers,
+      currentSources.fplFixtures,
     );
   }
 

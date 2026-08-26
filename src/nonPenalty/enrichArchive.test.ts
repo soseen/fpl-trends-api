@@ -7,6 +7,7 @@ import type {
   penalty_records,
 } from "@prisma/client";
 import { enrichArchive } from "./enrichArchive.js";
+import { enrichHistoryPast } from "./historyPast.js";
 import {
   assertFootballerAnalyticsShape,
   assertTeamAnalyticsShape,
@@ -16,7 +17,10 @@ import {
   parseOptaCode,
   parsePremierLeagueFixture,
 } from "../penalties/premierLeagueFeed.js";
-import { validateFixtureCoverage } from "../penalties/syncPenaltyFeed.js";
+import {
+  validateFixtureCoverage,
+  validateListedScoredPenalties,
+} from "../penalties/syncPenaltyFeed.js";
 
 const fixture = JSON.parse(
   fs.readFileSync(
@@ -84,7 +88,7 @@ void describe("official feed joins and archive enrichment", () => {
     );
     assert.equal(listed.fixtureCode, 2562265);
     assert.deepEqual(listed.goals, [
-      { type: "P", personId: 50727, teamId: 131 },
+      { type: "P", personId: 50727, teamId: null },
     ]);
 
     const detailed = parsePremierLeagueFixture(
@@ -101,6 +105,20 @@ void describe("official feed joins and archive enrichment", () => {
       { playerCode: 15157, teamId: 131 },
       { playerCode: 50175, teamId: 12 },
     ]);
+    assert.doesNotThrow(() =>
+      validateListedScoredPenalties(
+        listed.goals,
+        detailed.goals,
+        listed.fixtureCode,
+      ),
+    );
+    assert.throws(() =>
+      validateListedScoredPenalties(
+        [{ type: "P", personId: 999, teamId: null }],
+        detailed.goals,
+        listed.fixtureCode,
+      ),
+    );
   });
 
   void it("requires exact completed-fixture coverage", () => {
@@ -125,6 +143,35 @@ void describe("official feed joins and archive enrichment", () => {
       validateFixtureCoverage(
         [],
         [{ id: 5, code: 100, event: 1, finished: true, team_h: 1, team_a: 2 }],
+      ),
+    );
+  });
+
+  void it("distinguishes zero-filled legacy rows from recorded expected data", () => {
+    const legacy = enrichHistoryPast(
+      {
+        season_name: "2021/22",
+        goals_scored: 2,
+        minutes: 900,
+        expected_goals: "0.00",
+        expected_goal_involvements: "0.00",
+      },
+      123,
+      new Map(),
+      new Set(),
+    );
+    assert.equal(legacy.non_penalty_expected_goals, 0);
+    assert.equal(legacy.non_penalty_expected_goal_involvements, 0);
+    assert.throws(() =>
+      enrichHistoryPast(
+        {
+          season_name: "2022/23",
+          expected_goals: "0.10",
+          expected_goal_involvements: "0.20",
+        },
+        123,
+        new Map(),
+        new Set(),
       ),
     );
   });

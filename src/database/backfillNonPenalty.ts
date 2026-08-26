@@ -42,10 +42,11 @@ const historyPastSeasons = (footballers: unknown): Set<string> => {
   const result = new Set<string>();
   for (const footballer of asRows(footballers)) {
     for (const row of asRows(footballer["history_past"])) {
-      if (
-        row["expected_goals"] === undefined &&
-        row["expected_goal_involvements"] === undefined
-      ) {
+      const expectedGoals = Number(row["expected_goals"] ?? 0);
+      const expectedGoalInvolvements = Number(
+        row["expected_goal_involvements"] ?? 0,
+      );
+      if (expectedGoals <= 0 && expectedGoalInvolvements <= 0) {
         continue;
       }
       const season = normalizeSeasonLabel(row["season_name"]);

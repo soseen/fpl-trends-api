@@ -5,7 +5,7 @@
     "gameweek": { "gameweek": 38 },
     "teams": [{ "team": { "id": 131 } }, { "team": { "id": 12 } }],
     "goals": [
-      { "type": "P", "personId": 50727, "teamId": 131 },
+      { "type": "P", "personId": 50727 },
       { "type": "G", "personId": 2100, "teamId": 131 }
     ]
   },

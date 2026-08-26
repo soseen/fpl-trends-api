@@ -33,9 +33,13 @@ export const enrichHistoryPast = (
       `[nonPenalty] Invalid history_past season label ${String(row.season_name)} for player ${playerCode}.`,
     );
   }
+  // FPL backfills these keys with zero for seasons before expected metrics
+  // existed. A non-zero source value proves the season contains real data;
+  // once one player proves it, the deep-coverage ledger covers every player.
   const hasExpectedData =
-    row.expected_goals !== undefined ||
-    row.expected_goal_involvements !== undefined;
+    deepCoveredSeasons.has(season) ||
+    Number(row.expected_goals ?? 0) > 0 ||
+    Number(row.expected_goal_involvements ?? 0) > 0;
   if (hasExpectedData && !deepCoveredSeasons.has(season)) {
     throw new Error(
       `[nonPenalty] Missing full penalty-event coverage for history_past ${season}, player ${playerCode}. Run backfill-non-penalty first.`,

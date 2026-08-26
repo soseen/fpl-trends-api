@@ -20,7 +20,7 @@ export type PremierLeagueFixture = {
 export type PremierLeaguePenaltyEvent = {
   type: "P" | "MP";
   personId: number;
-  teamId: number;
+  teamId: number | null;
 };
 
 export type CompetitionSeason = {
@@ -144,8 +144,10 @@ const teamIds = (fixture: JsonObject): [number, number] => {
   return [teams[0], teams[1]];
 };
 
-const eventTeamId = (event: JsonObject): number => {
+const eventTeamId = (event: JsonObject): number | null => {
   if (Number.isInteger(event["teamId"])) return event["teamId"] as number;
+  if (Number.isInteger(event["team"])) return event["team"] as number;
+  if (event["team"] === undefined || event["team"] === null) return null;
   const team = object(event["team"], "penalty event team");
   return integer(team["id"], "penalty event team id");
 };
@@ -242,7 +244,7 @@ export const fetchFixturePenaltyEvents = async (
   fixtureId: number,
 ): Promise<PremierLeagueFixture> => {
   const payload = await feedGet<unknown>(`/fixtures/${fixtureId}`, {
-    params: {},
+    params: { altIds: true },
   });
   return parsePremierLeagueFixture(payload, "events", new Set(["P", "MP"]));
 };
