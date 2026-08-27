@@ -1,6 +1,10 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { combineCohortRows } from "./comparisonCohorts.js";
+import {
+  combineCohortRows,
+  combineComparisonCohortRows,
+  comparisonCohortGw,
+} from "./comparisonCohorts.js";
 
 const row = (overrides: Record<string, number>) => ({
   stratum: 1 as const,
@@ -54,5 +58,32 @@ void describe("combineCohortRows", () => {
     );
 
     assert.equal(aggregate.avg_bench, null);
+  });
+});
+
+void describe("comparison cohorts", () => {
+  void it("uses end-of-range rank for ranges beginning at GW1", () => {
+    assert.equal(comparisonCohortGw(1, 1), 1);
+    assert.equal(comparisonCohortGw(1, 6), 6);
+  });
+
+  void it("uses pre-range rank for ranges beginning after GW1", () => {
+    assert.equal(comparisonCohortGw(2, 2), 1);
+    assert.equal(comparisonCohortGw(7, 12), 6);
+  });
+
+  void it("returns Top 100k and Top 10k aggregates", () => {
+    const aggregates = combineComparisonCohortRows(
+      [
+        row({ stratum: 1, sampleSize: 100, sumPoints: 10_000 }),
+        row({ stratum: 2, sampleSize: 100, sumPoints: 5_000 }),
+        row({ stratum: 3, sampleSize: 100, sumPoints: 0 }),
+      ],
+      { 1: 10, 2: 90, 3: 900 },
+    );
+
+    assert.equal(aggregates.top10k.avg_total_points, 100);
+    assert.equal(aggregates.top100k.avg_total_points, 55);
+    assert.equal(aggregates.average.avg_total_points, 5.5);
   });
 });

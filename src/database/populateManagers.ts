@@ -1163,11 +1163,11 @@ export const rebuildStratumGwRunningStats = async (): Promise<void> => {
   ]);
 };
 
-// Per-(pre-range cohort, start_gw, end_gw) precomputed avg net points per
+// Per-(comparison cohort, start_gw, end_gw) precomputed avg net points per
 // transfer. For start_gw > 1, stratum is determined by overall rank after
-// start_gw - 1, before any points in the selected range can affect it. GW1
-// uses the end-GW stratum only to reconstruct the population-wide average;
-// elite GW1 comparators stay unavailable at the response layer.
+// start_gw - 1, before any points in the selected range can affect it. Ranges
+// beginning at GW1 use end-GW rank so the UI can describe what managers who
+// finished the selected range in the Top 100k/10k did.
 // Replaces the per-request sampleAvgPtsPerTransfer query that dominated
 // comparison-endpoint latency. See stratum_range_xfer_avg in schema.prisma
 // for the model and read-path semantics.
@@ -1500,7 +1500,7 @@ export const rebuildManagerReadModels = async ({
 
   // Refresh only the latest end_gw column of stratum_range_xfer_avg. This
   // includes every possible start GW for the current endpoint and keeps the
-  // causal cohort rows current as new manager transfer histories arrive.
+  // comparison cohort rows current as new manager transfer histories arrive.
   const xferStarted = Date.now();
   if (transferAverages === "latest" && currentGw >= 1) {
     await rebuildStratumRangeXferAvg({ endGwOnly: currentGw });

@@ -27,14 +27,13 @@ export type CaptainChoice = {
   sample_complete: boolean;
 };
 
-export type CausalComparisonCohorts = {
+export type ComparisonCohorts = {
   average: CohortAggregate;
   top100k: CohortAggregate;
   top10k: CohortAggregate;
   averageCaptain: CaptainChoice;
   top100kCaptain: CaptainChoice;
   top10kCaptain: CaptainChoice;
-  eliteAvailable: boolean;
 };
 
 type CohortRow = {
@@ -231,6 +230,20 @@ export const combineCohortRows = (
   };
 };
 
+export const combineComparisonCohortRows = (
+  rows: ReadonlyArray<NumericCohortRow>,
+  weights: Record<Stratum, number>,
+): Pick<ComparisonCohorts, "average" | "top100k" | "top10k"> => {
+  const byStrata = (strata: readonly Stratum[]): NumericCohortRow[] =>
+    rows.filter((row) => strata.includes(row.stratum));
+
+  return {
+    average: combineCohortRows(byStrata([1, 2, 3]), weights),
+    top100k: combineCohortRows(byStrata([1, 2]), weights),
+    top10k: combineCohortRows(byStrata([1]), weights),
+  };
+};
+
 const captainChoice = (
   rows: ReadonlyArray<CaptainRow>,
   strata: ReadonlySet<Stratum>,
@@ -265,12 +278,19 @@ const captainChoice = (
   return { player_id: playerId, sample_complete: playerId !== null };
 };
 
-const loadCausalComparisonCohorts = async (
+// GW1 has no pre-range rank, so ranges beginning at GW1 use rank at the end
+// of the selected range. This is intentionally descriptive: it answers what
+// the managers who finished that range in the Top 100k/10k did. Later ranges
+// keep using rank immediately before the range so their cohorts remain causal.
+export const comparisonCohortGw = (startGw: number, endGw: number): number =>
+  startGw === 1 ? endGw : startGw - 1;
+
+const loadComparisonCohorts = async (
   startGw: number,
   endGw: number,
-): Promise<CausalComparisonCohorts> => {
+): Promise<ComparisonCohorts> => {
   const expectedGws = endGw - startGw + 1;
-  const cohortGw = startGw === 1 ? endGw : startGw - 1;
+  const cohortGw = comparisonCohortGw(startGw, endGw);
   const [rawRows, captainRows, trueSizes] = await Promise.all([
     prisma.$queryRawUnsafe<CohortRow[]>(
       `
@@ -409,34 +429,28 @@ const loadCausalComparisonCohorts = async (
   const rows = rawRows
     .map(toNumericRow)
     .filter((row): row is NumericCohortRow => row !== null);
-  const byStrata = (strata: readonly Stratum[]): NumericCohortRow[] =>
-    rows.filter((row) => strata.includes(row.stratum));
-  const all = byStrata([1, 2, 3]);
-  const top100 = byStrata([1, 2]);
-  const top10 = byStrata([1]);
-  const eliteAvailable = startGw > 1;
+  const aggregates = combineComparisonCohortRows(rows, trueSizes);
 
   return {
-    average: combineCohortRows(all, trueSizes),
-    top100k: eliteAvailable
-      ? combineCohortRows(top100, trueSizes)
-      : emptyAggregate(),
-    top10k: eliteAvailable
-      ? combineCohortRows(top10, trueSizes)
-      : emptyAggregate(),
+    ...aggregates,
     averageCaptain: captainChoice(
       captainRows,
       new Set([1, 2, 3]),
       trueSizes,
       expectedGws,
     ),
-    top100kCaptain: eliteAvailable
-      ? captainChoice(captainRows, new Set([1, 2]), trueSizes, expectedGws)
-      : { player_id: null, sample_complete: false },
-    top10kCaptain: eliteAvailable
-      ? captainChoice(captainRows, new Set([1]), trueSizes, expectedGws)
-      : { player_id: null, sample_complete: false },
-    eliteAvailable,
+    top100kCaptain: captainChoice(
+      captainRows,
+      new Set([1, 2]),
+      trueSizes,
+      expectedGws,
+    ),
+    top10kCaptain: captainChoice(
+      captainRows,
+      new Set([1]),
+      trueSizes,
+      expectedGws,
+    ),
   };
 };
 
@@ -444,13 +458,13 @@ const CACHE_TTL_MS = 5 * 60 * 1_000;
 const MAX_CACHE_ENTRIES = 64;
 const cohortCache = new Map<
   string,
-  { expiresAt: number; value: Promise<CausalComparisonCohorts> }
+  { expiresAt: number; value: Promise<ComparisonCohorts> }
 >();
 
-export const getCausalComparisonCohorts = (
+export const getComparisonCohorts = (
   startGw: number,
   endGw: number,
-): Promise<CausalComparisonCohorts> => {
+): Promise<ComparisonCohorts> => {
   const key = `${startGw}:${endGw}`;
   const now = Date.now();
   const cached = cohortCache.get(key);
@@ -462,7 +476,7 @@ export const getCausalComparisonCohorts = (
     if (oldestKey !== undefined) cohortCache.delete(oldestKey);
   }
 
-  const value = loadCausalComparisonCohorts(startGw, endGw).catch((error) => {
+  const value = loadComparisonCohorts(startGw, endGw).catch((error) => {
     cohortCache.delete(key);
     throw error;
   });

@@ -4,7 +4,7 @@ import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks, captainPicksFromResolved } from "./resolvePicks.js";
 import { computeUserTransferNet } from "./getManagerTransfers.js";
 import { sampleAvgPtsPerTransfer } from "./transferImpactCalc.js";
-import { getCausalComparisonCohorts } from "./comparisonCohorts.js";
+import { getComparisonCohorts } from "./comparisonCohorts.js";
 
 type ChipPlay = { chip_name: string; num_played: number };
 
@@ -52,17 +52,17 @@ export type ManagerComparisonResponse = {
   hits: ComparisonStat;
   bench_points: ComparisonStat;
   // Sum of (captained_player_points × (multiplier − 1)) across the range.
-  // Elite averages use the manager's rank immediately before the selected
-  // range. Missing picks are excluded from the denominator rather than
-  // silently contributing zero.
+  // Elite averages use end-of-range rank when the range begins at GW1, and
+  // the manager's rank immediately before the selected range otherwise.
+  // Missing picks are excluded from the denominator rather than silently
+  // contributing zero.
   captain_bonus: ComparisonStat;
   // Average net points per transfer made in range. User value:
   // (sum of (in_player_points − out_player_points) over [transfer.gw, end_gw])
   // / number_of_transfers_in_range. Sample averages are per-manager averages
   // averaged across the stratum (managers with zero in-range transfers are
   // excluded from the sample mean — they have no defined per-transfer rate).
-  // Range-conditional and backed by a pre-range-cohort transfer read model.
-  // Elite values are null for GW1 because no pre-season rank cohort exists.
+  // Range-conditional and backed by the comparison-cohort transfer read model.
   avg_pts_per_transfer: ComparisonStat;
   // Mean per-GW points (range total / GWs played). For sample averages this
   // is computed per-manager then averaged.
@@ -721,7 +721,7 @@ export const getManagerComparison = async (
     userPicks,
     userXferNet,
   ] = await Promise.all([
-    getCausalComparisonCohorts(startGw, endGw),
+    getComparisonCohorts(startGw, endGw),
     sampleAvgPtsPerTransfer(startGw, endGw, "active"),
     sampleAvgPtsPerTransfer(startGw, endGw, "stratum12"),
     sampleAvgPtsPerTransfer(startGw, endGw, "stratum1"),
@@ -748,20 +748,16 @@ export const getManagerComparison = async (
     activeXferAgg.with_data,
     "active",
   );
-  const avgPtsPerTransferTop100k = cohorts.eliteAvailable
-    ? gateOnMinimumSample(
-        top100kXferAgg.avg,
-        top100kXferAgg.with_data,
-        "stratum12",
-      )
-    : null;
-  const avgPtsPerTransferTop10k = cohorts.eliteAvailable
-    ? gateOnMinimumSample(
-        top10kXferAgg.avg,
-        top10kXferAgg.with_data,
-        "stratum1",
-      )
-    : null;
+  const avgPtsPerTransferTop100k = gateOnMinimumSample(
+    top100kXferAgg.avg,
+    top100kXferAgg.with_data,
+    "stratum12",
+  );
+  const avgPtsPerTransferTop10k = gateOnMinimumSample(
+    top10kXferAgg.avg,
+    top10kXferAgg.with_data,
+    "stratum1",
+  );
 
   const userAvgPtsPerTransfer =
     userXferNet.total_count > 0

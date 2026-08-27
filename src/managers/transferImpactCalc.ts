@@ -1,4 +1,5 @@
 import { prisma } from "../database/client.js";
+import { comparisonCohortGw } from "./comparisonCohorts.js";
 import { trueStratumSizes, type Stratum } from "./rangeStats.js";
 
 // Shared helpers for computing the "transfer net points" metric over a
@@ -145,7 +146,7 @@ export const sampleAvgPtsPerTransfer = async (
     strata,
   );
 
-  const cohortGw = startGw === 1 ? endGw : startGw - 1;
+  const cohortGw = comparisonCohortGw(startGw, endGw);
   const trueSizes = await trueStratumSizes(cohortGw);
   let weightedAverage = 0;
   let totalWeight = 0;
