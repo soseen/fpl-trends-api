@@ -1424,10 +1424,22 @@ export const rangeScoreBucketsNeedRefresh = async (
     }>
   >`
     WITH cumulative AS (
-      SELECT stratum, COUNT(*)::int AS sample_size
-      FROM manager_cumulative
-      WHERE gw = ${endGw}
-      GROUP BY stratum
+      SELECT
+        COALESCE(
+          CASE
+            WHEN mh.overall_rank > 0 AND mh.overall_rank <= 10000 THEN 1
+            WHEN mh.overall_rank > 10000 AND mh.overall_rank <= 100000 THEN 2
+            WHEN mh.overall_rank > 100000 THEN 3
+            ELSE NULL
+          END,
+          mc.stratum
+        )::int AS stratum,
+        COUNT(*)::int AS sample_size
+      FROM manager_cumulative mc
+      LEFT JOIN manager_history mh
+        ON mh.entry_id = mc.entry_id AND mh.gw = mc.gw
+      WHERE mc.gw = ${endGw}
+      GROUP BY 1
     ),
     buckets AS (
       SELECT stratum, SUM(managers)::int AS sample_size
