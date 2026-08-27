@@ -4,6 +4,7 @@ import {
   estimateRangeRankFromBuckets,
   managerSampleFreshnessForEndGw,
   pickStratum as pickRankStratum,
+  rankedCountForGw,
   stratumCMax as currentStratumCMax,
   type ManagerSampleStatus,
 } from "./rangeStats.js";
@@ -27,6 +28,7 @@ export type RangeRankResponse = {
   // quality at a glance. Null when startGw > 1 (no FPL-stored answer
   // for partial-range queries) or when the user wasn't ranked at endGw.
   range_rank_official: number | null;
+  ranked_count_at_end: number | null;
   range_total: number;
   // Cumulative overall rank at the GW immediately before the range, and at
   // the last GW in the range. Used by the UI to show whether the range
@@ -66,8 +68,11 @@ export const getRangeRank = async (
   const overallRankAfter =
     allEvents.find((ev) => ev.event === endGw)?.overall_rank ?? null;
 
-  const cMax = await currentStratumCMax();
-  const stratum = pickRankStratum(summary.summary_overall_rank, cMax);
+  const [cMax, rankedCountAtEnd] = await Promise.all([
+    currentStratumCMax(),
+    rankedCountForGw(endGw),
+  ]);
+  const stratum = pickRankStratum(overallRankAfter, rankedCountAtEnd ?? cMax);
   const overallRank = summary.summary_overall_rank;
   const totalPoints = summary.summary_overall_points ?? null;
 
@@ -124,6 +129,7 @@ export const getRangeRank = async (
       total_points: totalPoints,
       range_rank: rangeRank,
       range_rank_official: rangeRankOfficial,
+      ranked_count_at_end: rankedCountAtEnd,
       range_total: rangeTotal,
       overall_rank_before: overallRankBefore,
       overall_rank_after: overallRankAfter,
@@ -143,6 +149,7 @@ export const getRangeRank = async (
     total_points: totalPoints,
     range_rank: rangeRank,
     range_rank_official: rangeRankOfficial,
+    ranked_count_at_end: rankedCountAtEnd,
     range_total: rangeTotal,
     overall_rank_before: overallRankBefore,
     overall_rank_after: overallRankAfter,

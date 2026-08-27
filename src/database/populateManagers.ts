@@ -1163,7 +1163,11 @@ export const rebuildStratumGwRunningStats = async (): Promise<void> => {
   ]);
 };
 
-// Per-(stratum, start_gw, end_gw) precomputed avg net points per transfer.
+// Per-(pre-range cohort, start_gw, end_gw) precomputed avg net points per
+// transfer. For start_gw > 1, stratum is determined by overall rank after
+// start_gw - 1, before any points in the selected range can affect it. GW1
+// uses the end-GW stratum only to reconstruct the population-wide average;
+// elite GW1 comparators stay unavailable at the response layer.
 // Replaces the per-request sampleAvgPtsPerTransfer query that dominated
 // comparison-endpoint latency. See stratum_range_xfer_avg in schema.prisma
 // for the model and read-path semantics.
@@ -1234,18 +1238,27 @@ export const rebuildStratumRangeXferAvg = async (options?: {
           GROUP BY h.footballer_id, gw_series.gw
         ),
         per_manager AS (
-          SELECT mt.entry_id, ms.stratum,
+          SELECT
+                 mt.entry_id,
+                 CASE
+                   WHEN cohort_rank.overall_rank BETWEEN 1 AND 10000 THEN 1
+                   WHEN cohort_rank.overall_rank BETWEEN 10001 AND 100000 THEN 2
+                   WHEN cohort_rank.overall_rank > 100000 THEN 3
+                   ELSE NULL
+                 END::int AS stratum,
                  SUM(COALESCE(in_pts.pts, 0) - COALESCE(out_pts.pts, 0))::float AS net,
                  COUNT(*)::int AS xfers
           FROM manager_transfers mt
-          JOIN manager_summary ms ON ms.entry_id = mt.entry_id
+          JOIN manager_history cohort_rank
+            ON cohort_rank.entry_id = mt.entry_id
+           AND cohort_rank.gw = CASE WHEN $1::int = 1 THEN $2::int ELSE $1::int - 1 END
           LEFT JOIN point_windows in_pts
             ON in_pts.footballer_id = mt.in_element AND in_pts.gw = mt.gw
           LEFT JOIN point_windows out_pts
             ON out_pts.footballer_id = mt.out_element AND out_pts.gw = mt.gw
           WHERE mt.gw BETWEEN $1::int AND $2::int
-            AND ms.stratum IN (1, 2, 3)
-          GROUP BY mt.entry_id, ms.stratum
+            AND cohort_rank.overall_rank > 0
+          GROUP BY mt.entry_id, cohort_rank.overall_rank
         ),
         agg AS (
           SELECT stratum,
@@ -1253,15 +1266,24 @@ export const rebuildStratumRangeXferAvg = async (options?: {
                  COUNT(*)::int AS managers_with_xfers
           FROM per_manager
           WHERE xfers > 0
-          GROUP BY stratum
+          GROUP BY 1
         ),
         sizes AS (
-          SELECT stratum,
-                 COUNT(*) FILTER (WHERE has_transfer_history)::int AS with_data,
+          SELECT
+                 CASE
+                   WHEN mh.overall_rank BETWEEN 1 AND 10000 THEN 1
+                   WHEN mh.overall_rank BETWEEN 10001 AND 100000 THEN 2
+                   WHEN mh.overall_rank > 100000 THEN 3
+                   ELSE NULL
+                 END::int AS stratum,
+                 COUNT(*) FILTER (WHERE ms.has_transfer_history)::int AS with_data,
                  COUNT(*)::int AS stratum_size
-          FROM manager_summary
-          WHERE stratum IN (1, 2, 3)
-          GROUP BY stratum
+          FROM manager_summary ms
+          JOIN manager_history mh
+            ON mh.entry_id = ms.entry_id
+           AND mh.gw = CASE WHEN $1::int = 1 THEN $2::int ELSE $1::int - 1 END
+          WHERE mh.overall_rank > 0
+          GROUP BY 1
         ),
         strata AS (SELECT unnest(ARRAY[1, 2, 3]::int[]) AS stratum)
         SELECT
@@ -1464,10 +1486,9 @@ export const rebuildManagerReadModels = async ({
     `[populateManagers] manager_range_score_buckets rebuilt${rangeBuckets === "latest" && currentGw >= 1 ? ` (end_gw=${currentGw})` : ""} in ${Math.round((Date.now() - bucketStarted) / 1000)}s`,
   );
 
-  // Refresh only the latest end_gw column of stratum_range_xfer_avg —
-  // In cron, transferAverages="skip" bypasses this block so rank refreshes
-  // are not held hostage by transfer-average maintenance. Run
-  // backfill-stratum-range-xfer-avg when those rows need a full resync.
+  // Refresh only the latest end_gw column of stratum_range_xfer_avg. This
+  // includes every possible start GW for the current endpoint and keeps the
+  // causal cohort rows current as new manager transfer histories arrive.
   const xferStarted = Date.now();
   if (transferAverages === "latest" && currentGw >= 1) {
     await rebuildStratumRangeXferAvg({ endGwOnly: currentGw });
@@ -1654,13 +1675,15 @@ export const populateManagers = async (
     // run. Range-score buckets are refreshed for the latest end GW only:
     // this is the hot UI path, and it keeps the cron bounded as the sample
     // grows. Historical end GWs stay available and can be fully refreshed
-    // out-of-band via `npm run rebuild-manager-read-models`.
+    // out-of-band via `npm run rebuild-manager-read-models`. Transfer averages
+    // refresh for the latest end GW on every successful ingest, so newly
+    // collected transfer histories are reflected without a manual backfill.
     if (stats.processed > 0 && !governor.shouldAbort) {
       const readModelsStarted = Date.now();
       try {
         await rebuildManagerReadModels({
           rangeBuckets: "latest",
-          transferAverages: "skip",
+          transferAverages: "latest",
         });
         console.info(
           `[populateManagers] manager read models rebuilt in ${Math.round((Date.now() - readModelsStarted) / 1000)}s`,

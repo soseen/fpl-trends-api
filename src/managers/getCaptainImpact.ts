@@ -266,12 +266,9 @@ const fetchCaptainGwDetails = async (
   return map;
 };
 
-// Pick the top-captained player per GW within stratum 1 (top 10k).
-// Excludes captain_multiplier === 0 rows: those are managers whose
-// intended captain didn't play and the vice took over, so the row's
-// player wasn't actually captained for points. Falls back to the
-// 2× rows (captained-and-played) as our best signal of "what top-10k
-// managers actually captained successfully".
+// Pick the intended captain most often selected by managers who were top 10k
+// before that GW. GW1 deliberately has no result: everyone entered the season
+// without a rank, so a "top 10k" benchmark would be selected by the outcome.
 const fetchTop10kCaptainByGw = async (
   startGw: number,
   endGw: number,
@@ -280,13 +277,17 @@ const fetchTop10kCaptainByGw = async (
     Array<{ gw: number; captain_element: number; picks: number }>
   >(
     `
-    SELECT gw, captain_element, SUM(picks)::int AS picks
-    FROM stratum_captain_picks_gw
-    WHERE stratum = 1
-      AND gw BETWEEN $1 AND $2
-      AND captain_multiplier >= 2
-    GROUP BY gw, captain_element
-    ORDER BY gw, picks DESC
+    SELECT mp.gw, mp.captain_element, COUNT(*)::int AS picks
+    FROM manager_picks mp
+    JOIN manager_history mh_previous
+      ON mh_previous.entry_id = mp.entry_id
+     AND mh_previous.gw = mp.gw - 1
+    WHERE mp.gw BETWEEN $1 AND $2
+      AND mp.gw > 1
+      AND mh_previous.overall_rank BETWEEN 1 AND 10000
+      AND mp.captain_element IS NOT NULL
+    GROUP BY mp.gw, mp.captain_element
+    ORDER BY mp.gw, picks DESC
     `,
     startGw,
     endGw,
@@ -326,9 +327,17 @@ export const getCaptainImpact = async (
     top10kCaptainInfo,
     overallCaptainInfo,
   ] = await Promise.all([
-    fetchCaptainRatesInRankBand(rankContext.rank_band, startGw, endGw),
-    fetchCaptainRatesInStratum(rankContext.stratum, startGw, endGw),
-    fetchCaptainRatesInStratum(1, startGw, endGw),
+    fetchCaptainRatesInRankBand(
+      rankContext.comparison_band_by_gw,
+      startGw,
+      endGw,
+    ),
+    fetchCaptainRatesInStratum(null, startGw, endGw),
+    fetchCaptainRatesInRankBand(
+      new Map(range.map((gw) => [gw, gw === 1 ? null : 1] as const)),
+      startGw,
+      endGw,
+    ),
     fetchCaptainRatesInStratum(null, startGw, endGw),
   ]);
   const captainInfo = mergeCaptainRateInfo(
@@ -504,10 +513,7 @@ export const getCaptainImpact = async (
       expectedCaptainBonus === null
         ? null
         : userCaptainBonus - expectedCaptainBonus;
-    const rankImpact =
-      captaincyExcess !== null && rankContext.rank_per_point !== null
-        ? captaincyExcess * rankContext.rank_per_point
-        : null;
+    const rankImpact = captaincyExcess !== null ? 0 : null;
 
     events.push({
       gw,
@@ -523,6 +529,31 @@ export const getCaptainImpact = async (
       captaincy_excess: captaincyExcess,
       rank_impact: rankImpact,
     });
+  }
+
+  const chronologicalRankedEvents = events
+    .filter(
+      (event): event is CaptainEvent & { captaincy_excess: number } =>
+        event.captaincy_excess !== null,
+    )
+    .sort((a, b) => a.gw - b.gw);
+  let cumulativeExcess = 0;
+  let cumulativeRankImpact = 0;
+  if (
+    rankContext.estimator !== null &&
+    rankContext.user_overall_total !== null
+  ) {
+    for (const event of chronologicalRankedEvents) {
+      cumulativeExcess += event.captaincy_excess;
+      const nextImpact = rankContext.estimator.impactForExcess(
+        rankContext.user_overall_total,
+        cumulativeExcess,
+      );
+      event.rank_impact = nextImpact - cumulativeRankImpact;
+      cumulativeRankImpact = nextImpact;
+    }
+  } else {
+    for (const event of chronologicalRankedEvents) event.rank_impact = null;
   }
 
   events.sort((a, b) => b.gw - a.gw);
@@ -549,15 +580,7 @@ export const getCaptainImpact = async (
       captaincy_excess: number;
     } => e.expected_captain_bonus !== null && e.captaincy_excess !== null,
   );
-  const rankedEvents = eventsWithExpected.filter(
-    (
-      e,
-    ): e is CaptainEvent & {
-      expected_captain_bonus: number;
-      captaincy_excess: number;
-      rank_impact: number;
-    } => e.rank_impact !== null,
-  );
+  const rankedEvents = eventsWithExpected.filter((e) => e.rank_impact !== null);
   const totalUserCaptainBonus = events.reduce(
     (s, e) => s + e.user_captain_bonus,
     0,
@@ -570,10 +593,7 @@ export const getCaptainImpact = async (
     eventsWithExpected.length > 0
       ? eventsWithExpected.reduce((s, e) => s + e.captaincy_excess, 0)
       : null;
-  const totalRankImpact =
-    rankedEvents.length > 0
-      ? rankedEvents.reduce((s, e) => s + e.rank_impact, 0)
-      : null;
+  const totalRankImpact = rankedEvents.length > 0 ? cumulativeRankImpact : null;
   notes.partial_rank_impact = rankedEvents.length !== events.length;
 
   return {

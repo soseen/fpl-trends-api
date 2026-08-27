@@ -590,7 +590,10 @@ model stratum_gw_running_stats {
   @@id([stratum, gw])
 }
 
-// Per-(stratum, start_gw, end_gw) precomputed avg net points per transfer.
+// Per-(pre-range rank cohort, start_gw, end_gw) precomputed avg net points per
+// transfer. For start_gw > 1, `stratum` is the manager's rank bucket after
+// start_gw - 1. GW1 rows use end-rank strata only for population-wide
+// weighting; elite GW1 comparison values are deliberately not exposed.
 //
 // Replaces the per-request sampleAvgPtsPerTransfer query (manager_transfers
 // ⨝ history with a generate_series CTE × 3 calls) that dominated comparison

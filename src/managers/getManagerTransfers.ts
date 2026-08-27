@@ -11,6 +11,7 @@ import {
   fetchPlayerGwRankStats,
   ownershipPct,
   playerGwKey,
+  rankImpactForPoints,
   resolveRankImpactContext,
   type PlayerGwRankStat,
 } from "./rankImpact.js";
@@ -383,11 +384,6 @@ const outPointsInWindow = (
   // already a counterfactual estimate.
   return Math.round(total);
 };
-
-const rankImpactFromPoints = (
-  points: number,
-  rankPerPoint: number | null,
-): number | null => (rankPerPoint !== null ? points * rankPerPoint : null);
 
 // Average picked percentage for context/tooltips. It is deliberately
 // separate from transfer rank math: transfer rank uses the same direct
@@ -765,9 +761,11 @@ export const getManagerTransfers = async (
   const emptyRankContext = {
     user_range_points: 0,
     stratum: null,
-    rank_band: null,
+    comparison_band_by_gw: new Map(),
     stratum_avg_range_points: null,
     rank_per_point: null,
+    user_overall_total: null,
+    estimator: null,
   };
 
   const [meta, perRound, rankStats, rankContext] = await Promise.all([
@@ -837,12 +835,12 @@ export const getManagerTransfers = async (
         gross_net_points: 0,
         hits_cost: m?.hits_cost ?? 0,
         combined_net_points: 0,
-        gross_rank_impact: rankContext.rank_per_point !== null ? 0 : null,
-        hits_rank_impact:
-          rankContext.rank_per_point !== null
-            ? -(m?.hits_cost ?? 0) * rankContext.rank_per_point
-            : null,
-        combined_rank_impact: rankContext.rank_per_point !== null ? 0 : null,
+        gross_rank_impact: rankImpactForPoints(rankContext, 0),
+        hits_rank_impact: rankImpactForPoints(
+          rankContext,
+          -(m?.hits_cost ?? 0),
+        ),
+        combined_rank_impact: rankImpactForPoints(rankContext, 0),
         chip: m?.chip ?? null,
         bench_boost_points: m?.chip === "bboost" ? (m.bench_points ?? 0) : null,
       };
@@ -954,18 +952,9 @@ export const getManagerTransfers = async (
     const inBenchRole =
       inWindowGws >= 2 && inStartedGws / inWindowGws < BENCH_ROLE_THRESHOLD;
     const netPoints = inPts - outPts;
-    const inTransferRankImpact = rankImpactFromPoints(
-      inPts,
-      rankContext.rank_per_point,
-    );
-    const outTransferRankImpact = rankImpactFromPoints(
-      -outPts,
-      rankContext.rank_per_point,
-    );
-    const pairRankImpact = rankImpactFromPoints(
-      netPoints,
-      rankContext.rank_per_point,
-    );
+    const inTransferRankImpact = rankImpactForPoints(rankContext, inPts);
+    const outTransferRankImpact = rankImpactForPoints(rankContext, -outPts);
+    const pairRankImpact = rankImpactForPoints(rankContext, netPoints);
     // sold_gw is informative only for non-FH transfers (FH auto-reverts
     // next GW so showing "GW t+1" on every FH tile is noise). Always
     // shown when the IN player was actually sold, even if the sale was
@@ -1000,18 +989,15 @@ export const getManagerTransfers = async (
     ev.pairs.push(pair);
     ev.gross_net_points += pair.net_points;
     ev.combined_net_points = ev.gross_net_points - ev.hits_cost;
-    if (
-      ev.gross_rank_impact !== null &&
-      ev.hits_rank_impact !== null &&
-      pair.net_rank_impact !== null
-    ) {
-      ev.gross_rank_impact += pair.net_rank_impact;
-      ev.combined_rank_impact = ev.gross_rank_impact + ev.hits_rank_impact;
-    } else {
-      ev.gross_rank_impact = null;
-      ev.hits_rank_impact = null;
-      ev.combined_rank_impact = null;
-    }
+    ev.gross_rank_impact = rankImpactForPoints(
+      rankContext,
+      ev.gross_net_points,
+    );
+    ev.hits_rank_impact = rankImpactForPoints(rankContext, -ev.hits_cost);
+    ev.combined_rank_impact = rankImpactForPoints(
+      rankContext,
+      ev.combined_net_points,
+    );
   }
 
   // Surface bench-boost-only GWs (no transfers) so the UI can render a
@@ -1036,6 +1022,27 @@ export const getManagerTransfers = async (
 
   const events = Array.from(eventByGw.values()).sort((a, b) => b.gw - a.gw);
 
+  // Allocate the non-linear range movement chronologically so the event
+  // impacts add back to the headline total. Pair/gross/hit values remain
+  // isolated counterfactuals; combined_rank_impact is the event's marginal
+  // contribution after earlier GWs in the selected range.
+  if (
+    rankContext.estimator !== null &&
+    rankContext.user_overall_total !== null
+  ) {
+    let cumulativePoints = 0;
+    let previousImpact = 0;
+    for (const event of [...events].sort((a, b) => a.gw - b.gw)) {
+      cumulativePoints += event.combined_net_points;
+      const cumulativeImpact = rankContext.estimator.impactForExcess(
+        rankContext.user_overall_total,
+        cumulativePoints,
+      );
+      event.combined_rank_impact = cumulativeImpact - previousImpact;
+      previousImpact = cumulativeImpact;
+    }
+  }
+
   // Headline total INCLUDES Free Hit / Wildcard events. The points
   // they generated (or cost) are real and should be visible in the
   // overall figure — a successful WC that gained 80 pts shouldn't
@@ -1043,10 +1050,7 @@ export const getManagerTransfers = async (
   // counts real transfers (FPL's `event_transfers` is 0 for chip
   // GWs by design, and the "How you compare" table uses that count).
   const totalNet = events.reduce((acc, ev) => acc + ev.combined_net_points, 0);
-  const totalRank =
-    rankContext.rank_per_point !== null
-      ? events.reduce((acc, ev) => acc + (ev.combined_rank_impact ?? 0), 0)
-      : null;
+  const totalRank = rankImpactForPoints(rankContext, totalNet);
   const transferCount = displayTransfers.filter(
     (t) => !fhGws.has(t.gw) && !wcGws.has(t.gw),
   ).length;

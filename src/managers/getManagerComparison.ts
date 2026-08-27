@@ -4,6 +4,7 @@ import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks, captainPicksFromResolved } from "./resolvePicks.js";
 import { computeUserTransferNet } from "./getManagerTransfers.js";
 import { sampleAvgPtsPerTransfer } from "./transferImpactCalc.js";
+import { getCausalComparisonCohorts } from "./comparisonCohorts.js";
 
 type ChipPlay = { chip_name: string; num_played: number };
 
@@ -51,20 +52,17 @@ export type ManagerComparisonResponse = {
   hits: ComparisonStat;
   bench_points: ComparisonStat;
   // Sum of (captained_player_points × (multiplier − 1)) across the range.
-  // Ignores GWs where the captain ended up benched (multiplier 0). Top-10k
-  // and overall averages come from the cumulative_captain_bonus delta over
-  // the matching stratum partition — no per-row LATERAL join at request
-  // time. Coverage depends on how much of the sample has picks ingested
-  // (LEFT JOIN; missing picks contribute 0 — see populateManagers
-  // rebuildCumulativeForEntry).
+  // Elite averages use the manager's rank immediately before the selected
+  // range. Missing picks are excluded from the denominator rather than
+  // silently contributing zero.
   captain_bonus: ComparisonStat;
   // Average net points per transfer made in range. User value:
   // (sum of (in_player_points − out_player_points) over [transfer.gw, end_gw])
   // / number_of_transfers_in_range. Sample averages are per-manager averages
   // averaged across the stratum (managers with zero in-range transfers are
   // excluded from the sample mean — they have no defined per-transfer rate).
-  // Range-conditional, so this metric isn't backed by manager_cumulative;
-  // sampleAvgPtsPerTransfer runs at request time over manager_transfers.
+  // Range-conditional and backed by a pre-range-cohort transfer read model.
+  // Elite values are null for GW1 because no pre-season rank cohort exists.
   avg_pts_per_transfer: ComparisonStat;
   // Mean per-GW points (range total / GWs played). For sample averages this
   // is computed per-manager then averaged.
@@ -159,7 +157,7 @@ const COVERAGE_THRESHOLD = 0.5;
 // `stratumFilter`:
 //   - "active" → all strata (1, 2, 3) summed.
 //   - "stratum1" → stratum 1 only (the top-10k comparator).
-const sampleStratumAggregates = async (
+export const sampleStratumAggregates = async (
   startGw: number,
   endGw: number,
   stratumFilter: "active" | "stratum1" | "stratum12",
@@ -487,16 +485,6 @@ const sampleStratumAggregates = async (
   };
 };
 
-const gateOnCoverage = (
-  value: number | null,
-  withData: number,
-  sampleSize: number,
-): number | null => {
-  if (value === null || sampleSize === 0 || withData === 0) return null;
-  const coverage = withData / sampleSize;
-  return coverage >= COVERAGE_THRESHOLD ? value : null;
-};
-
 const gateOnMinimumSample = (
   value: number | null,
   withData: number,
@@ -521,7 +509,7 @@ const captainSampleMinimum = (
 // that production query scanned hundreds of thousands of rows per request.
 // Most-captained also comes from stratum_captain_picks_gw by summing the
 // range and taking the most frequent captain among played-captain rows.
-const sampleCaptainAggregate = async (
+export const sampleCaptainAggregate = async (
   startGw: number,
   endGw: number,
   stratumFilter: "active" | "stratum1" | "stratum12",
@@ -726,61 +714,30 @@ export const getManagerComparison = async (
   // team-impact, and computeUserTransferNet shares its FPL fetch with the
   // transfers endpoint via the in-flight de-dup in resolveTransfers.
   const [
-    activeAgg,
-    top100kAgg,
-    top10kAgg,
-    activeCaptainAgg,
-    top100kCaptainAgg,
-    top10kCaptainAgg,
+    cohorts,
     activeXferAgg,
     top100kXferAgg,
     top10kXferAgg,
     userPicks,
     userXferNet,
   ] = await Promise.all([
-    sampleStratumAggregates(startGw, endGw, "active"),
-    sampleStratumAggregates(startGw, endGw, "stratum12"),
-    sampleStratumAggregates(startGw, endGw, "stratum1"),
-    sampleCaptainAggregate(startGw, endGw, "active"),
-    sampleCaptainAggregate(startGw, endGw, "stratum12"),
-    sampleCaptainAggregate(startGw, endGw, "stratum1"),
+    getCausalComparisonCohorts(startGw, endGw),
     sampleAvgPtsPerTransfer(startGw, endGw, "active"),
     sampleAvgPtsPerTransfer(startGw, endGw, "stratum12"),
     sampleAvgPtsPerTransfer(startGw, endGw, "stratum1"),
     resolvePicks(entryId, ingestedGws),
     computeUserTransferNet(entryId, startGw, endGw),
   ]);
+  const activeAgg = cohorts.average;
+  const top100kAgg = cohorts.top100k;
+  const top10kAgg = cohorts.top10k;
 
-  const avgHits = gateOnCoverage(
-    activeAgg.avg_hits,
-    activeAgg.with_hits_data,
-    activeAgg.sample_size,
-  );
-  const avgBench = gateOnCoverage(
-    activeAgg.avg_bench,
-    activeAgg.with_bench_data,
-    activeAgg.sample_size,
-  );
-  const avgHitsTop10k = gateOnCoverage(
-    top10kAgg.avg_hits,
-    top10kAgg.with_hits_data,
-    top10kAgg.sample_size,
-  );
-  const avgBenchTop10k = gateOnCoverage(
-    top10kAgg.avg_bench,
-    top10kAgg.with_bench_data,
-    top10kAgg.sample_size,
-  );
-  const avgHitsTop100k = gateOnCoverage(
-    top100kAgg.avg_hits,
-    top100kAgg.with_hits_data,
-    top100kAgg.sample_size,
-  );
-  const avgBenchTop100k = gateOnCoverage(
-    top100kAgg.avg_bench,
-    top100kAgg.with_bench_data,
-    top100kAgg.sample_size,
-  );
+  const avgHits = activeAgg.avg_hits;
+  const avgBench = activeAgg.avg_bench;
+  const avgHitsTop10k = top10kAgg.avg_hits;
+  const avgBenchTop10k = top10kAgg.avg_bench;
+  const avgHitsTop100k = top100kAgg.avg_hits;
+  const avgBenchTop100k = top100kAgg.avg_bench;
 
   // Coverage gates for the new transfers-per-manager metric. The "active"
   // pool drives the partial-data flag because it's the larger sample —
@@ -791,16 +748,20 @@ export const getManagerComparison = async (
     activeXferAgg.with_data,
     "active",
   );
-  const avgPtsPerTransferTop100k = gateOnMinimumSample(
-    top100kXferAgg.avg,
-    top100kXferAgg.with_data,
-    "stratum12",
-  );
-  const avgPtsPerTransferTop10k = gateOnMinimumSample(
-    top10kXferAgg.avg,
-    top10kXferAgg.with_data,
-    "stratum1",
-  );
+  const avgPtsPerTransferTop100k = cohorts.eliteAvailable
+    ? gateOnMinimumSample(
+        top100kXferAgg.avg,
+        top100kXferAgg.with_data,
+        "stratum12",
+      )
+    : null;
+  const avgPtsPerTransferTop10k = cohorts.eliteAvailable
+    ? gateOnMinimumSample(
+        top10kXferAgg.avg,
+        top10kXferAgg.with_data,
+        "stratum1",
+      )
+    : null;
 
   const userAvgPtsPerTransfer =
     userXferNet.total_count > 0
@@ -846,6 +807,11 @@ export const getManagerComparison = async (
   }
 
   const userMostName = await footballerName(userMostCaptainedElement);
+  const [averageMostName, top100kMostName, top10kMostName] = await Promise.all([
+    footballerName(cohorts.averageCaptain.player_id),
+    footballerName(cohorts.top100kCaptain.player_id),
+    footballerName(cohorts.top10kCaptain.player_id),
+  ]);
 
   const hasH1 = startGw <= 19;
   const hasH2 = endGw > 19;
@@ -935,9 +901,9 @@ export const getManagerComparison = async (
     },
     captain_bonus: {
       user: userCaptainBonus,
-      average: activeCaptainAgg.avg_bonus,
-      top100k_average: top100kCaptainAgg.avg_bonus,
-      top10k_average: top10kCaptainAgg.avg_bonus,
+      average: activeAgg.avg_captain_bonus,
+      top100k_average: top100kAgg.avg_captain_bonus,
+      top10k_average: top10kAgg.avg_captain_bonus,
     },
     avg_pts_per_transfer: {
       user: userAvgPtsPerTransfer,
@@ -955,12 +921,12 @@ export const getManagerComparison = async (
     most_captained: {
       user_player_id: userMostCaptainedElement,
       user_player_name: userMostName,
-      average_player_id: activeCaptainAgg.most_captained_id,
-      average_player_name: activeCaptainAgg.most_captained_name,
-      top100k_player_id: top100kCaptainAgg.most_captained_id,
-      top100k_player_name: top100kCaptainAgg.most_captained_name,
-      top10k_player_id: top10kCaptainAgg.most_captained_id,
-      top10k_player_name: top10kCaptainAgg.most_captained_name,
+      average_player_id: cohorts.averageCaptain.player_id,
+      average_player_name: averageMostName,
+      top100k_player_id: cohorts.top100kCaptain.player_id,
+      top100k_player_name: top100kMostName,
+      top10k_player_id: cohorts.top10kCaptain.player_id,
+      top10k_player_name: top10kMostName,
     },
     notes: {
       hits_average_partial:
@@ -976,8 +942,8 @@ export const getManagerComparison = async (
       // themselves that some of their own picks weren't fetched).
       captain_average_partial:
         userPicks.incomplete ||
-        (activeCaptainAgg.gws_with_data > 0 &&
-          activeCaptainAgg.avg_bonus === null),
+        activeAgg.avg_captain_bonus === null ||
+        !cohorts.averageCaptain.sample_complete,
       // Transfers-per-manager backfill is still trickling in via
       // backfillManagerTransfers / per-visit ingestTransfersForEntry; gate
       // partial when the active stratum's coverage is below the threshold

@@ -3,16 +3,14 @@ import type { PlayerHistory } from "../types.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { fetchEntryHistory, fetchEntrySummary } from "./fetchManager.js";
 import {
+  overallRankMovementEstimator,
   pickStratum,
   rangeDensityFromCumulative,
   stratumCMax,
   type Stratum,
 } from "./rangeStats.js";
-import {
-  pickRankBand,
-  RANK_BAND_SQL_CASE,
-  type RankBand,
-} from "./rankBands.js";
+import { pickRankBand, rankBandSqlCase, type RankBand } from "./rankBands.js";
+import type { RankMovementEstimator } from "./rankMovement.js";
 
 export const RANK_DENSITY_HALF_WINDOW = 25;
 export const SMALL_CAPTAIN_SAMPLE_THRESHOLD = 50;
@@ -20,9 +18,11 @@ export const SMALL_CAPTAIN_SAMPLE_THRESHOLD = 50;
 export type RankImpactContext = {
   user_range_points: number;
   stratum: Stratum | null;
-  rank_band: RankBand | null;
+  comparison_band_by_gw: ReadonlyMap<number, RankBand | 0 | null>;
   stratum_avg_range_points: number | null;
   rank_per_point: number | null;
+  user_overall_total: number | null;
+  estimator: RankMovementEstimator | null;
 };
 
 export type PlayerGwRankStat = {
@@ -79,21 +79,54 @@ export const resolveRankImpactContext = async (
   const userOverallTotal =
     rangeEndEvent?.total_points ?? summary.summary_overall_points;
   const stratum = pickStratum(rangeEndOverallRank, cMax);
-  const density = await rangeDensityFromCumulative(
-    stratum,
-    startGw,
-    endGw,
-    userOverallTotal,
-    RANK_DENSITY_HALF_WINDOW,
+  const [density, estimator] = await Promise.all([
+    rangeDensityFromCumulative(
+      stratum,
+      startGw,
+      endGw,
+      userOverallTotal,
+      RANK_DENSITY_HALF_WINDOW,
+    ),
+    overallRankMovementEstimator(endGw),
+  ]);
+  const rankPerPoint =
+    estimator !== null && userOverallTotal !== null
+      ? estimator.impactForExcess(userOverallTotal, 1)
+      : null;
+  const historicalRankByGw = new Map(
+    (resolvedHistory.current ?? []).map((event) => [
+      event.event,
+      event.overall_rank,
+    ]),
   );
+  const comparisonBandByGw = new Map<number, RankBand | 0 | null>();
+  for (let gw = startGw; gw <= endGw; gw += 1) {
+    comparisonBandByGw.set(
+      gw,
+      gw === 1 ? 0 : pickRankBand(historicalRankByGw.get(gw - 1)),
+    );
+  }
 
   return {
     user_range_points: userRangePoints,
     stratum,
-    rank_band: pickRankBand(rangeEndOverallRank),
+    comparison_band_by_gw: comparisonBandByGw,
     stratum_avg_range_points: density.stratumAverage,
-    rank_per_point: density.rankPerPoint,
+    rank_per_point:
+      rankPerPoint !== null && rankPerPoint > 0 ? rankPerPoint : null,
+    user_overall_total: userOverallTotal,
+    estimator,
   };
+};
+
+export const rankImpactForPoints = (
+  context: RankImpactContext,
+  points: number,
+): number | null => {
+  if (context.estimator === null || context.user_overall_total === null) {
+    return null;
+  }
+  return context.estimator.impactForExcess(context.user_overall_total, points);
 };
 
 export const fetchPlayerGwRankStats = async (
@@ -239,35 +272,51 @@ export const fetchCaptainRatesInStratum = async (
 };
 
 export const fetchCaptainRatesInRankBand = async (
-  rankBand: RankBand | null,
+  comparisonBandByGw: ReadonlyMap<number, RankBand | 0 | null>,
   startGw: number,
   endGw: number,
 ): Promise<CaptainRateInfo> => {
   const rates = new Map<string, CaptainRate>();
   const perGwSampleSize = new Map<number, number>();
-  if (rankBand === null) return { rates, perGwSampleSize };
+  const bands = Array.from(
+    new Set(
+      Array.from(comparisonBandByGw.values()).filter(
+        (band): band is RankBand | 0 => band !== null,
+      ),
+    ),
+  );
+  if (bands.length === 0) return { rates, perGwSampleSize };
+  const causalBand = `CASE WHEN mp.gw = 1 THEN 0 ELSE ${rankBandSqlCase(
+    "mh_previous.overall_rank",
+  )} END`;
 
   const sampleRows = await prisma.$queryRawUnsafe<
-    Array<{ gw: number; sample_size: number }>
+    Array<{ rank_band: number; gw: number; sample_size: number }>
   >(
     `
-    SELECT mp.gw, COUNT(*)::int AS sample_size
+    SELECT (${causalBand})::int AS rank_band, mp.gw, COUNT(*)::int AS sample_size
     FROM manager_picks mp
-    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+    LEFT JOIN manager_history mh_previous
+      ON mh_previous.entry_id = mp.entry_id
+     AND mh_previous.gw = mp.gw - 1
     WHERE mp.gw BETWEEN $1 AND $2
       AND mp.captain_element IS NOT NULL
       AND mp.captain_multiplier IS NOT NULL
-      AND (${RANK_BAND_SQL_CASE}) = $3
-    GROUP BY mp.gw
+      AND (${causalBand}) = ANY($3::int[])
+    GROUP BY rank_band, mp.gw
     `,
     startGw,
     endGw,
-    rankBand,
+    bands,
   );
-  for (const r of sampleRows) perGwSampleSize.set(r.gw, r.sample_size);
+  for (const r of sampleRows) {
+    if (comparisonBandByGw.get(r.gw) !== r.rank_band) continue;
+    perGwSampleSize.set(r.gw, r.sample_size);
+  }
 
   const captainRows = await prisma.$queryRawUnsafe<
     Array<{
+      rank_band: number;
       gw: number;
       captain_element: number;
       captain_multiplier: number;
@@ -276,24 +325,28 @@ export const fetchCaptainRatesInRankBand = async (
   >(
     `
     SELECT
+      (${causalBand})::int AS rank_band,
       mp.gw,
       mp.captain_element,
       mp.captain_multiplier,
       COUNT(*)::int AS picks
     FROM manager_picks mp
-    JOIN manager_summary ms ON ms.entry_id = mp.entry_id
+    LEFT JOIN manager_history mh_previous
+      ON mh_previous.entry_id = mp.entry_id
+     AND mh_previous.gw = mp.gw - 1
     WHERE mp.gw BETWEEN $1 AND $2
       AND mp.captain_element IS NOT NULL
       AND mp.captain_multiplier IS NOT NULL
-      AND (${RANK_BAND_SQL_CASE}) = $3
-    GROUP BY mp.gw, mp.captain_element, mp.captain_multiplier
+      AND (${causalBand}) = ANY($3::int[])
+    GROUP BY rank_band, mp.gw, mp.captain_element, mp.captain_multiplier
     `,
     startGw,
     endGw,
-    rankBand,
+    bands,
   );
 
   for (const r of captainRows) {
+    if (comparisonBandByGw.get(r.gw) !== r.rank_band) continue;
     const sample = perGwSampleSize.get(r.gw) ?? 0;
     if (sample === 0) continue;
 

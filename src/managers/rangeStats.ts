@@ -91,7 +91,7 @@ export const pickStratum = (
   overallRank: number | null,
   cMax: number,
 ): Stratum | null => {
-  if (overallRank === null) return null;
+  if (overallRank === null || overallRank <= 0) return null;
   if (overallRank <= STRATUM_A_MAX) return 1;
   if (overallRank <= STRATUM_B_MAX) return 2;
   if (overallRank <= cMax) return 3;
@@ -107,17 +107,17 @@ export const trueStratumSizes = async (
   ]);
   const effectiveCMax = rankedAtEnd ?? cMax;
   return {
-    1: STRATUM_A_MAX,
-    2: STRATUM_B_MAX - STRATUM_A_MAX,
-    3: Math.max(effectiveCMax - STRATUM_B_MAX, 1),
+    1: Math.min(effectiveCMax, STRATUM_A_MAX),
+    2: Math.max(Math.min(effectiveCMax, STRATUM_B_MAX) - STRATUM_A_MAX, 0),
+    3: Math.max(effectiveCMax - STRATUM_B_MAX, 0),
   };
 };
 
 type BucketAggregateRow = {
   stratum: number;
   sample_size: bigint | number | null;
-  higher: bigint | number | null;
-  total_points: bigint | number | null;
+  strictly_higher: bigint | number | null;
+  tied: bigint | number | null;
 };
 
 const toNumber = (value: bigint | number | null | undefined): number =>
@@ -126,6 +126,35 @@ const toNumber = (value: bigint | number | null | undefined): number =>
 export type RangeEstimate = {
   rangeRank: number | null;
   sampleSizeByStratum: Record<Stratum, number>;
+};
+
+export const estimateWeightedMidrank = (
+  rows: ReadonlyArray<BucketAggregateRow>,
+  trueSize: Record<Stratum, number>,
+  rankedAtEnd: number | null,
+): RangeEstimate => {
+  const sampleSizeByStratum: Record<Stratum, number> = { 1: 0, 2: 0, 3: 0 };
+  if (rows.length === 0) return { rangeRank: null, sampleSizeByStratum };
+
+  let managersAhead = 0;
+  for (const row of rows) {
+    if (!ALL_STRATA.includes(row.stratum as Stratum)) continue;
+    const stratum = row.stratum as Stratum;
+    const sampleSize = toNumber(row.sample_size);
+    sampleSizeByStratum[stratum] = sampleSize;
+    if (sampleSize === 0) continue;
+
+    const strictlyHigher = toNumber(row.strictly_higher);
+    const tied = toNumber(row.tied);
+    const sampleMidrankAhead = strictlyHigher + tied / 2;
+    managersAhead += (sampleMidrankAhead * trueSize[stratum]) / sampleSize;
+  }
+
+  const cap = rankedAtEnd ?? Number.MAX_SAFE_INTEGER;
+  return {
+    rangeRank: Math.max(1, Math.min(Math.round(managersAhead + 1), cap)),
+    sampleSizeByStratum,
+  };
 };
 
 export const estimateRangeRankFromBuckets = async (
@@ -139,8 +168,8 @@ export const estimateRangeRankFromBuckets = async (
       SELECT
         stratum,
         SUM(managers)::bigint AS sample_size,
-        SUM(managers) FILTER (WHERE range_total >= $3)::bigint AS higher,
-        SUM((range_total::bigint * managers::bigint))::bigint AS total_points
+        SUM(managers) FILTER (WHERE range_total > $3)::bigint AS strictly_higher,
+        SUM(managers) FILTER (WHERE range_total = $3)::bigint AS tied
       FROM manager_range_score_buckets
       WHERE start_gw = $1 AND end_gw = $2
       GROUP BY stratum
@@ -153,27 +182,7 @@ export const estimateRangeRankFromBuckets = async (
     rankedCountForGw(endGw),
   ]);
 
-  const sampleSizeByStratum: Record<Stratum, number> = { 1: 0, 2: 0, 3: 0 };
-  if (rows.length === 0) {
-    return { rangeRank: null, sampleSizeByStratum };
-  }
-
-  let totalHigher = 0;
-  for (const row of rows) {
-    if (!ALL_STRATA.includes(row.stratum as Stratum)) continue;
-    const stratum = row.stratum as Stratum;
-    const sampleSize = toNumber(row.sample_size);
-    const higher = toNumber(row.higher);
-    sampleSizeByStratum[stratum] = sampleSize;
-    if (sampleSize === 0) continue;
-    totalHigher += Math.round((higher * trueSize[stratum]) / sampleSize);
-  }
-
-  const cap = rankedAtEnd ?? Number.MAX_SAFE_INTEGER;
-  return {
-    rangeRank: Math.max(1, Math.min(totalHigher + 1, cap)),
-    sampleSizeByStratum,
-  };
+  return estimateWeightedMidrank(rows, trueSize, rankedAtEnd);
 };
 
 export type RangeDensity = {

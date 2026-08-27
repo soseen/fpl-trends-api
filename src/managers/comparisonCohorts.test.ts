@@ -1,0 +1,58 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+import { combineCohortRows } from "./comparisonCohorts.js";
+
+const row = (overrides: Record<string, number>) => ({
+  stratum: 1 as const,
+  sampleSize: 100,
+  sumPoints: 5_000,
+  sumGws: 100,
+  completeTransfers: 100,
+  sumTransfers: 100,
+  completeHits: 100,
+  sumHitsCost: 400,
+  completeBench: 100,
+  sumBench: 200,
+  completeCaptain: 100,
+  sumCaptain: 300,
+  completeChips: 100,
+  wildcardsH1: 10,
+  wildcardsH2: 0,
+  freehitsH1: 5,
+  freehitsH2: 0,
+  bboostsH1: 2,
+  bboostsH2: 0,
+  ...overrides,
+});
+
+void describe("combineCohortRows", () => {
+  void it("uses population weights instead of raw sample counts", () => {
+    const aggregate = combineCohortRows(
+      [
+        row({ stratum: 1, sampleSize: 100, sumPoints: 10_000 }),
+        row({ stratum: 3, sampleSize: 10, sumPoints: 0 }),
+      ],
+      { 1: 10, 2: 0, 3: 90 },
+    );
+
+    assert.equal(aggregate.avg_total_points, 10);
+  });
+
+  void it("divides covered metrics only by managers with complete data", () => {
+    const aggregate = combineCohortRows(
+      [row({ completeHits: 60, sumHitsCost: 480 })],
+      { 1: 100, 2: 0, 3: 0 },
+    );
+
+    assert.equal(aggregate.avg_hits, 2);
+  });
+
+  void it("hides a metric when complete coverage is below half", () => {
+    const aggregate = combineCohortRows(
+      [row({ completeBench: 49, sumBench: 98 })],
+      { 1: 100, 2: 0, 3: 0 },
+    );
+
+    assert.equal(aggregate.avg_bench, null);
+  });
+});

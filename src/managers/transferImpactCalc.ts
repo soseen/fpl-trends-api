@@ -1,4 +1,5 @@
 import { prisma } from "../database/client.js";
+import { trueStratumSizes, type Stratum } from "./rangeStats.js";
 
 // Shared helpers for computing the "transfer net points" metric over a
 // gameweek range. Used by:
@@ -122,6 +123,7 @@ export const sampleAvgPtsPerTransfer = async (
 
   const rows = await prisma.$queryRawUnsafe<
     Array<{
+      stratum: number;
       sum_per_manager_avg: number | null;
       managers_with_xfers: number | null;
       with_data: number | null;
@@ -130,10 +132,11 @@ export const sampleAvgPtsPerTransfer = async (
   >(
     `
     SELECT
-      SUM(sum_per_manager_avg)::float AS sum_per_manager_avg,
-      SUM(managers_with_xfers)::int   AS managers_with_xfers,
-      SUM(with_data)::int             AS with_data,
-      SUM(stratum_size)::int          AS stratum_size
+      stratum,
+      sum_per_manager_avg,
+      managers_with_xfers,
+      with_data,
+      stratum_size
     FROM stratum_range_xfer_avg
     WHERE start_gw = $1 AND end_gw = $2 AND stratum = ANY($3::int[])
     `,
@@ -142,16 +145,36 @@ export const sampleAvgPtsPerTransfer = async (
     strata,
   );
 
-  const row = rows[0];
-  const managers = row?.managers_with_xfers ?? 0;
-  const sum = row?.sum_per_manager_avg ?? 0;
+  const cohortGw = startGw === 1 ? endGw : startGw - 1;
+  const trueSizes = await trueStratumSizes(cohortGw);
+  let weightedAverage = 0;
+  let totalWeight = 0;
+  let managers = 0;
+  let withData = 0;
+  let stratumSize = 0;
+  for (const row of rows) {
+    const managersInRow = row.managers_with_xfers ?? 0;
+    managers += managersInRow;
+    withData += row.with_data ?? 0;
+    stratumSize += row.stratum_size ?? 0;
+    if (managersInRow <= 0 || row.sum_per_manager_avg === null) continue;
+    const stratum = row.stratum as Stratum;
+    const sampledStratumSize = row.stratum_size ?? 0;
+    const weight =
+      sampledStratumSize > 0
+        ? (trueSizes[stratum] ?? 0) * (managersInRow / sampledStratumSize)
+        : 0;
+    if (weight <= 0) continue;
+    weightedAverage += (row.sum_per_manager_avg / managersInRow) * weight;
+    totalWeight += weight;
+  }
   return {
     // Null when no managers in the requested strata had transfers in range
     // (or when the row is missing — e.g. mid-rebuild, or end_gw beyond what
     // the cron has refreshed). UI renders as "—" rather than zero.
-    avg: managers > 0 ? sum / managers : null,
-    with_data: row?.with_data ?? 0,
+    avg: managers > 0 && totalWeight > 0 ? weightedAverage / totalWeight : null,
+    with_data: withData,
     with_transfers: managers,
-    stratum_size: row?.stratum_size ?? 0,
+    stratum_size: stratumSize,
   };
 };
