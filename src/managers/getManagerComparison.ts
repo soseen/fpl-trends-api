@@ -49,6 +49,7 @@ export type ManagerComparisonResponse = {
   wildcards: ChipUsageStat;
   free_hits: ChipUsageStat;
   bench_boosts: ChipUsageStat;
+  triple_captains: ChipUsageStat;
   hits: ComparisonStat;
   bench_points: ComparisonStat;
   // Sum of (captained_player_points × (multiplier − 1)) across the range.
@@ -81,6 +82,7 @@ export type ManagerComparisonResponse = {
 const CHIP_NAME_WILDCARD = "wildcard";
 const CHIP_NAME_FREEHIT = "freehit";
 const CHIP_NAME_BBOOST = "bboost";
+const CHIP_NAME_TRIPLE_CAPTAIN = "3xc";
 
 const sumChipPlays = (
   chipPlays: ChipPlay[] | null | undefined,
@@ -663,6 +665,9 @@ export const getManagerComparison = async (
   const userBenchBoost = chipsPlayedInRange.filter(
     (c) => c.name === CHIP_NAME_BBOOST,
   ).length;
+  const userTripleCaptain = chipsPlayedInRange.filter(
+    (c) => c.name === CHIP_NAME_TRIPLE_CAPTAIN,
+  ).length;
 
   // ---- Per-event aggregates from our DB (whole-population averages from
   // FPL's own per-GW counts; orthogonal to the sampled stratum stats).
@@ -686,6 +691,8 @@ export const getManagerComparison = async (
   let avgFreeHitH2Rate = 0;
   let avgBenchBoostH1Rate = 0;
   let avgBenchBoostH2Rate = 0;
+  let avgTripleCaptainH1Rate = 0;
+  let avgTripleCaptainH2Rate = 0;
 
   for (const ev of events) {
     avgTotalPoints += ev.average_entry_score;
@@ -696,14 +703,18 @@ export const getManagerComparison = async (
       const wcRate = sumChipPlays(cp, CHIP_NAME_WILDCARD) / ev.ranked_count;
       const fhRate = sumChipPlays(cp, CHIP_NAME_FREEHIT) / ev.ranked_count;
       const bbRate = sumChipPlays(cp, CHIP_NAME_BBOOST) / ev.ranked_count;
+      const tcRate =
+        sumChipPlays(cp, CHIP_NAME_TRIPLE_CAPTAIN) / ev.ranked_count;
       if (isH1) {
         avgWildcardH1Rate += wcRate;
         avgFreeHitH1Rate += fhRate;
         avgBenchBoostH1Rate += bbRate;
+        avgTripleCaptainH1Rate += tcRate;
       } else {
         avgWildcardH2Rate += wcRate;
         avgFreeHitH2Rate += fhRate;
         avgBenchBoostH2Rate += bbRate;
+        avgTripleCaptainH2Rate += tcRate;
       }
     }
   }
@@ -882,6 +893,15 @@ export const getManagerComparison = async (
       top100kAgg.bench_boosts_h2_rate,
       top10kAgg.bench_boosts_h1_rate,
       top10kAgg.bench_boosts_h2_rate,
+    ),
+    triple_captains: chipStat(
+      userTripleCaptain,
+      avgTripleCaptainH1Rate,
+      avgTripleCaptainH2Rate,
+      top100kAgg.triple_captains_h1_rate,
+      top100kAgg.triple_captains_h2_rate,
+      top10kAgg.triple_captains_h1_rate,
+      top10kAgg.triple_captains_h2_rate,
     ),
     hits: {
       user: userHits,

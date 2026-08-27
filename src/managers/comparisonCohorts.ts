@@ -14,6 +14,8 @@ export type CohortAggregate = {
   free_hits_h2_rate: number | null;
   bench_boosts_h1_rate: number | null;
   bench_boosts_h2_rate: number | null;
+  triple_captains_h1_rate: number | null;
+  triple_captains_h2_rate: number | null;
   sample_size: number;
   with_hits_data: number;
   with_bench_data: number;
@@ -56,6 +58,8 @@ type CohortRow = {
   freehits_h2: bigint | number | null;
   bboosts_h1: bigint | number | null;
   bboosts_h2: bigint | number | null;
+  triplecaptains_h1: bigint | number | null;
+  triplecaptains_h2: bigint | number | null;
 };
 
 type CaptainRow = {
@@ -86,6 +90,8 @@ type NumericCohortRow = {
   freehitsH2: number;
   bboostsH1: number;
   bboostsH2: number;
+  tripleCaptainsH1: number;
+  tripleCaptainsH2: number;
 };
 
 const COVERAGE_THRESHOLD = 0.5;
@@ -107,6 +113,8 @@ const emptyAggregate = (): CohortAggregate => ({
   free_hits_h2_rate: null,
   bench_boosts_h1_rate: null,
   bench_boosts_h2_rate: null,
+  triple_captains_h1_rate: null,
+  triple_captains_h2_rate: null,
   sample_size: 0,
   with_hits_data: 0,
   with_bench_data: 0,
@@ -137,6 +145,8 @@ const toNumericRow = (row: CohortRow): NumericCohortRow | null => {
     freehitsH2: numberValue(row.freehits_h2),
     bboostsH1: numberValue(row.bboosts_h1),
     bboostsH2: numberValue(row.bboosts_h2),
+    tripleCaptainsH1: numberValue(row.triplecaptains_h1),
+    tripleCaptainsH2: numberValue(row.triplecaptains_h2),
   };
 };
 
@@ -221,6 +231,8 @@ export const combineCohortRows = (
     free_hits_h2_rate: chipRate((row) => row.freehitsH2),
     bench_boosts_h1_rate: chipRate((row) => row.bboostsH1),
     bench_boosts_h2_rate: chipRate((row) => row.bboostsH2),
+    triple_captains_h1_rate: chipRate((row) => row.tripleCaptainsH1),
+    triple_captains_h2_rate: chipRate((row) => row.tripleCaptainsH2),
     sample_size: sampleSize,
     with_hits_data: sumComplete((row) => row.completeHits),
     with_bench_data: sumComplete((row) => row.completeBench),
@@ -343,7 +355,13 @@ const loadComparisonCohorts = async (
           )::int AS bboost_h1,
           COUNT(*) FILTER (
             WHERE mh.active_chip = 'bboost' AND mh.gw > 19
-          )::int AS bboost_h2
+          )::int AS bboost_h2,
+          COUNT(*) FILTER (
+            WHERE mh.active_chip = '3xc' AND mh.gw <= 19
+          )::int AS triplecaptain_h1,
+          COUNT(*) FILTER (
+            WHERE mh.active_chip = '3xc' AND mh.gw > 19
+          )::int AS triplecaptain_h2
         FROM manager_history mh
         JOIN cohort c ON c.entry_id = mh.entry_id
         WHERE mh.gw BETWEEN $1 AND $2
@@ -372,7 +390,11 @@ const loadComparisonCohorts = async (
         SUM(r.freehit_h1) FILTER (WHERE c.has_chip_history)::bigint AS freehits_h1,
         SUM(r.freehit_h2) FILTER (WHERE c.has_chip_history)::bigint AS freehits_h2,
         SUM(r.bboost_h1) FILTER (WHERE c.has_chip_history)::bigint AS bboosts_h1,
-        SUM(r.bboost_h2) FILTER (WHERE c.has_chip_history)::bigint AS bboosts_h2
+        SUM(r.bboost_h2) FILTER (WHERE c.has_chip_history)::bigint AS bboosts_h2,
+        SUM(r.triplecaptain_h1) FILTER (WHERE c.has_chip_history)::bigint
+          AS triplecaptains_h1,
+        SUM(r.triplecaptain_h2) FILTER (WHERE c.has_chip_history)::bigint
+          AS triplecaptains_h2
       FROM cohort c
       JOIN range_history r ON r.entry_id = c.entry_id
       WHERE c.stratum IS NOT NULL

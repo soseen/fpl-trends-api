@@ -26,6 +26,8 @@ const row = (overrides: Record<string, number>) => ({
   freehitsH2: 0,
   bboostsH1: 2,
   bboostsH2: 0,
+  tripleCaptainsH1: 3,
+  tripleCaptainsH2: 0,
   ...overrides,
 });
 
@@ -58,6 +60,16 @@ void describe("combineCohortRows", () => {
     );
 
     assert.equal(aggregate.avg_bench, null);
+  });
+
+  void it("includes Triple Captain in chip usage rates", () => {
+    const aggregate = combineCohortRows([row({ tripleCaptainsH1: 12 })], {
+      1: 100,
+      2: 0,
+      3: 0,
+    });
+
+    assert.equal(aggregate.triple_captains_h1_rate, 0.12);
   });
 });
 
