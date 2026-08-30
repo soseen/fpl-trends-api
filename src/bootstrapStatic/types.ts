@@ -43,7 +43,7 @@ export type Event = {
   highest_scoring_entry: number | null;
   deadline_time_epoch: number;
   deadline_time_game_offset: number;
-  highest_score: number;
+  highest_score: number | null;
   is_previous: boolean;
   is_current: boolean;
   is_next: boolean;
@@ -55,10 +55,10 @@ export type Event = {
   ranked_count: number;
   overrides: Override;
   chip_plays: ChipPlay[];
-  most_selected: number;
-  most_transferred_in: number;
-  top_element: number;
-  top_element_info: TopElementInfo;
+  most_selected: number | null;
+  most_transferred_in: number | null;
+  top_element: number | null;
+  top_element_info: TopElementInfo | null;
   transfers_made: number;
   most_captained: number | null;
   most_vice_captained: number | null;

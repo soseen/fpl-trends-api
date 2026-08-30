@@ -20,6 +20,7 @@ export type FplFixture = {
   code: number;
   event: number | null;
   finished: boolean;
+  finished_provisional?: boolean;
   team_h: number;
   team_a: number;
 };

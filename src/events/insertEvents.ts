@@ -73,7 +73,6 @@ export const insertEvents = async () => {
     console.info("Events populated successfully.");
   } catch (error) {
     console.error("Error inserting events:", error);
-  } finally {
-    await prisma.$disconnect();
+    throw error;
   }
 };

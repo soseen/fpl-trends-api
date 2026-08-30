@@ -153,14 +153,12 @@ export const insertFootballers = async () => {
         },
       });
     }
+    console.info("Footballers populated successfully.");
   } catch (error) {
     console.error(
       "Couldn't populate the footballers table. Error:",
       (error as Error)?.message,
     );
     throw error;
-  } finally {
-    console.info("Footballers populated successfully.");
-    await prisma.$disconnect();
   }
 };

@@ -140,6 +140,33 @@ void describe("official feed joins and archive enrichment", () => {
       ),
       1,
     );
+    assert.equal(
+      validateFixtureCoverage(
+        [
+          {
+            id: 1,
+            fixtureCode: 200,
+            gameweek: 2,
+            homeTeamId: 10,
+            awayTeamId: 20,
+            goals: [],
+            playerTeams: [],
+          },
+        ],
+        [
+          {
+            id: 6,
+            code: 200,
+            event: 2,
+            finished: false,
+            finished_provisional: true,
+            team_h: 1,
+            team_a: 2,
+          },
+        ],
+      ),
+      1,
+    );
     assert.throws(() =>
       validateFixtureCoverage(
         [],

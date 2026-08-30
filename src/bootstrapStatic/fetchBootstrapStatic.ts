@@ -14,5 +14,6 @@ export const fetchBootstrapStatic = async () => {
     console.error(
       `There was an error trying to fetch bootstrap static data...: ${(error as Error).message}`,
     );
+    throw error;
   }
 };

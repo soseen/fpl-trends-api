@@ -35,6 +35,9 @@ type SyncOptions = {
 const recordKey = (fixtureCode: number, playerCode: number): string =>
   `${fixtureCode}:${playerCode}`;
 
+const isPublishableFplFixture = (fixture: FplFixture): boolean =>
+  fixture.finished || fixture.finished_provisional === true;
+
 const addEvent = (
   records: Map<string, PenaltyLedgerRow>,
   season: string,
@@ -120,15 +123,15 @@ export const validateFixtureCoverage = (
   if (!fplFixtures) return plFixtures.length;
   const plCodes = new Set(plFixtures.map((fixture) => fixture.fixtureCode));
   const fplCodes = new Set(
-    fplFixtures
-      .filter((fixture) => fixture.finished)
-      .map((fixture) => fixture.code),
+    fplFixtures.filter(isPublishableFplFixture).map((fixture) => fixture.code),
   );
-  const missingInPl = [...fplCodes].filter((code) => !plCodes.has(code));
-  const missingInFpl = [...plCodes].filter((code) => !fplCodes.has(code));
-  if (missingInPl.length > 0 || missingInFpl.length > 0) {
+  const missingFromPlFeed = [...fplCodes].filter((code) => !plCodes.has(code));
+  const missingFromFplFixtures = [...plCodes].filter(
+    (code) => !fplCodes.has(code),
+  );
+  if (missingFromPlFeed.length > 0 || missingFromFplFixtures.length > 0) {
     throw new Error(
-      `[penaltyFeed] Completed fixture coverage is incomplete (missing PL=${missingInPl.join(",") || "none"}; missing FPL=${missingInFpl.join(",") || "none"}).`,
+      `[penaltyFeed] Fixture coverage is incomplete (missing from PL feed=${missingFromPlFeed.join(",") || "none"}; missing from FPL publishable fixtures=${missingFromFplFixtures.join(",") || "none"}).`,
     );
   }
   return fplCodes.size;
@@ -157,7 +160,7 @@ const addCurrentFplMisses = (
     for (const history of summary.history) {
       if (history.penalties_missed <= 0) continue;
       const fixture = fixtures.get(history.fixture);
-      if (!fixture?.finished) {
+      if (!fixture || !isPublishableFplFixture(fixture)) {
         throw new Error(
           `[penaltyFeed] Miss for player ${player.code} references unknown or incomplete FPL fixture ${history.fixture}.`,
         );

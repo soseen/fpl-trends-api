@@ -48,7 +48,6 @@ export const insertTeams = async () => {
       "Couldn't populate the teams table. Error:",
       (error as Error).message,
     );
-  } finally {
-    await prisma.$disconnect();
+    throw error;
   }
 };

@@ -94,7 +94,6 @@ export const insertFootballersFixtures = async () => {
       "Couldn't populate the fixtures table. Error:",
       (error as Error)?.message,
     );
-  } finally {
-    await prisma.$disconnect();
+    throw error;
   }
 };

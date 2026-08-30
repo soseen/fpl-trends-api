@@ -309,7 +309,7 @@ model events {
   highest_scoring_entry     Int?
   deadline_time_epoch       Int
   deadline_time_game_offset Int
-  highest_score             Int
+  highest_score             Int?
   is_previous               Boolean
   is_current                Boolean
   is_next                   Boolean
@@ -319,9 +319,9 @@ model events {
   can_manage                Boolean
   released                  Boolean
   ranked_count              Int
-  most_selected             Int
-  most_transferred_in       Int
-  top_element               Int
+  most_selected             Int?
+  most_transferred_in       Int?
+  top_element               Int?
   transfers_made            Int
   most_captained            Int?
   most_vice_captained       Int?

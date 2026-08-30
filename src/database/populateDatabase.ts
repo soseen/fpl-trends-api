@@ -41,6 +41,70 @@ const markBulkDataRefreshComplete = async (): Promise<void> => {
   `;
 };
 
+const latestPublishableEventId = (events: BootstrapStaticData["events"]) =>
+  Math.max(
+    0,
+    ...events
+      .filter((event) => event.finished || event.is_current)
+      .map((event) => event.id),
+  );
+
+const latestFootballerHistoryRound = (
+  footballers: Record<string, Footballer>,
+) => {
+  let latestRound = 0;
+  for (const footballer of Object.values(footballers)) {
+    for (const history of footballer.history ?? []) {
+      latestRound = Math.max(latestRound, history.round);
+    }
+  }
+  return latestRound;
+};
+
+const assertBulkPublicationFresh = async ({
+  expectedEventId,
+  expectedHistoryRound,
+}: {
+  expectedEventId: number;
+  expectedHistoryRound: number;
+}): Promise<void> => {
+  const [eventSummary] = await prisma.$queryRaw<
+    Array<{ latest_event_id: number | null }>
+  >`
+    SELECT MAX(id) AS latest_event_id
+    FROM events
+  `;
+  const [historySummary] = await prisma.$queryRaw<
+    Array<{ latest_round: number | null }>
+  >`
+    SELECT MAX(round) AS latest_round
+    FROM history
+  `;
+
+  const latestEventId = eventSummary?.latest_event_id ?? 0;
+  const latestHistoryRound = historySummary?.latest_round ?? 0;
+
+  if (expectedEventId > 0 && latestEventId < expectedEventId) {
+    throw new Error(
+      `[populateDatabase] Publication incomplete: events table is at GW${latestEventId}, expected at least GW${expectedEventId}.`,
+    );
+  }
+  if (expectedHistoryRound > 0 && latestHistoryRound < expectedHistoryRound) {
+    throw new Error(
+      `[populateDatabase] Publication incomplete: history table is at GW${latestHistoryRound}, expected at least GW${expectedHistoryRound}.`,
+    );
+  }
+  if (latestHistoryRound > latestEventId) {
+    throw new Error(
+      `[populateDatabase] Publication inconsistent: history is at GW${latestHistoryRound}, but events are only at GW${latestEventId}.`,
+    );
+  }
+
+  console.info(
+    `[populateDatabase] Publication freshness verified: events through GW${latestEventId}, history through GW${latestHistoryRound}.`,
+  );
+};
+
 export const populateDatabase = async () => {
   try {
     // 1. Fetch bootstrap data first (needed for season detection)
@@ -151,6 +215,11 @@ export const populateDatabase = async () => {
 
     console.info("Populating footballers history...");
     await insertFootballersHistory(currentSeason, fplFixtures);
+
+    await assertBulkPublicationFresh({
+      expectedEventId: latestPublishableEventId(currentBootstrap.events),
+      expectedHistoryRound: latestFootballerHistoryRound(footballers),
+    });
 
     await markBulkDataRefreshComplete();
 
