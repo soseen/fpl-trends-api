@@ -643,3 +643,30 @@ model manager_range_score_buckets {
   @@id([stratum, start_gw, end_gw, range_total])
   @@index([start_gw, end_gw, stratum, range_total])
 }
+
+// A snapshot-consistent score-to-overall-rank curve sampled directly from
+// FPL's Overall league standings. Unlike manager_history, every point in one
+// snapshot is collected during the same short refresh and is therefore safe
+// to use while a gameweek is live and ranks are changing quickly.
+model overall_rank_curve_snapshots {
+  gw               Int      @id
+  captured_at      DateTime
+  is_final         Boolean
+  pages_requested  Int
+  pages_sampled    Int
+  managers_sampled Int
+  min_rank         Int
+  max_rank         Int
+  points           overall_rank_curve_points[]
+}
+
+model overall_rank_curve_points {
+  gw    Int
+  score Int
+  rank  Int
+
+  snapshot overall_rank_curve_snapshots @relation(fields: [gw], references: [gw], onDelete: Cascade)
+
+  @@id([gw, score])
+  @@index([gw, rank])
+}

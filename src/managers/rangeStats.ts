@@ -193,13 +193,34 @@ export type RangeDensity = {
 type OverallRankMilestoneRow = {
   score: number;
   rank: number;
+  sample_size?: number;
 };
 
-// Overall-rank movement is non-linear: four points can cross far more teams
-// than four times a one-point estimate. Sampled managers already carry an
-// official rank, so median score/rank milestones give us a calibrated local
-// curve without assuming that the manager sample is distributionally uniform.
-export const overallRankMovementEstimator = async (
+export type RankCurveSource =
+  | "standings_snapshot"
+  | "recent_manager_sample"
+  | "final_manager_sample";
+
+export type RankCurveStatus =
+  | "live"
+  | "refreshing"
+  | "final"
+  | "provisional"
+  | "stale"
+  | "unavailable";
+
+export type RankMovementCurve = {
+  estimator: RankMovementEstimator | null;
+  source: RankCurveSource | null;
+  status: RankCurveStatus;
+  capturedAt: Date | null;
+};
+
+const LIVE_SNAPSHOT_STALE_AFTER_MS = 45 * 60 * 1000;
+const RECENT_MANAGER_SAMPLE_MIN_MILESTONES = 5;
+const RECENT_MANAGER_SAMPLE_MIN_MANAGERS = 100;
+
+const finalManagerSampleEstimator = async (
   endGw: number,
 ): Promise<RankMovementEstimator | null> => {
   const latest = await prisma.manager_cumulative.aggregate({
@@ -234,6 +255,149 @@ export const overallRankMovementEstimator = async (
   );
 
   return createRankMovementEstimator(rows);
+};
+
+const recentManagerSampleCurve = async (
+  endGw: number,
+): Promise<RankMovementCurve> => {
+  const [rows, latest] = await Promise.all([
+    prisma.$queryRawUnsafe<OverallRankMilestoneRow[]>(
+      `
+      WITH latest AS (
+        SELECT MAX(last_updated) AS captured_at
+        FROM manager_summary
+        WHERE last_checked_gw = $1
+          AND last_updated >= NOW() - INTERVAL '45 minutes'
+      )
+      SELECT
+        ms.total_points AS score,
+        PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY ms.overall_rank)::float AS rank,
+        COUNT(*)::int AS sample_size
+      FROM manager_summary ms
+      CROSS JOIN latest
+      WHERE ms.last_checked_gw = $1
+        AND latest.captured_at IS NOT NULL
+        AND ms.last_updated >= latest.captured_at - INTERVAL '10 minutes'
+        AND ms.total_points IS NOT NULL
+        AND ms.overall_rank > 0
+      GROUP BY ms.total_points
+      ORDER BY ms.total_points
+      `,
+      endGw,
+    ),
+    prisma.manager_summary.aggregate({
+      where: {
+        last_checked_gw: endGw,
+        last_updated: {
+          gte: new Date(Date.now() - LIVE_SNAPSHOT_STALE_AFTER_MS),
+        },
+      },
+      _max: { last_updated: true },
+    }),
+  ]);
+  const sampleSize = rows.reduce(
+    (total, row) => total + (row.sample_size ?? 0),
+    0,
+  );
+  if (
+    rows.length < RECENT_MANAGER_SAMPLE_MIN_MILESTONES ||
+    sampleSize < RECENT_MANAGER_SAMPLE_MIN_MANAGERS
+  ) {
+    return {
+      estimator: null,
+      source: null,
+      status: "unavailable",
+      capturedAt: null,
+    };
+  }
+  return {
+    estimator: createRankMovementEstimator(rows),
+    source: "recent_manager_sample",
+    status: "provisional",
+    capturedAt: latest._max.last_updated,
+  };
+};
+
+// Overall-rank movement is non-linear: four points can cross far more teams
+// than four times a one-point estimate. During a live GW, always prefer the
+// independently captured Overall-league snapshot: manager_history is updated
+// throughout the weekend and mixing those rows produces a curve that never
+// existed at any one moment. A recent manager_summary slice is a live-safe
+// fallback. Each score/rank pair originates in the same standings row and the
+// fallback is limited to a tight ten-minute capture window.
+export const overallRankMovementCurve = async (
+  endGw: number,
+): Promise<RankMovementCurve> => {
+  const [snapshot, event] = await Promise.all([
+    prisma.overall_rank_curve_snapshots.findUnique({
+      where: { gw: endGw },
+      include: { points: { orderBy: { score: "asc" } } },
+    }),
+    prisma.events.findUnique({
+      where: { id: endGw },
+      select: { finished: true, is_current: true },
+    }),
+  ]);
+
+  if (snapshot) {
+    const estimator = createRankMovementEstimator(snapshot.points);
+    if (estimator !== null) {
+      const ageMs = Date.now() - snapshot.captured_at.getTime();
+      const status: RankCurveStatus = snapshot.is_final
+        ? "final"
+        : event?.finished
+          ? "refreshing"
+          : ageMs <= LIVE_SNAPSHOT_STALE_AFTER_MS
+            ? "live"
+            : "stale";
+      if (status !== "stale") {
+        return {
+          estimator,
+          source: "standings_snapshot",
+          status,
+          capturedAt: snapshot.captured_at,
+        };
+      }
+
+      const recent = await recentManagerSampleCurve(endGw);
+      if (recent.estimator !== null) return recent;
+      return {
+        estimator,
+        source: "standings_snapshot",
+        status,
+        capturedAt: snapshot.captured_at,
+      };
+    }
+  }
+
+  if (event?.is_current && !event.finished) {
+    const recent = await recentManagerSampleCurve(endGw);
+    if (recent.estimator !== null) return recent;
+    // Never fall through to the all-time manager sample during a live GW.
+    // Those rows are refreshed at different times, so combining them would
+    // recreate the incoherent curve this snapshot model is designed to avoid.
+    return recent;
+  }
+
+  const estimator = await finalManagerSampleEstimator(endGw);
+  return {
+    estimator,
+    source: estimator === null ? null : "final_manager_sample",
+    status:
+      estimator === null
+        ? "unavailable"
+        : event?.finished
+          ? "final"
+          : "provisional",
+    capturedAt: null,
+  };
+};
+
+export const overallRankMovementEstimator = async (
+  endGw: number,
+): Promise<RankMovementEstimator | null> => {
+  const curve = await overallRankMovementCurve(endGw);
+  return curve.estimator;
 };
 
 // Density of OVERALL season totals at the user's overall total (at end_gw)

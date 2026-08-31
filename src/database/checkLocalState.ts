@@ -121,6 +121,28 @@ const main = async (): Promise<void> => {
     FROM events
   `;
 
+  const rankCurves = await prisma.$queryRaw<
+    Array<{
+      gw: number;
+      captured_at: Date;
+      is_final: boolean;
+      milestones: bigint;
+      min_rank: number;
+      max_rank: number;
+    }>
+  >`
+    SELECT s.gw,
+           s.captured_at,
+           s.is_final,
+           COUNT(p.score)::bigint AS milestones,
+           s.min_rank,
+           s.max_rank
+    FROM overall_rank_curve_snapshots s
+    LEFT JOIN overall_rank_curve_points p ON p.gw = s.gw
+    GROUP BY s.gw, s.captured_at, s.is_final, s.min_rank, s.max_rank
+    ORDER BY s.gw DESC
+  `;
+
   const managerMetadata = await prisma.$queryRaw<
     Array<{ key: string; value: string }>
   >`
@@ -156,6 +178,17 @@ const main = async (): Promise<void> => {
   console.info(
     `  current GW: ${events[0]?.current_gw ?? "?"} (${events[0]?.current_finished ? "finished" : "live/not finished"})`,
   );
+
+  console.info("\noverall rank curves (rank-impact read path):");
+  if (rankCurves.length === 0) {
+    console.info("  EMPTY - run `npm run refresh-rank-curve`.");
+  } else {
+    for (const curve of rankCurves) {
+      console.info(
+        `  GW${curve.gw}: ${curve.milestones} milestones, ranks ${curve.min_rank}-${curve.max_rank}, ${curve.is_final ? "final" : "live"}, captured ${curve.captured_at.toISOString()}`,
+      );
+    }
+  }
 
   console.info("\ningest metadata:");
   for (const key of MANAGER_METADATA_KEYS) {

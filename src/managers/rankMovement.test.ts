@@ -36,4 +36,24 @@ void describe("createRankMovementEstimator", () => {
   void it("returns null for an empty distribution", () => {
     assert.equal(createRankMovementEstimator([]), null);
   });
+
+  void it("produces realistic non-linear impacts from an official standings curve", () => {
+    const estimator = createRankMovementEstimator([
+      { score: 148, rank: 2_104_830 },
+      { score: 166, rank: 649_183 },
+      { score: 172, rank: 394_127 },
+      { score: 183, rank: 124_318 },
+      { score: 194, rank: 35_000 },
+    ]);
+
+    assert.ok(estimator);
+    const brunoCaptainGain = estimator.impactForExcess(172, 21.5);
+    const haalandLoss = estimator.impactForExcess(172, -11.3);
+    const whiteGain = estimator.impactForExcess(172, 6.2);
+
+    assert.ok(brunoCaptainGain > 1_000_000);
+    assert.ok(whiteGain > 250_000);
+    assert.ok(haalandLoss < -200_000);
+    assert.ok(Math.abs(haalandLoss) <= 394_126);
+  });
 });

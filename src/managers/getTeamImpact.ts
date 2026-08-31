@@ -3,12 +3,15 @@ import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks } from "./resolvePicks.js";
 import {
-  overallRankMovementEstimator,
+  overallRankMovementCurve,
   rangeDensityFromCumulative,
+  type RankCurveSource,
+  type RankCurveStatus,
   type Stratum,
 } from "./rangeStats.js";
 import { pickRankBand, rankBandSqlCase, type RankBand } from "./rankBands.js";
 import type { RankMovementEstimator } from "./rankMovement.js";
+import { effectivePointExcess } from "./teamImpactCalc.js";
 
 // ----------------------------------------------------------------------------
 // Public response types. Mirrored on the frontend in
@@ -121,6 +124,9 @@ export type TeamImpactResponse = {
     incomplete_picks: boolean;
     fallback_used: boolean;
     small_sample_gws: number[];
+    rank_curve_source: RankCurveSource | null;
+    rank_curve_status: RankCurveStatus;
+    rank_curve_captured_at: string | null;
   };
 };
 
@@ -286,11 +292,11 @@ const fetchPlayerGwStats = async (
 };
 
 // Map keyed by `${footballer_id}:${round}` for every (player, GW) pair in
-// `finishedGws` where the player scored at least 1 point. Uses the same
+// `finishedGws` where the player scored non-zero points. Uses the same
 // per-row aggregation as `fetchPlayerGwStats` but without the player-id
 // filter — needed to compute rank-killer impact for players the user did
-// NOT own. Filtering to `total_points > 0` keeps the result set small
-// (~roughly the active player count × GWs in range).
+// NOT own. Negative totals must be retained because they offset a player's
+// damaging positive weeks in the same counterfactual ownership outcome.
 const fetchAllPlayerGwStats = async (
   finishedGws: number[],
 ): Promise<Map<string, PerGwPlayerStat>> => {
@@ -333,7 +339,7 @@ const fetchAllPlayerGwStats = async (
     LEFT JOIN events e ON e.id = h.round
     WHERE h.round = ANY($1::int[])
     GROUP BY h.footballer_id, h.round
-    HAVING SUM(h.total_points) > 0
+    HAVING SUM(h.total_points) <> 0
     `,
     finishedGws,
   );
@@ -686,8 +692,11 @@ const computeRankInfo = async (
   rank_per_point: number | null;
   stratum_avg: number | null;
   estimator: RankMovementEstimator | null;
+  curve_source: RankCurveSource | null;
+  curve_status: RankCurveStatus;
+  curve_captured_at: string | null;
 }> => {
-  const [density, estimator] = await Promise.all([
+  const [density, curve] = await Promise.all([
     rangeDensityFromCumulative(
       stratum as Stratum | null,
       startGw,
@@ -695,8 +704,9 @@ const computeRankInfo = async (
       userOverallTotal,
       AVERAGE_DENSITY_WINDOW,
     ),
-    overallRankMovementEstimator(endGw),
+    overallRankMovementCurve(endGw),
   ]);
+  const estimator = curve.estimator;
   const rankPerPoint =
     estimator !== null && userOverallTotal !== null
       ? estimator.impactForExcess(userOverallTotal, 1)
@@ -706,6 +716,9 @@ const computeRankInfo = async (
       rankPerPoint !== null && rankPerPoint > 0 ? rankPerPoint : null,
     stratum_avg: density.stratumAverage,
     estimator,
+    curve_source: curve.source,
+    curve_status: curve.status,
+    curve_captured_at: curve.capturedAt?.toISOString() ?? null,
   };
 };
 
@@ -1039,6 +1052,9 @@ export const getTeamImpact = async (
         incomplete_picks: false,
         fallback_used: true,
         small_sample_gws: [],
+        rank_curve_source: null,
+        rank_curve_status: "unavailable",
+        rank_curve_captured_at: null,
       },
     };
   }
@@ -1142,7 +1158,7 @@ export const getTeamImpact = async (
     const eo = exposure.eo;
     if (!exposure.usedRankBandExposure) fallbackUsed = true;
 
-    const excess = (pick.multiplier - eo) * points;
+    const excess = effectivePointExcess(pick.multiplier, eo, points);
 
     let acc = accumulators.get(pick.element_id);
     if (!acc) {
@@ -1234,9 +1250,8 @@ export const getTeamImpact = async (
     0,
   );
 
-  // Rank killers: players the user did NOT have in their squad but who
-  // scored points and were widely owned in the stratum, lifting OTHER
-  // managers' totals and so dragging the user's relative rank down.
+  // Rank killers: players the user did NOT have in their squad whose net
+  // range outcome lifted other managers' totals and dragged the user's rank.
   // We only do this when rank_per_point is computable (otherwise the
   // attribution would always be 0 and the section would be hidden anyway).
   const rankKillers: PlayerImpact[] = [];
@@ -1297,7 +1312,7 @@ export const getTeamImpact = async (
 
       if (eo === 0) continue;
 
-      const excess = -eo * stat.total_points;
+      const excess = effectivePointExcess(0, eo, stat.total_points);
 
       let acc = killerAccs.get(playerId);
       if (!acc) {
@@ -1323,8 +1338,8 @@ export const getTeamImpact = async (
         excess,
         rank_impact_gw: 0,
         // Rank killers come from `fetchAllPlayerGwStats`, which already
-        // filters to rows that exist in `history` (i.e. had a fixture
-        // and total_points > 0).
+        // filters to non-zero rows that exist in `history` (i.e. the player
+        // had a fixture). Negative scores deliberately remain in the range.
         had_fixture: true,
         // Populated below once we've selected the top-10 — avoids
         // joining `teams` for every player who scored in the range.
@@ -1418,6 +1433,9 @@ export const getTeamImpact = async (
       incomplete_picks: incomplete,
       fallback_used: fallbackUsed,
       small_sample_gws: Array.from(smallSampleGws).sort((a, b) => a - b),
+      rank_curve_source: rankInfo.curve_source,
+      rank_curve_status: rankInfo.curve_status,
+      rank_curve_captured_at: rankInfo.curve_captured_at,
     },
   };
 };

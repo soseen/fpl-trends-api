@@ -19,6 +19,7 @@
     "test": "tsx --test src/**/*.test.ts",
     "populate": "tsx src/database/populateDatabase.ts",
     "populate-managers": "tsx src/database/populateManagers.ts",
+    "refresh-rank-curve": "tsx src/database/refreshOverallRankCurve.ts",
     "backfill-picks": "tsx src/database/backfillPicks.ts",
     "backfill-comparison-picks": "tsx src/database/backfillComparisonPicks.ts",
     "backfill-cumulative": "tsx src/database/backfillManagerCumulative.ts",

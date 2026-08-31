@@ -16,6 +16,7 @@ import {
 } from "../managers/fetchPicks.js";
 import { persistPickElements } from "../managers/persistPickElements.js";
 import { rankBandSqlCase } from "../managers/rankBands.js";
+import { refreshOverallRankCurveSnapshot } from "../managers/rankCurveSnapshot.js";
 import { fetchEntryTransfers } from "../managers/fetchTransfers.js";
 import {
   RateLimitGovernor,
@@ -1550,6 +1551,34 @@ export const populateManagers = async (
         "[populateManagers] No active or finished GWs yet - nothing to ingest.",
       );
       return;
+    }
+
+    // Rank-impact endpoints need a score-to-overall-rank curve that remains
+    // coherent while matches are live. Refresh it independently from the
+    // slower manager-history walk: standings pages contain score and rank in
+    // one response, so a published snapshot never mixes Friday ranks with
+    // Sunday/Monday totals. A failed refresh keeps the previous good snapshot
+    // and must not stop EO/comparison ingestion.
+    const rankCurveStarted = Date.now();
+    try {
+      const rankCurveEvent = await prisma.events.findUnique({
+        where: { id: currentGw },
+        select: { ranked_count: true, data_checked: true },
+      });
+      const snapshot = await refreshOverallRankCurveSnapshot({
+        gw: currentGw,
+        // `finished` flips before all bonus/rank processing is necessarily
+        // complete. Keep refreshing until FPL marks the GW data checked.
+        isFinal: rankCurveEvent?.data_checked ?? false,
+        rankedCount: rankCurveEvent?.ranked_count ?? 0,
+      });
+      console.info(
+        `[populateManagers] overall rank curve GW${currentGw} refreshed from ${snapshot.pagesFetched}/${snapshot.pagesRequested} standings pages (${snapshot.milestones.length} scores, ${Math.round((Date.now() - rankCurveStarted) / 1000)}s)`,
+      );
+    } catch (err) {
+      console.warn(
+        `[populateManagers] overall rank curve refresh failed; retaining previous snapshot: ${(err as Error).message}`,
+      );
     }
 
     // One-time migration: pre-refactor cursors stored raw page numbers,
