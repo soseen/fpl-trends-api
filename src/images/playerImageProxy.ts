@@ -91,38 +91,59 @@ export const getPlayerImage = async (
     return;
   }
 
-  const upstreamUrl = `https://resources.premierleague.com/premierleague25/photos/players/${size}/${code}.png`;
+  // A player who changes clubs can be added to the current-season data before
+  // their photo reaches the current-season CDN. The previous-season CDN still
+  // has their old-club photo, which is preferable to falling back to a crest.
+  const upstreamUrls = [
+    `https://resources.premierleague.com/premierleague25/photos/players/${size}/${code}.png`,
+    `https://resources.premierleague.com/premierleague/photos/players/${size}/p${code}.png`,
+  ];
+  let lastStatus: number | undefined;
+  let lastError: unknown;
 
-  try {
-    const response = await axios.get<ArrayBuffer>(upstreamUrl, {
-      responseType: "arraybuffer",
-      timeout: 10_000,
-      validateStatus: () => true,
-    });
+  for (const upstreamUrl of upstreamUrls) {
+    try {
+      const response = await axios.get<ArrayBuffer>(upstreamUrl, {
+        responseType: "arraybuffer",
+        timeout: 10_000,
+        validateStatus: () => true,
+      });
 
-    if (response.status !== 200) {
-      res.setHeader("Cache-Control", `public, max-age=${MISS_TTL_SECONDS}`);
-      res.status(response.status).end();
+      if (response.status !== 200) {
+        lastStatus = response.status;
+        continue;
+      }
+
+      const contentTypeHeader = response.headers["content-type"];
+      const etagHeader = response.headers["etag"];
+      const entry: CachedPlayerImage = {
+        body: Buffer.from(response.data),
+        contentType:
+          typeof contentTypeHeader === "string"
+            ? contentTypeHeader
+            : "image/png",
+        etag: typeof etagHeader === "string" ? etagHeader : undefined,
+        expiresAt: Date.now() + SUCCESS_TTL_MS,
+      };
+
+      writeCacheEntry(key, entry);
+      writeImageResponse(req, res, entry);
       return;
+    } catch (error: unknown) {
+      lastError = error;
     }
-
-    const contentTypeHeader = response.headers["content-type"];
-    const etagHeader = response.headers["etag"];
-    const entry: CachedPlayerImage = {
-      body: Buffer.from(response.data),
-      contentType:
-        typeof contentTypeHeader === "string" ? contentTypeHeader : "image/png",
-      etag: typeof etagHeader === "string" ? etagHeader : undefined,
-      expiresAt: Date.now() + SUCCESS_TTL_MS,
-    };
-
-    writeCacheEntry(key, entry);
-    writeImageResponse(req, res, entry);
-  } catch (error: unknown) {
-    console.error(
-      `[playerImageProxy] Failed to fetch player image ${size}/${code}:`,
-      (error as Error).message,
-    );
-    res.status(502).json({ error: "Failed to fetch player image." });
   }
+
+  res.setHeader("Cache-Control", `public, max-age=${MISS_TTL_SECONDS}`);
+
+  if (lastStatus !== undefined) {
+    res.status(lastStatus).end();
+    return;
+  }
+
+  console.error(
+    `[playerImageProxy] Failed to fetch player image ${size}/${code} from all upstreams:`,
+    lastError instanceof Error ? lastError.message : String(lastError),
+  );
+  res.status(502).json({ error: "Failed to fetch player image." });
 };
