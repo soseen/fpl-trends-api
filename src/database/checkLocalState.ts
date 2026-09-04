@@ -73,12 +73,16 @@ const main = async (): Promise<void> => {
       managers: bigint;
       gws: bigint;
       with_captain: bigint;
+      with_sampling_provenance: bigint;
     }>
   >`
     SELECT COUNT(*)::bigint AS rows,
            COUNT(DISTINCT entry_id)::bigint AS managers,
            COUNT(DISTINCT gw)::bigint AS gws,
-           COUNT(*) FILTER (WHERE captain_element IS NOT NULL)::bigint AS with_captain
+           COUNT(*) FILTER (WHERE captain_element IS NOT NULL)::bigint AS with_captain,
+           COUNT(*) FILTER (
+             WHERE sampled_at_gw = gw AND sample_stratum BETWEEN 1 AND 3
+           )::bigint AS with_sampling_provenance
     FROM manager_picks
   `;
 
@@ -246,6 +250,9 @@ const main = async (): Promise<void> => {
   console.info(
     `  with captain_element NOT NULL: ${picks[0]?.with_captain ?? 0n}`,
   );
+  console.info(
+    `  with same-GW sampling provenance: ${picks[0]?.with_sampling_provenance ?? 0n}`,
+  );
 
   console.info("\nmanager_pick_elements (full XV cache, user + sample EO):");
   console.info(
@@ -305,6 +312,9 @@ const main = async (): Promise<void> => {
 
   console.info("\n=== Diagnosis ===");
   const picksRows = Number(picks[0]?.rows ?? 0n);
+  const picksWithSamplingProvenance = Number(
+    picks[0]?.with_sampling_provenance ?? 0n,
+  );
   const cumRows = Number(cumulative[0]?.rows ?? 0n);
   const captainBuckets = captainPicks.reduce(
     (acc, r) => acc + Number(r.rows),
@@ -352,6 +362,12 @@ const main = async (): Promise<void> => {
   if (staleFuturePickRows > 0) {
     console.info(
       `  WARNING manager_pick_elements contains ${staleFuturePickRows} rows beyond the current season GW; remove them before they can affect live EO.`,
+    );
+  }
+
+  if (picksRows > 0 && picksWithSamplingProvenance < picksRows * 0.5) {
+    console.info(
+      "  WARNING manager_picks sampling provenance is sparse; causal EO will use its population-weighted fallback until current-GW sampling catches up.",
     );
   }
 

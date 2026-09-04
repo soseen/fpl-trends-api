@@ -115,6 +115,8 @@ const isHttpStatus = (err: unknown, status: number): boolean => {
 const fetchAndStorePicks = async (
   entryId: number,
   gw: number,
+  sampleStratum: 1 | 2 | 3,
+  sampledAtGw: number,
   governor: RateLimitGovernor,
 ): Promise<void> => {
   const payload = await withGovernor(governor, () =>
@@ -129,6 +131,8 @@ const fetchAndStorePicks = async (
       vice_captain_element,
       captain_multiplier,
       active_chip: payload.active_chip,
+      sample_stratum: sampleStratum,
+      sampled_at_gw: sampledAtGw,
     },
     create: {
       entry_id: entryId,
@@ -137,6 +141,8 @@ const fetchAndStorePicks = async (
       vice_captain_element,
       captain_multiplier,
       active_chip: payload.active_chip,
+      sample_stratum: sampleStratum,
+      sampled_at_gw: sampledAtGw,
     },
   });
   await persistPickElements(entryId, gw, payload.picks ?? []);
@@ -168,7 +174,13 @@ const ingestStratum = async (
           return;
         }
         try {
-          await fetchAndStorePicks(pair.entry_id, pair.gw, governor);
+          await fetchAndStorePicks(
+            pair.entry_id,
+            pair.gw,
+            stratum,
+            currentGw,
+            governor,
+          );
           done += 1;
         } catch (err) {
           failed += 1;

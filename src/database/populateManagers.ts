@@ -555,7 +555,7 @@ const processEntry = async (
   // is the current GW, so My Trends can converge while matches are still
   // being played.
   if (INGEST_SAMPLE_PICKS) {
-    await ingestPicksForMissingGws(entryId, currentGw, governor);
+    await ingestPicksForMissingGws(entryId, currentGw, stratum, governor);
   }
 
   // Rebuild manager_cumulative for this entry after optional picks are current
@@ -684,6 +684,7 @@ export const rebuildCumulativeForEntry = async (
 const ingestPicksForMissingGws = async (
   entryId: number,
   currentGw: number,
+  sampleStratum: 1 | 2 | 3,
   governor: RateLimitGovernor,
 ): Promise<void> => {
   if (currentGw < 1) return;
@@ -719,6 +720,8 @@ const ingestPicksForMissingGws = async (
       vice_captain_element,
       captain_multiplier,
       active_chip: payload.active_chip,
+      sample_stratum: sampleStratum,
+      sampled_at_gw: currentGw,
     },
     create: {
       entry_id: entryId,
@@ -727,6 +730,8 @@ const ingestPicksForMissingGws = async (
       vice_captain_element,
       captain_multiplier,
       active_chip: payload.active_chip,
+      sample_stratum: sampleStratum,
+      sampled_at_gw: currentGw,
     },
   });
   await persistPickElements(entryId, currentGw, payload.picks ?? []);
@@ -944,25 +949,28 @@ export const rebuildStratumCaptainPicks = async (): Promise<void> => {
       INSERT INTO stratum_captain_picks_gw
         (stratum, gw, captain_element, captain_multiplier, picks, last_rebuilt)
       SELECT
-        ms.stratum,
+        mp.sample_stratum,
         mp.gw,
         mp.captain_element,
         mp.captain_multiplier,
         COUNT(*)::int AS picks,
         NOW()         AS last_rebuilt
       FROM manager_picks mp
-      JOIN manager_summary ms ON ms.entry_id = mp.entry_id
       WHERE mp.captain_element IS NOT NULL
         AND mp.captain_multiplier IS NOT NULL
-      GROUP BY ms.stratum, mp.gw, mp.captain_element, mp.captain_multiplier
+        AND mp.sampled_at_gw = mp.gw
+        AND mp.sample_stratum BETWEEN 1 AND 3
+      GROUP BY mp.sample_stratum, mp.gw, mp.captain_element, mp.captain_multiplier
     `),
   ]);
 };
 
-// Rebuild LiveFPL-style player exposure by rank band from full XV rows.
-// The important metric is effective_multiplier_sum / sample_size, which is
-// actual EO from final multipliers rather than global selected-by plus a
-// separate captain estimate.
+// Rebuild LiveFPL-style player exposure by causal pre-GW rank band. Managers
+// are selected from the post-GW standings with deliberately unequal sampling
+// rates, so raw counts would over-represent managers who moved into the top
+// 100k. Inverse-probability weights reconstruct the pre-GW band's population;
+// the stored sample_size is Kish effective N so request-time quality gates
+// still reflect statistical support rather than weighted population size.
 export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
   const previousRankBand = rankBandSqlCase("mh_previous.overall_rank");
   await prisma.$transaction([
@@ -971,25 +979,105 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
       INSERT INTO rank_band_player_exposure_gw
         (rank_band, gw, element_id, sample_size, squad_picks, active_picks,
          effective_multiplier_sum, last_rebuilt)
-      WITH causal_pick_rows AS (
+      WITH same_gw_sampled_pick_rows AS (
         SELECT
-          CASE WHEN mpe.gw = 1 THEN 0 ELSE ${previousRankBand} END AS rank_band,
           mpe.gw,
           mpe.entry_id,
           mpe.element_id,
-          mpe.multiplier
+          mpe.multiplier,
+          mp.sample_stratum
         FROM manager_pick_elements mpe
-        LEFT JOIN manager_history mh_previous
-          ON mh_previous.entry_id = mpe.entry_id
-         AND mh_previous.gw = mpe.gw - 1
+        JOIN manager_picks mp
+          ON mp.entry_id = mpe.entry_id
+         AND mp.gw = mpe.gw
+         AND mp.sampled_at_gw = mpe.gw
+         AND mp.sample_stratum BETWEEN 1 AND 3
+        WHERE mpe.gw > 1
+      ),
+      sample_stratum_sizes AS (
+        SELECT
+          gw,
+          sample_stratum,
+          COUNT(DISTINCT entry_id)::numeric AS sample_size
+        FROM same_gw_sampled_pick_rows
+        GROUP BY gw, sample_stratum
+      ),
+      sample_stratum_population_grid AS (
+        SELECT
+          e.id AS gw,
+          source.sample_stratum,
+          CASE source.sample_stratum
+            WHEN 1 THEN LEAST(e.ranked_count, 10000)::numeric
+            WHEN 2 THEN GREATEST(LEAST(e.ranked_count, 100000) - 10000, 0)::numeric
+            ELSE GREATEST(e.ranked_count - 100000, 0)::numeric
+          END AS population
+        FROM events e
+        CROSS JOIN (VALUES (1), (2), (3)) AS source(sample_stratum)
+        WHERE e.id > 1
+      ),
+      sample_coverage AS (
+        SELECT
+          p.gw,
+          BOOL_AND(
+            p.population = 0 OR COALESCE(s.sample_size, 0) > 0
+          ) AS complete
+        FROM sample_stratum_population_grid p
+        LEFT JOIN sample_stratum_sizes s
+          ON s.gw = p.gw
+         AND s.sample_stratum = p.sample_stratum
+        GROUP BY p.gw
+      ),
+      sample_weights AS (
+        SELECT
+          p.gw,
+          p.sample_stratum,
+          p.population / s.sample_size AS sample_weight
+        FROM sample_stratum_population_grid p
+        JOIN sample_stratum_sizes s
+          ON s.gw = p.gw
+         AND s.sample_stratum = p.sample_stratum
+        JOIN sample_coverage c ON c.gw = p.gw AND c.complete
+        WHERE p.population > 0
+      ),
+      causal_pick_rows AS (
+        SELECT
+          ${previousRankBand} AS rank_band,
+          sampled.gw,
+          sampled.entry_id,
+          sampled.element_id,
+          sampled.multiplier,
+          weight.sample_weight
+        FROM same_gw_sampled_pick_rows sampled
+        JOIN manager_history mh_previous
+          ON mh_previous.entry_id = sampled.entry_id
+         AND mh_previous.gw = sampled.gw - 1
+        JOIN sample_weights weight
+          ON weight.gw = sampled.gw
+         AND weight.sample_stratum = sampled.sample_stratum
+        WHERE mh_previous.overall_rank > 0
+      ),
+      weighted_manager_rows AS (
+        SELECT DISTINCT
+          rank_band,
+          gw,
+          entry_id,
+          sample_weight
+        FROM causal_pick_rows
+        WHERE rank_band BETWEEN 1 AND 9
       ),
       samples AS (
         SELECT
           rank_band,
           gw,
-          COUNT(DISTINCT entry_id)::int AS sample_size
-        FROM causal_pick_rows
-        WHERE rank_band BETWEEN 1 AND 9
+          GREATEST(
+            ROUND(
+              POWER(SUM(sample_weight), 2)
+                / NULLIF(SUM(sample_weight * sample_weight), 0)
+            )::int,
+            1
+          ) AS sample_size,
+          SUM(sample_weight)::numeric AS weighted_population
+        FROM weighted_manager_rows
         GROUP BY rank_band, gw
       ),
       player_exposure AS (
@@ -997,9 +1085,15 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
           rank_band,
           gw,
           element_id,
-          COUNT(*)::int AS squad_picks,
-          COUNT(*) FILTER (WHERE multiplier > 0)::int AS active_picks,
-          COALESCE(SUM(multiplier), 0)::int AS effective_multiplier_sum
+          SUM(sample_weight)::numeric AS weighted_squad_picks,
+          COALESCE(
+            SUM(sample_weight) FILTER (WHERE multiplier > 0),
+            0
+          )::numeric AS weighted_active_picks,
+          COALESCE(
+            SUM(multiplier * sample_weight),
+            0
+          )::numeric AS weighted_multiplier_sum
         FROM causal_pick_rows
         WHERE rank_band BETWEEN 1 AND 9
         GROUP BY rank_band, gw, element_id
@@ -1085,9 +1179,15 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
         pe.gw,
         pe.element_id,
         s.sample_size,
-        pe.squad_picks,
-        pe.active_picks,
-        pe.effective_multiplier_sum,
+        ROUND(
+          pe.weighted_squad_picks / s.weighted_population * s.sample_size
+        )::int AS squad_picks,
+        ROUND(
+          pe.weighted_active_picks / s.weighted_population * s.sample_size
+        )::int AS active_picks,
+        ROUND(
+          pe.weighted_multiplier_sum / s.weighted_population * s.sample_size
+        )::int AS effective_multiplier_sum,
         NOW() AS last_rebuilt
       FROM player_exposure pe
       JOIN samples s ON s.rank_band = pe.rank_band AND s.gw = pe.gw

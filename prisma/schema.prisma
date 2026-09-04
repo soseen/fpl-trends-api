@@ -374,10 +374,13 @@ model manager_picks {
   vice_captain_element Int? // backup captain (footballer id)
   captain_multiplier   Int? // 2 = standard captain, 3 = triple captain, 0 = captain benched
   active_chip          String?         @db.VarChar(20) // wildcard | freehit | bboost | 3xc | manager
+  sample_stratum       Int? // standings-page stratum that selected this manager (1/2/3)
+  sampled_at_gw        Int? // GW whose standings selected this row; causal EO requires sampled_at_gw = gw
   manager              manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
 
   @@id([entry_id, gw])
   @@index([gw])
+  @@index([gw, sampled_at_gw, sample_stratum])
   @@index([captain_element])
 }
 
@@ -649,7 +652,7 @@ model manager_range_score_buckets {
 // snapshot is collected during the same short refresh and is therefore safe
 // to use while a gameweek is live and ranks are changing quickly.
 model overall_rank_curve_snapshots {
-  gw               Int      @id
+  gw               Int                         @id
   captured_at      DateTime
   is_final         Boolean
   pages_requested  Int

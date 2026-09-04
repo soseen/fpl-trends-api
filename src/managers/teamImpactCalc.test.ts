@@ -10,6 +10,12 @@ void describe("effectivePointExcess", () => {
     assert.ok(Math.abs(effectivePointExcess(1, 0.115, 7) - 6.195) < 0.000_001);
   });
 
+  void it("preserves a large captain gain against an unbiased rank-band EO", () => {
+    const brunoGw2Excess = effectivePointExcess(2, 0.6471, 23);
+
+    assert.ok(Math.abs(brunoGw2Excess - 31.1167) < 0.000_001);
+  });
+
   void it("makes an unowned high-EO return a rank cost", () => {
     assert.ok(
       Math.abs(effectivePointExcess(0, 0.866, 13) + 11.258) < 0.000_001,

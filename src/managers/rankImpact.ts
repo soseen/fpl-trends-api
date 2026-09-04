@@ -182,77 +182,150 @@ export const fetchCaptainRatesInStratum = async (
 ): Promise<CaptainRateInfo> => {
   const rates = new Map<string, CaptainRate>();
   const perGwSampleSize = new Map<number, number>();
-  const sampleRows =
-    stratum === null
-      ? await prisma.$queryRawUnsafe<
-          Array<{ gw: number; sample_size: number }>
-        >(
-          `
-          SELECT gw, SUM(picks)::int AS sample_size
-          FROM stratum_captain_picks_gw
-          WHERE gw BETWEEN $1 AND $2
-          GROUP BY gw
-          `,
-          startGw,
-          endGw,
-        )
-      : await prisma.$queryRawUnsafe<
-          Array<{ gw: number; sample_size: number }>
-        >(
-          `
-          SELECT gw, SUM(picks)::int AS sample_size
-          FROM stratum_captain_picks_gw
-          WHERE gw BETWEEN $1 AND $2
-            AND stratum = $3
-          GROUP BY gw
-          `,
-          startGw,
-          endGw,
-          stratum,
-        );
+  if (stratum === null) {
+    const weightedRows = await prisma.$queryRawUnsafe<
+      Array<{
+        gw: number;
+        captain_element: number;
+        sample_size: number;
+        cap_rate: number;
+        tc_rate: number;
+      }>
+    >(
+      `
+      WITH sample_sizes AS (
+        SELECT gw, stratum, SUM(picks)::numeric AS sample_size
+        FROM stratum_captain_picks_gw
+        WHERE gw BETWEEN $1 AND $2
+        GROUP BY gw, stratum
+      ),
+      population_grid AS (
+        SELECT
+          e.id AS gw,
+          source.stratum,
+          CASE source.stratum
+            WHEN 1 THEN LEAST(e.ranked_count, 10000)::numeric
+            WHEN 2 THEN GREATEST(LEAST(e.ranked_count, 100000) - 10000, 0)::numeric
+            ELSE GREATEST(e.ranked_count - 100000, 0)::numeric
+          END AS population
+        FROM events e
+        CROSS JOIN (VALUES (1), (2), (3)) AS source(stratum)
+        WHERE e.id BETWEEN $1 AND $2
+      ),
+      coverage AS (
+        SELECT
+          p.gw,
+          BOOL_AND(
+            p.population = 0 OR COALESCE(s.sample_size, 0) > 0
+          ) AS complete
+        FROM population_grid p
+        LEFT JOIN sample_sizes s
+          ON s.gw = p.gw AND s.stratum = p.stratum
+        GROUP BY p.gw
+      ),
+      weights AS (
+        SELECT
+          p.gw,
+          p.stratum,
+          s.sample_size,
+          p.population,
+          p.population / s.sample_size AS sample_weight
+        FROM population_grid p
+        JOIN sample_sizes s
+          ON s.gw = p.gw AND s.stratum = p.stratum
+        JOIN coverage c ON c.gw = p.gw AND c.complete
+        WHERE p.population > 0
+      ),
+      effective_samples AS (
+        SELECT
+          gw,
+          GREATEST(
+            ROUND(
+              POWER(SUM(population), 2)
+                / NULLIF(SUM(sample_size * sample_weight * sample_weight), 0)
+            )::int,
+            1
+          ) AS sample_size,
+          SUM(population)::numeric AS weighted_population
+        FROM weights
+        GROUP BY gw
+      )
+      SELECT
+        picks.gw,
+        picks.captain_element,
+        sample.sample_size,
+        (
+          COALESCE(
+            SUM(picks.picks * weight.sample_weight)
+              FILTER (WHERE picks.captain_multiplier = 2),
+            0
+          ) / sample.weighted_population
+        )::double precision AS cap_rate,
+        (
+          COALESCE(
+            SUM(picks.picks * weight.sample_weight)
+              FILTER (WHERE picks.captain_multiplier = 3),
+            0
+          ) / sample.weighted_population
+        )::double precision AS tc_rate
+      FROM stratum_captain_picks_gw picks
+      JOIN weights weight
+        ON weight.gw = picks.gw AND weight.stratum = picks.stratum
+      JOIN effective_samples sample ON sample.gw = picks.gw
+      GROUP BY
+        picks.gw,
+        picks.captain_element,
+        sample.sample_size,
+        sample.weighted_population
+      `,
+      startGw,
+      endGw,
+    );
+
+    for (const row of weightedRows) {
+      perGwSampleSize.set(row.gw, row.sample_size);
+      rates.set(playerGwKey(row.captain_element, row.gw), {
+        cap_rate: row.cap_rate,
+        tc_rate: row.tc_rate,
+      });
+    }
+    return { rates, perGwSampleSize };
+  }
+
+  const sampleRows = await prisma.$queryRawUnsafe<
+    Array<{ gw: number; sample_size: number }>
+  >(
+    `
+    SELECT gw, SUM(picks)::int AS sample_size
+    FROM stratum_captain_picks_gw
+    WHERE gw BETWEEN $1 AND $2
+      AND stratum = $3
+    GROUP BY gw
+    `,
+    startGw,
+    endGw,
+    stratum,
+  );
   for (const r of sampleRows) perGwSampleSize.set(r.gw, r.sample_size);
 
-  const captainRows =
-    stratum === null
-      ? await prisma.$queryRawUnsafe<
-          Array<{
-            gw: number;
-            captain_element: number;
-            captain_multiplier: number;
-            picks: number;
-          }>
-        >(
-          `
-          SELECT
-            gw,
-            captain_element,
-            captain_multiplier,
-            SUM(picks)::int AS picks
-          FROM stratum_captain_picks_gw
-          WHERE gw BETWEEN $1 AND $2
-          GROUP BY gw, captain_element, captain_multiplier
-          `,
-          startGw,
-          endGw,
-        )
-      : await prisma.$queryRawUnsafe<
-          Array<{
-            gw: number;
-            captain_element: number;
-            captain_multiplier: number;
-            picks: number;
-          }>
-        >(
-          `
-          SELECT gw, captain_element, captain_multiplier, picks
-          FROM stratum_captain_picks_gw
-          WHERE gw BETWEEN $1 AND $2
-            AND stratum = $3
-          `,
-          startGw,
-          endGw,
-          stratum,
-        );
+  const captainRows = await prisma.$queryRawUnsafe<
+    Array<{
+      gw: number;
+      captain_element: number;
+      captain_multiplier: number;
+      picks: number;
+    }>
+  >(
+    `
+    SELECT gw, captain_element, captain_multiplier, picks
+    FROM stratum_captain_picks_gw
+    WHERE gw BETWEEN $1 AND $2
+      AND stratum = $3
+    `,
+    startGw,
+    endGw,
+    stratum,
+  );
 
   for (const r of captainRows) {
     const sample = perGwSampleSize.get(r.gw) ?? 0;
@@ -286,59 +359,141 @@ export const fetchCaptainRatesInRankBand = async (
     ),
   );
   if (bands.length === 0) return { rates, perGwSampleSize };
-  const causalBand = `CASE WHEN mp.gw = 1 THEN 0 ELSE ${rankBandSqlCase(
+  const causalBand = `CASE WHEN sampled.gw = 1 THEN 0 ELSE ${rankBandSqlCase(
     "mh_previous.overall_rank",
   )} END`;
-
-  const sampleRows = await prisma.$queryRawUnsafe<
-    Array<{ rank_band: number; gw: number; sample_size: number }>
-  >(
-    `
-    SELECT (${causalBand})::int AS rank_band, mp.gw, COUNT(*)::int AS sample_size
-    FROM manager_picks mp
-    LEFT JOIN manager_history mh_previous
-      ON mh_previous.entry_id = mp.entry_id
-     AND mh_previous.gw = mp.gw - 1
-    WHERE mp.gw BETWEEN $1 AND $2
-      AND mp.captain_element IS NOT NULL
-      AND mp.captain_multiplier IS NOT NULL
-      AND (${causalBand}) = ANY($3::int[])
-    GROUP BY rank_band, mp.gw
-    `,
-    startGw,
-    endGw,
-    bands,
-  );
-  for (const r of sampleRows) {
-    if (comparisonBandByGw.get(r.gw) !== r.rank_band) continue;
-    perGwSampleSize.set(r.gw, r.sample_size);
-  }
 
   const captainRows = await prisma.$queryRawUnsafe<
     Array<{
       rank_band: number;
       gw: number;
       captain_element: number;
-      captain_multiplier: number;
-      picks: number;
+      sample_size: number;
+      cap_rate: number;
+      tc_rate: number;
     }>
   >(
     `
+    WITH same_gw_sampled_rows AS (
+      SELECT
+        mp.entry_id,
+        mp.gw,
+        mp.captain_element,
+        mp.captain_multiplier,
+        mp.sample_stratum
+      FROM manager_picks mp
+      WHERE mp.gw BETWEEN $1 AND $2
+        AND mp.captain_element IS NOT NULL
+        AND mp.captain_multiplier IS NOT NULL
+        AND mp.sampled_at_gw = mp.gw
+        AND mp.sample_stratum BETWEEN 1 AND 3
+    ),
+    sample_stratum_sizes AS (
+      SELECT
+        gw,
+        sample_stratum,
+        COUNT(*)::numeric AS sample_size
+      FROM same_gw_sampled_rows
+      GROUP BY gw, sample_stratum
+    ),
+    sample_stratum_population_grid AS (
+      SELECT
+        e.id AS gw,
+        source.sample_stratum,
+        CASE source.sample_stratum
+          WHEN 1 THEN LEAST(e.ranked_count, 10000)::numeric
+          WHEN 2 THEN GREATEST(LEAST(e.ranked_count, 100000) - 10000, 0)::numeric
+          ELSE GREATEST(e.ranked_count - 100000, 0)::numeric
+        END AS population
+      FROM events e
+      CROSS JOIN (VALUES (1), (2), (3)) AS source(sample_stratum)
+      WHERE e.id BETWEEN $1 AND $2
+    ),
+    sample_coverage AS (
+      SELECT
+        p.gw,
+        BOOL_AND(
+          p.population = 0 OR COALESCE(s.sample_size, 0) > 0
+        ) AS complete
+      FROM sample_stratum_population_grid p
+      LEFT JOIN sample_stratum_sizes s
+        ON s.gw = p.gw
+       AND s.sample_stratum = p.sample_stratum
+      GROUP BY p.gw
+    ),
+    sample_weights AS (
+      SELECT
+        p.gw,
+        p.sample_stratum,
+        p.population / s.sample_size AS sample_weight
+      FROM sample_stratum_population_grid p
+      JOIN sample_stratum_sizes s
+        ON s.gw = p.gw
+       AND s.sample_stratum = p.sample_stratum
+      JOIN sample_coverage c ON c.gw = p.gw AND c.complete
+      WHERE p.population > 0
+    ),
+    weighted_rows AS (
+      SELECT
+        (${causalBand})::int AS rank_band,
+        sampled.gw,
+        sampled.captain_element,
+        sampled.captain_multiplier,
+        weight.sample_weight
+      FROM same_gw_sampled_rows sampled
+      LEFT JOIN manager_history mh_previous
+        ON mh_previous.entry_id = sampled.entry_id
+       AND mh_previous.gw = sampled.gw - 1
+      JOIN sample_weights weight
+        ON weight.gw = sampled.gw
+       AND weight.sample_stratum = sampled.sample_stratum
+      WHERE (sampled.gw = 1 OR mh_previous.overall_rank > 0)
+        AND (${causalBand}) = ANY($3::int[])
+    ),
+    weighted_samples AS (
+      SELECT
+        rank_band,
+        gw,
+        GREATEST(
+          ROUND(
+            POWER(SUM(sample_weight), 2)
+              / NULLIF(SUM(sample_weight * sample_weight), 0)
+          )::int,
+          1
+        ) AS sample_size,
+        SUM(sample_weight)::numeric AS weighted_population
+      FROM weighted_rows
+      GROUP BY rank_band, gw
+    )
     SELECT
-      (${causalBand})::int AS rank_band,
-      mp.gw,
-      mp.captain_element,
-      mp.captain_multiplier,
-      COUNT(*)::int AS picks
-    FROM manager_picks mp
-    LEFT JOIN manager_history mh_previous
-      ON mh_previous.entry_id = mp.entry_id
-     AND mh_previous.gw = mp.gw - 1
-    WHERE mp.gw BETWEEN $1 AND $2
-      AND mp.captain_element IS NOT NULL
-      AND mp.captain_multiplier IS NOT NULL
-      AND (${causalBand}) = ANY($3::int[])
-    GROUP BY rank_band, mp.gw, mp.captain_element, mp.captain_multiplier
+      weighted.rank_band,
+      weighted.gw,
+      weighted.captain_element,
+      sample.sample_size,
+      (
+        COALESCE(
+          SUM(weighted.sample_weight)
+            FILTER (WHERE weighted.captain_multiplier = 2),
+          0
+        ) / sample.weighted_population
+      )::double precision AS cap_rate,
+      (
+        COALESCE(
+          SUM(weighted.sample_weight)
+            FILTER (WHERE weighted.captain_multiplier = 3),
+          0
+        ) / sample.weighted_population
+      )::double precision AS tc_rate
+    FROM weighted_rows weighted
+    JOIN weighted_samples sample
+      ON sample.rank_band = weighted.rank_band
+     AND sample.gw = weighted.gw
+    GROUP BY
+      weighted.rank_band,
+      weighted.gw,
+      weighted.captain_element,
+      sample.sample_size,
+      sample.weighted_population
     `,
     startGw,
     endGw,
@@ -347,17 +502,11 @@ export const fetchCaptainRatesInRankBand = async (
 
   for (const r of captainRows) {
     if (comparisonBandByGw.get(r.gw) !== r.rank_band) continue;
-    const sample = perGwSampleSize.get(r.gw) ?? 0;
-    if (sample === 0) continue;
-
-    const key = playerGwKey(r.captain_element, r.gw);
-    const existing = rates.get(key) ?? { cap_rate: 0, tc_rate: 0 };
-    if (r.captain_multiplier === 3) {
-      existing.tc_rate += r.picks / sample;
-    } else if (r.captain_multiplier === 2) {
-      existing.cap_rate += r.picks / sample;
-    }
-    rates.set(key, existing);
+    perGwSampleSize.set(r.gw, r.sample_size);
+    rates.set(playerGwKey(r.captain_element, r.gw), {
+      cap_rate: r.cap_rate,
+      tc_rate: r.tc_rate,
+    });
   }
 
   return { rates, perGwSampleSize };

@@ -9,8 +9,9 @@ import {
   type RankCurveStatus,
   type Stratum,
 } from "./rangeStats.js";
-import { pickRankBand, rankBandSqlCase, type RankBand } from "./rankBands.js";
+import { pickRankBand, type RankBand } from "./rankBands.js";
 import type { RankMovementEstimator } from "./rankMovement.js";
+import { fetchCaptainRatesInRankBand as fetchWeightedCaptainRatesInRankBand } from "./rankImpact.js";
 import { effectivePointExcess } from "./teamImpactCalc.js";
 
 // ----------------------------------------------------------------------------
@@ -587,102 +588,6 @@ const fetchCaptainRatesInStratum = async (
 
 type ComparisonRankBand = RankBand | 0;
 
-const fetchCaptainRatesInRankBand = async (
-  comparisonBandByGw: ReadonlyMap<number, ComparisonRankBand | null>,
-  startGw: number,
-  endGw: number,
-): Promise<{
-  rates: Map<string, { cap_rate: number; tc_rate: number }>;
-  perGwSampleSize: Map<number, number>;
-}> => {
-  const rates = new Map<string, { cap_rate: number; tc_rate: number }>();
-  const perGwSampleSize = new Map<number, number>();
-  const bands = Array.from(
-    new Set(
-      Array.from(comparisonBandByGw.values()).filter(
-        (band): band is ComparisonRankBand => band !== null,
-      ),
-    ),
-  );
-  if (bands.length === 0) return { rates, perGwSampleSize };
-
-  const causalBand = `CASE WHEN mp.gw = 1 THEN 0 ELSE ${rankBandSqlCase(
-    "mh_previous.overall_rank",
-  )} END`;
-
-  const sampleRows = await prisma.$queryRawUnsafe<
-    Array<{ rank_band: number; gw: number; sample_size: number }>
-  >(
-    `
-    SELECT
-      (${causalBand})::int AS rank_band,
-      mp.gw,
-      COUNT(*)::int AS sample_size
-    FROM manager_picks mp
-    LEFT JOIN manager_history mh_previous
-      ON mh_previous.entry_id = mp.entry_id
-     AND mh_previous.gw = mp.gw - 1
-    WHERE mp.gw BETWEEN $1 AND $2
-      AND mp.captain_element IS NOT NULL
-      AND mp.captain_multiplier IS NOT NULL
-      AND (${causalBand}) = ANY($3::int[])
-    GROUP BY rank_band, mp.gw
-    `,
-    startGw,
-    endGw,
-    bands,
-  );
-  for (const r of sampleRows) {
-    if (comparisonBandByGw.get(r.gw) !== r.rank_band) continue;
-    perGwSampleSize.set(r.gw, r.sample_size);
-  }
-
-  const captainRows = await prisma.$queryRawUnsafe<
-    Array<{
-      rank_band: number;
-      gw: number;
-      captain_element: number;
-      captain_multiplier: number;
-      n: number;
-    }>
-  >(
-    `
-    SELECT
-      (${causalBand})::int AS rank_band,
-      mp.gw,
-      mp.captain_element,
-      mp.captain_multiplier,
-      COUNT(*)::int AS n
-    FROM manager_picks mp
-    LEFT JOIN manager_history mh_previous
-      ON mh_previous.entry_id = mp.entry_id
-     AND mh_previous.gw = mp.gw - 1
-    WHERE mp.gw BETWEEN $1 AND $2
-      AND mp.captain_element IS NOT NULL
-      AND mp.captain_multiplier IS NOT NULL
-      AND (${causalBand}) = ANY($3::int[])
-    GROUP BY rank_band, mp.gw, mp.captain_element, mp.captain_multiplier
-    `,
-    startGw,
-    endGw,
-    bands,
-  );
-  for (const r of captainRows) {
-    if (comparisonBandByGw.get(r.gw) !== r.rank_band) continue;
-    const sample = perGwSampleSize.get(r.gw) ?? 0;
-    if (sample === 0) continue;
-    const key = `${r.captain_element}:${r.gw}`;
-    const existing = rates.get(key) ?? { cap_rate: 0, tc_rate: 0 };
-    if (r.captain_multiplier === 3) {
-      existing.tc_rate += r.n / sample;
-    } else if (r.captain_multiplier === 2) {
-      existing.cap_rate += r.n / sample;
-    }
-    rates.set(key, existing);
-  }
-  return { rates, perGwSampleSize };
-};
-
 type PlayerExposure = {
   ownership_pct: number;
   eo: number;
@@ -1196,7 +1101,7 @@ export const getTeamImpact = async (
   ] = await Promise.all([
     fetchFootballerInfo(elementIds),
     fetchPlayerGwStats(elementIds, startGw, endGw),
-    fetchCaptainRatesInRankBand(comparisonBandByGw, startGw, endGw),
+    fetchWeightedCaptainRatesInRankBand(comparisonBandByGw, startGw, endGw),
     fetchCaptainRatesInStratum(null, startGw, endGw),
     fetchPlayerExposureInRankBand(
       comparisonBandByGw,
