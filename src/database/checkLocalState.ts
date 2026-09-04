@@ -49,6 +49,24 @@ const main = async (): Promise<void> => {
     FROM manager_history
   `;
 
+  const historyRankCoverage = await prisma.$queryRaw<
+    Array<{
+      with_rank: bigint;
+      managers_pending_rank_backfill: bigint;
+    }>
+  >`
+    SELECT COUNT(overall_rank)::bigint AS with_rank,
+           COUNT(DISTINCT mh.entry_id) FILTER (
+             WHERE mh.overall_rank IS NULL
+               AND EXISTS (
+                 SELECT 1
+                 FROM manager_pick_elements mpe
+                 WHERE mpe.entry_id = mh.entry_id
+               )
+           )::bigint AS managers_pending_rank_backfill
+    FROM manager_history mh
+  `;
+
   const picks = await prisma.$queryRaw<
     Array<{
       rows: bigint;
@@ -209,6 +227,9 @@ const main = async (): Promise<void> => {
   console.info(
     `  ${history[0]?.rows ?? 0n} rows across ${history[0]?.managers ?? 0n} managers, ${history[0]?.gws ?? 0n} distinct GWs`,
   );
+  console.info(
+    `  with overall_rank: ${historyRankCoverage[0]?.with_rank ?? 0n}`,
+  );
 
   console.info("\nmanager_picks (captain / chip per GW for the sample):");
   console.info(
@@ -282,6 +303,9 @@ const main = async (): Promise<void> => {
     (acc, r) => acc + Number(r.rows),
     0,
   );
+  const pendingRankBackfill = Number(
+    historyRankCoverage[0]?.managers_pending_rank_backfill ?? 0n,
+  );
 
   if (cumRows === 0) {
     console.info(
@@ -333,9 +357,16 @@ const main = async (): Promise<void> => {
   }
 
   if (exposureBuckets === 0) {
-    console.info(
-      "  rank_band_player_exposure_gw empty - run `npm run backfill-comparison-picks` or `npm run rebuild-manager-read-models` after sample full-XV picks exist.",
-    );
+    if (pendingRankBackfill > 0) {
+      console.info(
+        `  rank_band_player_exposure_gw empty - ${pendingRankBackfill} managers with full-XV rows need per-GW rank backfill; run ` +
+          "`npm run backfill-manager-ranks`, then `npm run rebuild-manager-read-models`.",
+      );
+    } else {
+      console.info(
+        "  rank_band_player_exposure_gw empty - run `npm run backfill-comparison-picks` or `npm run rebuild-manager-read-models` after sample full-XV picks exist.",
+      );
+    }
   } else {
     console.info("  rank_band_player_exposure_gw populated.");
   }

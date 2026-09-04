@@ -141,14 +141,16 @@ const STRATUM_A_MAX = 10_000;
 const STRATUM_B_MAX = 100_000;
 
 // EO computed from sample is unstable below this many picks rows for a GW.
-// When triggered we drop captain/TC uplift and use global ownership only.
+// When triggered we fall back to official ownership plus population-weighted
+// captaincy, avoiding any post-GW rank cohort leakage or sample-density bias.
 const SMALL_SAMPLE_THRESHOLD = 50;
 
 // Rank-band captain samples are intentionally narrower than broad strata:
 // they approximate the "near you" cohort LiveFPL-style when full-XV EO is
 // unavailable. We accept a smaller denominator here because captaincy gives a
-// hard lower bound on active ownership, while using broad stratum 3 can wash a
-// 100k-250k manager into the whole tail and massively understate template EO.
+// hard lower bound on active ownership. If this is unavailable, the fallback is
+// the population-weighted full sample rather than the user's end-of-range
+// stratum, because that stratum may itself be the result of the player haul.
 const CAPTAIN_FALLBACK_SAMPLE_THRESHOLD = 10;
 
 // rangeDensityFromCumulative still supplies the display-only comparison
@@ -421,28 +423,119 @@ const fetchPlayerMatches = async (
   return map;
 };
 
-// Captain / TC rates per (player, gw) within stratum, served by the
-// pre-aggregated `stratum_captain_picks_gw` table (rebuilt at the end of
-// every populateManagers run via `rebuildStratumCaptainPicks`). Replaces
-// two GROUP-BYs over the full stratum slice of `manager_picks` — both
-// reads here are PK index lookups against ~17k rows total.
-//
-// Returns rates keyed `${player_id}:${gw}` plus per-GW active sample size.
+type CaptainRateInfo = {
+  rates: Map<string, { cap_rate: number; tc_rate: number }>;
+  perGwSampleSize: Map<number, number>;
+};
+
+type StratumCaptainAggregate = {
+  gw: number;
+  stratum: 1 | 2 | 3;
+  captain_element: number;
+  captain_multiplier: number;
+  n: number;
+  ranked_count: number;
+};
+
+const stratumPopulation = (stratum: 1 | 2 | 3, rankedCount: number): number => {
+  if (stratum === 1) return Math.min(rankedCount, STRATUM_A_MAX);
+  if (stratum === 2) {
+    return Math.max(Math.min(rankedCount, STRATUM_B_MAX) - STRATUM_A_MAX, 0);
+  }
+  return Math.max(rankedCount - STRATUM_B_MAX, 0);
+};
+
+// A plain union of the samples would heavily over-represent the top 100k:
+// those strata are close to a census while the multi-million-manager tail is
+// sampled. Weight each stratum's captain rate by its real GW population.
+export const populationWeightedCaptainInfo = (
+  rows: ReadonlyArray<StratumCaptainAggregate>,
+): CaptainRateInfo => {
+  const rates = new Map<string, { cap_rate: number; tc_rate: number }>();
+  const perGwSampleSize = new Map<number, number>();
+  const rankedCountByGw = new Map<number, number>();
+  const sampleByGwStratum = new Map<string, number>();
+
+  for (const row of rows) {
+    rankedCountByGw.set(
+      row.gw,
+      Math.max(rankedCountByGw.get(row.gw) ?? 0, row.ranked_count),
+    );
+    const sampleKey = `${row.gw}:${row.stratum}`;
+    sampleByGwStratum.set(
+      sampleKey,
+      (sampleByGwStratum.get(sampleKey) ?? 0) + row.n,
+    );
+  }
+
+  for (const [gw, rankedCount] of rankedCountByGw) {
+    if (rankedCount <= 0) continue;
+    const representedSamples = ([1, 2, 3] as const)
+      .filter((stratum) => stratumPopulation(stratum, rankedCount) > 0)
+      .map((stratum) => sampleByGwStratum.get(`${gw}:${stratum}`) ?? 0);
+    const leastRepresentedSample = Math.min(...representedSamples);
+    if (leastRepresentedSample > 0) {
+      // The weakest represented stratum controls whether this weighted rate
+      // is reliable enough for exposureForPlayerGw's small-sample gate.
+      perGwSampleSize.set(gw, leastRepresentedSample);
+    }
+  }
+
+  for (const row of rows) {
+    if (!perGwSampleSize.has(row.gw) || row.ranked_count <= 0) continue;
+    const sample = sampleByGwStratum.get(`${row.gw}:${row.stratum}`) ?? 0;
+    if (sample <= 0) continue;
+    const population = stratumPopulation(row.stratum, row.ranked_count);
+    if (population <= 0) continue;
+
+    const contribution = (row.n / sample) * (population / row.ranked_count);
+    const key = `${row.captain_element}:${row.gw}`;
+    const existing = rates.get(key) ?? { cap_rate: 0, tc_rate: 0 };
+    if (row.captain_multiplier === 3) {
+      existing.tc_rate += contribution;
+    } else if (row.captain_multiplier === 2) {
+      existing.cap_rate += contribution;
+    }
+    rates.set(key, existing);
+  }
+
+  return { rates, perGwSampleSize };
+};
+
+// Captain / TC rates per (player, gw), optionally within a broad stratum,
+// served by the pre-aggregated `stratum_captain_picks_gw` table (rebuilt at
+// the end of every populateManagers run via `rebuildStratumCaptainPicks`).
+// Passing null returns population-weighted rates across all three strata.
 const fetchCaptainRatesInStratum = async (
   stratum: number | null,
   startGw: number,
   endGw: number,
-): Promise<{
-  rates: Map<string, { cap_rate: number; tc_rate: number }>;
-  perGwSampleSize: Map<number, number>;
-}> => {
+): Promise<CaptainRateInfo> => {
+  if (stratum === null) {
+    const rows = await prisma.$queryRawUnsafe<StratumCaptainAggregate[]>(
+      `
+      SELECT
+        sc.gw,
+        sc.stratum,
+        sc.captain_element,
+        sc.captain_multiplier,
+        sc.picks AS n,
+        e.ranked_count
+      FROM stratum_captain_picks_gw sc
+      JOIN events e ON e.id = sc.gw
+      WHERE sc.gw BETWEEN $1 AND $2
+      `,
+      startGw,
+      endGw,
+    );
+    return populationWeightedCaptainInfo(rows);
+  }
+
   const rates = new Map<string, { cap_rate: number; tc_rate: number }>();
   const perGwSampleSize = new Map<number, number>();
-  if (stratum === null) return { rates, perGwSampleSize };
 
-  // Sample size per GW = sum of picks (across all captain/multiplier
-  // combos) for that stratum and GW. The full sample is used now —
-  // there is no longer a separate active subset.
+  // Sample size per GW = sum of picks across all captain/multiplier combos.
+  // The full sample is used now; there is no longer a separate active subset.
   const sampleRows = await prisma.$queryRawUnsafe<
     Array<{ gw: number; sample_size: number }>
   >(
@@ -928,7 +1021,7 @@ const globalOwnershipPct = (stat: PerGwPlayerStat | undefined): number =>
     ? Math.min(stat.selected / stat.ranked_count, 1)
     : 0;
 
-const exposureForPlayerGw = (
+export const exposureForPlayerGw = (
   playerId: number,
   gw: number,
   stat: PerGwPlayerStat | undefined,
@@ -940,7 +1033,7 @@ const exposureForPlayerGw = (
     rates: Map<string, { cap_rate: number; tc_rate: number }>;
     perGwSampleSize: Map<number, number>;
   },
-  stratumCapInfo: {
+  fallbackCapInfo: {
     rates: Map<string, { cap_rate: number; tc_rate: number }>;
     perGwSampleSize: Map<number, number>;
   },
@@ -976,13 +1069,13 @@ const exposureForPlayerGw = (
   }
   const rankBandCap = rankBandCapInfo.rates.get(key);
   const rankBandCapSample = rankBandCapInfo.perGwSampleSize.get(gw) ?? 0;
-  const stratumCap = stratumCapInfo.rates.get(key);
-  const stratumCapSample = stratumCapInfo.perGwSampleSize.get(gw) ?? 0;
+  const fallbackCap = fallbackCapInfo.rates.get(key);
+  const fallbackCapSample = fallbackCapInfo.perGwSampleSize.get(gw) ?? 0;
   const cap =
     rankBandCapSample >= CAPTAIN_FALLBACK_SAMPLE_THRESHOLD && rankBandCap
       ? rankBandCap
-      : stratumCapSample >= SMALL_SAMPLE_THRESHOLD
-        ? stratumCap
+      : fallbackCapSample >= SMALL_SAMPLE_THRESHOLD
+        ? fallbackCap
         : undefined;
 
   if (cap) {
@@ -990,7 +1083,9 @@ const exposureForPlayerGw = (
     // captain/TC rates from `manager_picks`. A manager can only captain the
     // player if they actively own him, so captain_rate + triple_captain_rate is
     // a lower bound for cohort ownership. Prefer rank-band captaincy for
-    // "near you" EO, then fall back to the broader stratum sample.
+    // "near you" EO, then fall back to the population-weighted sample. Do not
+    // fall back to the user's current/end stratum here: early-season hauls can
+    // create that stratum membership, which would hide their own rank impact.
     const captainOwnedPct = cap.cap_rate + cap.tc_rate;
     const activeOwnershipPct = Math.max(ownershipPct, captainOwnedPct);
     return {
@@ -1094,7 +1189,7 @@ export const getTeamImpact = async (
     infoMap,
     statsMap,
     rankBandCapInfo,
-    stratumCapInfo,
+    fallbackCapInfo,
     exposureInfo,
     rankInfo,
     ownedMatchesMap,
@@ -1102,7 +1197,7 @@ export const getTeamImpact = async (
     fetchFootballerInfo(elementIds),
     fetchPlayerGwStats(elementIds, startGw, endGw),
     fetchCaptainRatesInRankBand(comparisonBandByGw, startGw, endGw),
-    fetchCaptainRatesInStratum(stratum, startGw, endGw),
+    fetchCaptainRatesInStratum(null, startGw, endGw),
     fetchPlayerExposureInRankBand(
       comparisonBandByGw,
       elementIds,
@@ -1152,7 +1247,7 @@ export const getTeamImpact = async (
       stat,
       exposureInfo,
       rankBandCapInfo,
-      stratumCapInfo,
+      fallbackCapInfo,
     );
     const ownershipPct = exposure.ownershipPct;
     const eo = exposure.eo;
@@ -1304,7 +1399,7 @@ export const getTeamImpact = async (
         stat,
         killerExposureInfo,
         rankBandCapInfo,
-        stratumCapInfo,
+        fallbackCapInfo,
       );
       const ownershipPct = exposure.ownershipPct;
       const eo = exposure.eo;
