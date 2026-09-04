@@ -333,6 +333,24 @@ const getCurrentSampleGameweek = async (): Promise<SampleGameweek> => {
   };
 };
 
+export const shouldResetCurrentGwSample = ({
+  sampleGw,
+  currentGw,
+  isLiveCurrentGw,
+  sampleGwFinalized,
+  sampleGwCleaned,
+}: {
+  sampleGw: number;
+  currentGw: number;
+  isLiveCurrentGw: boolean;
+  sampleGwFinalized: number;
+  sampleGwCleaned: number;
+}): boolean =>
+  sampleGw !== currentGw ||
+  (!isLiveCurrentGw &&
+    (sampleGwFinalized === 0 ||
+      (sampleGwFinalized === 2 && sampleGwCleaned !== currentGw)));
+
 const MAX_PER_CALL_RETRIES = 4;
 
 const withGovernor = async <T>(
@@ -1590,22 +1608,26 @@ export const populateManagers = async (
     const sampleGw = await readIntCursor(SAMPLE_GW_KEY, 0);
     const sampleGwFinalized = await readIntCursor(SAMPLE_GW_FINALIZED_KEY, 0);
     const sampleGwCleaned = await readIntCursor(SAMPLE_GW_CLEANED_KEY, 0);
+    // Always clear a newly entered GW before sampling it. Besides removing
+    // any user-lazy rows fetched before this cron pass, this prevents an old
+    // season's same-numbered GW cache from being treated as current data.
     // Live-GW rows are partial. Once that same GW becomes finished, drop
     // the partial current-GW sample and rebuild it from finalized FPL data.
-    const needsFinishedSampleReset =
-      !isLiveCurrentGw &&
-      (sampleGw !== currentGw ||
-        sampleGwFinalized === 0 ||
-        (sampleGwFinalized === 2 && sampleGwCleaned !== currentGw));
+    const needsCurrentGwSampleReset = shouldResetCurrentGwSample({
+      sampleGw,
+      currentGw,
+      isLiveCurrentGw,
+      sampleGwFinalized,
+      sampleGwCleaned,
+    });
     if (
       cursorVersion < CURRENT_CURSOR_FORMAT_VERSION ||
-      sampleGw !== currentGw ||
-      needsFinishedSampleReset
+      needsCurrentGwSampleReset
     ) {
       console.info(
         `[populateManagers] Cursor format ${cursorVersion} → ${CURRENT_CURSOR_FORMAT_VERSION}: resetting walk cursors.`,
       );
-      if (needsFinishedSampleReset) {
+      if (needsCurrentGwSampleReset) {
         await clearCurrentGwSampleRows(currentGw);
         await writeIntCursor(SAMPLE_GW_CLEANED_KEY, currentGw);
       }

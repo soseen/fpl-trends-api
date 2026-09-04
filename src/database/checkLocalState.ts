@@ -83,11 +83,19 @@ const main = async (): Promise<void> => {
   `;
 
   const pickElements = await prisma.$queryRaw<
-    Array<{ rows: bigint; managers: bigint; gws: bigint }>
+    Array<{
+      rows: bigint;
+      managers: bigint;
+      gws: bigint;
+      stale_future_rows: bigint;
+    }>
   >`
     SELECT COUNT(*)::bigint AS rows,
            COUNT(DISTINCT entry_id)::bigint AS managers,
-           COUNT(DISTINCT gw)::bigint AS gws
+           COUNT(DISTINCT gw)::bigint AS gws,
+           COUNT(*) FILTER (
+             WHERE gw > COALESCE((SELECT MAX(id) FROM events), 0)
+           )::bigint AS stale_future_rows
     FROM manager_pick_elements
   `;
 
@@ -243,6 +251,9 @@ const main = async (): Promise<void> => {
   console.info(
     `  ${pickElements[0]?.rows ?? 0n} rows across ${pickElements[0]?.managers ?? 0n} managers, ${pickElements[0]?.gws ?? 0n} distinct GWs`,
   );
+  console.info(
+    `  rows beyond current season GW: ${pickElements[0]?.stale_future_rows ?? 0n}`,
+  );
 
   console.info(
     "\nmanager_cumulative (running totals — the comparison hot path):",
@@ -306,6 +317,7 @@ const main = async (): Promise<void> => {
   const pendingRankBackfill = Number(
     historyRankCoverage[0]?.managers_pending_rank_backfill ?? 0n,
   );
+  const staleFuturePickRows = Number(pickElements[0]?.stale_future_rows ?? 0n);
 
   if (cumRows === 0) {
     console.info(
@@ -335,6 +347,12 @@ const main = async (): Promise<void> => {
     );
   } else {
     console.info("  ✅ manager_picks reasonably covered.");
+  }
+
+  if (staleFuturePickRows > 0) {
+    console.info(
+      `  WARNING manager_pick_elements contains ${staleFuturePickRows} rows beyond the current season GW; remove them before they can affect live EO.`,
+    );
   }
 
   const sparseChipStrata = summary.filter(
