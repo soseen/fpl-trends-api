@@ -7,6 +7,7 @@ import {
   fetchPlayerGwRankStats,
   ownershipPct,
   playerGwKey,
+  rankImpactForPoints,
   resolveRankImpactContext,
   SMALL_CAPTAIN_SAMPLE_THRESHOLD,
 } from "./rankImpact.js";
@@ -105,6 +106,8 @@ export type CaptainImpactResponse = {
   total_expected_captain_bonus: number | null;
   total_captaincy_excess: number | null;
   total_rank_impact: number | null;
+  total_rank_impact_vs_template: number | null;
+  total_rank_impact_vs_top10k: number | null;
   matched_template_count: number; // GWs where user captained the template
   matched_top10k_count: number; // GWs where user captained the top-10k
   total_with_captain: number; // GWs in range where user had a captain
@@ -411,6 +414,8 @@ export const getCaptainImpact = async (
       total_expected_captain_bonus: null,
       total_captaincy_excess: null,
       total_rank_impact: null,
+      total_rank_impact_vs_template: null,
+      total_rank_impact_vs_top10k: null,
       matched_template_count: 0,
       matched_top10k_count: 0,
       total_with_captain: 0,
@@ -610,6 +615,28 @@ export const getCaptainImpact = async (
     total_expected_captain_bonus: totalExpectedCaptainBonus,
     total_captaincy_excess: totalCaptaincyExcess,
     total_rank_impact: totalRankImpact,
+    // Compare only GWs with a recorded reference captain. Keep the same
+    // weighted captain points as the summary totals and use the rank curve
+    // for the whole range rather than summing per-GW rank estimates.
+    total_rank_impact_vs_template: events.some((e) => e.template_captain)
+      ? rankImpactForPoints(
+          rankContext,
+          events.reduce(
+            (sum, e) =>
+              sum + (e.template_captain ? e.differential_vs_template : 0),
+            0,
+          ),
+        )
+      : null,
+    total_rank_impact_vs_top10k: events.some((e) => e.top10k_captain)
+      ? rankImpactForPoints(
+          rankContext,
+          events.reduce(
+            (sum, e) => sum + (e.top10k_captain ? e.differential_vs_top10k : 0),
+            0,
+          ),
+        )
+      : null,
     matched_template_count: matchedTemplateCount,
     matched_top10k_count: matchedTop10kCount,
     total_with_captain: events.length,
