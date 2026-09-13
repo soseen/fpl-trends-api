@@ -615,27 +615,13 @@ export const getCaptainImpact = async (
     total_expected_captain_bonus: totalExpectedCaptainBonus,
     total_captaincy_excess: totalCaptaincyExcess,
     total_rank_impact: totalRankImpact,
-    // Compare only GWs with a recorded reference captain. Keep the same
-    // weighted captain points as the summary totals and use the rank curve
-    // for the whole range rather than summing per-GW rank estimates.
+    // Use exactly the displayed points differences so points and rank
+    // comparisons stay consistent even when reference captains are missing.
     total_rank_impact_vs_template: events.some((e) => e.template_captain)
-      ? rankImpactForPoints(
-          rankContext,
-          events.reduce(
-            (sum, e) =>
-              sum + (e.template_captain ? e.differential_vs_template : 0),
-            0,
-          ),
-        )
+      ? rankImpactForPoints(rankContext, totalUser - totalTemplate)
       : null,
     total_rank_impact_vs_top10k: events.some((e) => e.top10k_captain)
-      ? rankImpactForPoints(
-          rankContext,
-          events.reduce(
-            (sum, e) => sum + (e.top10k_captain ? e.differential_vs_top10k : 0),
-            0,
-          ),
-        )
+      ? rankImpactForPoints(rankContext, totalUser - totalTop10k)
       : null,
     matched_template_count: matchedTemplateCount,
     matched_top10k_count: matchedTop10kCount,
