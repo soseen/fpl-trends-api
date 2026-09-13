@@ -1,4 +1,5 @@
-import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
+import { fetchLiveManagerHistory } from "./liveManagerHistory.js";
+import { fetchEntrySummary } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import {
   estimateRangeRankFromBuckets,
@@ -52,7 +53,7 @@ export const getRangeRank = async (
 ): Promise<RangeRankResponse> => {
   const [summary, history] = await Promise.all([
     fetchEntrySummary(entryId),
-    fetchEntryHistory(entryId),
+    fetchLiveManagerHistory(entryId),
   ]);
 
   const allEvents = history.current ?? [];

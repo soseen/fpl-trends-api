@@ -1,4 +1,5 @@
-import { fetchEntryHistory } from "./fetchManager.js";
+import { fetchLiveManagerHistory } from "./liveManagerHistory.js";
+
 import { netPointsForEvent } from "./activityFilter.js";
 
 export type ManagerTrajectoryPoint = {
@@ -25,7 +26,7 @@ export type ManagerTrajectoryResponse = {
 export const getManagerTrajectory = async (
   entryId: number,
 ): Promise<ManagerTrajectoryResponse> => {
-  const history = await fetchEntryHistory(entryId);
+  const history = await fetchLiveManagerHistory(entryId);
   const events = history.current ?? [];
   return {
     entry_id: entryId,

@@ -1,3 +1,4 @@
+import { rankedPopulationSql } from "./rankedPopulation.js";
 import { prisma } from "../database/client.js";
 import {
   createRankMovementEstimator,
@@ -19,15 +20,17 @@ export const stratumCMax = async (): Promise<number> => {
   const row = await prisma.events.aggregate({
     _max: { ranked_count: true },
   });
-  return row._max.ranked_count ?? STRATUM_C_MAX_FALLBACK;
+  return row._max.ranked_count && row._max.ranked_count > 0
+    ? row._max.ranked_count
+    : STRATUM_C_MAX_FALLBACK;
 };
 
 export const rankedCountForGw = async (gw: number): Promise<number | null> => {
-  const ev = await prisma.events.findUnique({
-    where: { id: gw },
-    select: { ranked_count: true },
-  });
-  return ev?.ranked_count ?? null;
+  const rows = await prisma.$queryRawUnsafe<Array<{ population: number }>>(
+    `SELECT ${rankedPopulationSql("e")} AS population FROM events e WHERE e.id = $1`,
+    gw,
+  );
+  return rows[0]?.population ?? null;
 };
 
 const readIntMetadata = async (
@@ -328,7 +331,7 @@ const recentManagerSampleCurve = async (
 export const overallRankMovementCurve = async (
   endGw: number,
 ): Promise<RankMovementCurve> => {
-  const [snapshot, event] = await Promise.all([
+  const [snapshot, event, population] = await Promise.all([
     prisma.overall_rank_curve_snapshots.findUnique({
       where: { gw: endGw },
       include: { points: { orderBy: { score: "asc" } } },
@@ -337,9 +340,12 @@ export const overallRankMovementCurve = async (
       where: { id: endGw },
       select: { finished: true, is_current: true },
     }),
+    rankedCountForGw(endGw),
   ]);
 
-  if (snapshot) {
+  // Previously published live curves may have been truncated to 100k by
+  // FPL's zero count. Do not extrapolate every ordinary manager to that tail.
+  if (snapshot && snapshot.max_rank >= Math.floor((population ?? 0) * 0.9)) {
     const estimator = createRankMovementEstimator(snapshot.points);
     if (estimator !== null) {
       const ageMs = Date.now() - snapshot.captured_at.getTime();

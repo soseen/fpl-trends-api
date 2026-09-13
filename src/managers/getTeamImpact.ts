@@ -1,5 +1,7 @@
+import { fetchLiveManagerHistory } from "./liveManagerHistory.js";
+import { rankedPopulationSql } from "./rankedPopulation.js";
 import { prisma } from "../database/client.js";
-import { fetchEntrySummary, fetchEntryHistory } from "./fetchManager.js";
+import { fetchEntrySummary } from "./fetchManager.js";
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks } from "./resolvePicks.js";
 import {
@@ -257,7 +259,7 @@ const fetchPlayerGwStats = async (
       h.round,
       SUM(h.total_points)::int AS total_points,
       MAX(h.selected)::int AS selected,
-      COALESCE(MAX(e.ranked_count), 0)::int AS ranked_count,
+      COALESCE(MAX(${rankedPopulationSql("e")}), 0)::int AS ranked_count,
       SUM(h.goals_scored)::int AS goals,
       SUM(h.assists)::int AS assists,
       SUM(h.clean_sheets)::int AS clean_sheets,
@@ -329,7 +331,7 @@ const fetchAllPlayerGwStats = async (
       h.round,
       SUM(h.total_points)::int AS total_points,
       MAX(h.selected)::int AS selected,
-      COALESCE(MAX(e.ranked_count), 0)::int AS ranked_count,
+      COALESCE(MAX(${rankedPopulationSql("e")}), 0)::int AS ranked_count,
       SUM(h.goals_scored)::int AS goals,
       SUM(h.assists)::int AS assists,
       SUM(h.clean_sheets)::int AS clean_sheets,
@@ -521,7 +523,7 @@ const fetchCaptainRatesInStratum = async (
         sc.captain_element,
         sc.captain_multiplier,
         sc.picks AS n,
-        e.ranked_count
+        ${rankedPopulationSql("e")} AS ranked_count
       FROM stratum_captain_picks_gw sc
       JOIN events e ON e.id = sc.gw
       WHERE sc.gw BETWEEN $1 AND $2
@@ -1015,7 +1017,7 @@ export const getTeamImpact = async (
   // Upfront fetches. summary and history come from FPL; events from our DB.
   const [summary, history, events] = await Promise.all([
     fetchEntrySummary(entryId),
-    fetchEntryHistory(entryId),
+    fetchLiveManagerHistory(entryId),
     prisma.events.findMany({
       where: { id: { gte: startGw, lte: endGw } },
       select: { id: true },

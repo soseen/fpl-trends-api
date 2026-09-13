@@ -303,6 +303,10 @@ const loadComparisonCohorts = async (
 ): Promise<ComparisonCohorts> => {
   const expectedGws = endGw - startGw + 1;
   const cohortGw = comparisonCohortGw(startGw, endGw);
+  const cohortRank = `COALESCE(
+    CASE WHEN NOT cohort_event.data_checked AND ms.last_checked_gw = $3
+      THEN ms.overall_rank END, cohort_rank.overall_rank
+  )`;
   const [rawRows, captainRows, trueSizes] = await Promise.all([
     prisma.$queryRawUnsafe<CohortRow[]>(
       `
@@ -310,23 +314,28 @@ const loadComparisonCohorts = async (
         SELECT
           c_end.entry_id,
           CASE
-            WHEN cohort_rank.overall_rank BETWEEN 1 AND 10000 THEN 1
-            WHEN cohort_rank.overall_rank BETWEEN 10001 AND 100000 THEN 2
-            WHEN cohort_rank.overall_rank > 100000 THEN 3
+            WHEN ${cohortRank} BETWEEN 1 AND 10000 THEN 1
+            WHEN ${cohortRank} BETWEEN 10001 AND 100000 THEN 2
+            WHEN ${cohortRank} > 100000 THEN 3
             ELSE NULL
           END::int AS stratum,
           c_end.cumulative_captain_bonus
             - COALESCE(c_start.cumulative_captain_bonus, 0) AS captain_bonus,
           c_end.picks_count_cum - COALESCE(c_start.picks_count_cum, 0) AS pick_gws,
-          ms.has_chip_history
+          ms.has_chip_history,
+          CASE WHEN NOT range_end_event.data_checked AND ms.last_checked_gw = $2
+            THEN ms.total_points - COALESCE(c_start.cumulative_points, 0)
+          END AS live_range_points
         FROM manager_cumulative c_end
         JOIN manager_summary ms ON ms.entry_id = c_end.entry_id
         LEFT JOIN manager_cumulative c_start
           ON c_start.entry_id = c_end.entry_id AND c_start.gw = $1 - 1
         JOIN manager_history cohort_rank
           ON cohort_rank.entry_id = c_end.entry_id AND cohort_rank.gw = $3
+        JOIN events cohort_event ON cohort_event.id = $3
+        JOIN events range_end_event ON range_end_event.id = $2
         WHERE c_end.gw = $2
-          AND cohort_rank.overall_rank > 0
+          AND ${cohortRank} > 0
       ), range_history AS (
         SELECT
           mh.entry_id,
@@ -370,7 +379,7 @@ const loadComparisonCohorts = async (
       SELECT
         c.stratum,
         COUNT(*)::bigint AS sample_size,
-        SUM(r.points)::bigint AS sum_points,
+        SUM(COALESCE(c.live_range_points, r.points))::bigint AS sum_points,
         SUM(r.played_gws)::bigint AS sum_gws,
         COUNT(*) FILTER (WHERE r.transfer_gws = $4)::bigint AS complete_transfers,
         SUM(r.transfers) FILTER (WHERE r.transfer_gws = $4)::bigint
@@ -411,15 +420,16 @@ const loadComparisonCohorts = async (
         SELECT
           ms.entry_id,
           CASE
-            WHEN mh.overall_rank BETWEEN 1 AND 10000 THEN 1
-            WHEN mh.overall_rank BETWEEN 10001 AND 100000 THEN 2
-            WHEN mh.overall_rank > 100000 THEN 3
+            WHEN ${cohortRank} BETWEEN 1 AND 10000 THEN 1
+            WHEN ${cohortRank} BETWEEN 10001 AND 100000 THEN 2
+            WHEN ${cohortRank} > 100000 THEN 3
             ELSE NULL
           END::int AS stratum
         FROM manager_summary ms
-        JOIN manager_history mh
-          ON mh.entry_id = ms.entry_id AND mh.gw = $3
-        WHERE mh.overall_rank > 0
+        JOIN manager_history cohort_rank
+          ON cohort_rank.entry_id = ms.entry_id AND cohort_rank.gw = $3
+        JOIN events cohort_event ON cohort_event.id = $3
+        WHERE ${cohortRank} > 0
       ), grouped AS (
         SELECT
           c.stratum,

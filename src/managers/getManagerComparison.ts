@@ -1,10 +1,12 @@
+import { fetchLiveManagerHistory } from "./liveManagerHistory.js";
 import { prisma } from "../database/client.js";
-import { fetchEntryHistory } from "./fetchManager.js";
+
 import { netPointsForEvent } from "./activityFilter.js";
 import { resolvePicks, captainPicksFromResolved } from "./resolvePicks.js";
 import { computeUserTransferNet } from "./getManagerTransfers.js";
 import { sampleAvgPtsPerTransfer } from "./transferImpactCalc.js";
 import { getComparisonCohorts } from "./comparisonCohorts.js";
+import { rankedCountForGw } from "./rangeStats.js";
 
 type ChipPlay = { chip_name: string; num_played: number };
 
@@ -72,6 +74,7 @@ export type ManagerComparisonResponse = {
   // value is a player name, not a numeric stat.
   most_captained: CaptainSummary;
   notes: {
+    provisional: boolean;
     hits_average_partial: boolean;
     bench_average_partial: boolean;
     captain_average_partial: boolean;
@@ -627,7 +630,7 @@ export const getManagerComparison = async (
   startGw: number,
   endGw: number,
 ): Promise<ManagerComparisonResponse> => {
-  const history = await fetchEntryHistory(entryId);
+  const history = await fetchLiveManagerHistory(entryId);
 
   const eventsInRange = history.current.filter(
     (ev) => ev.event >= startGw && ev.event <= endGw,
@@ -679,6 +682,7 @@ export const getManagerComparison = async (
       transfers_made: true,
       ranked_count: true,
       chip_plays: true,
+      data_checked: true,
     },
   });
   const ingestedGws = events.map((e) => e.id).sort((a, b) => a - b);
@@ -695,16 +699,23 @@ export const getManagerComparison = async (
   let avgTripleCaptainH2Rate = 0;
 
   for (const ev of events) {
-    avgTotalPoints += ev.average_entry_score;
-    if (ev.ranked_count > 0) {
-      avgTransfersTotal += ev.transfers_made / ev.ranked_count;
+    const population =
+      ev.ranked_count > 0
+        ? ev.ranked_count
+        : ((await rankedCountForGw(ev.id)) ?? 0);
+    const liveCohort = !ev.data_checked
+      ? await getComparisonCohorts(ev.id, ev.id)
+      : null;
+    avgTotalPoints +=
+      liveCohort?.average.avg_total_points ?? ev.average_entry_score;
+    if (population > 0) {
+      avgTransfersTotal += ev.transfers_made / population;
       const cp = ev.chip_plays as ChipPlay[] | null;
       const isH1 = ev.id <= 19;
-      const wcRate = sumChipPlays(cp, CHIP_NAME_WILDCARD) / ev.ranked_count;
-      const fhRate = sumChipPlays(cp, CHIP_NAME_FREEHIT) / ev.ranked_count;
-      const bbRate = sumChipPlays(cp, CHIP_NAME_BBOOST) / ev.ranked_count;
-      const tcRate =
-        sumChipPlays(cp, CHIP_NAME_TRIPLE_CAPTAIN) / ev.ranked_count;
+      const wcRate = sumChipPlays(cp, CHIP_NAME_WILDCARD) / population;
+      const fhRate = sumChipPlays(cp, CHIP_NAME_FREEHIT) / population;
+      const bbRate = sumChipPlays(cp, CHIP_NAME_BBOOST) / population;
+      const tcRate = sumChipPlays(cp, CHIP_NAME_TRIPLE_CAPTAIN) / population;
       if (isH1) {
         avgWildcardH1Rate += wcRate;
         avgFreeHitH1Rate += fhRate;
@@ -945,6 +956,7 @@ export const getManagerComparison = async (
       top10k_player_name: top10kMostName,
     },
     notes: {
+      provisional: events.some((event) => !event.data_checked),
       hits_average_partial:
         avgHits !== null && activeAgg.with_hits_data < activeAgg.sample_size,
       bench_average_partial:

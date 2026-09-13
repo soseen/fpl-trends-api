@@ -11,6 +11,17 @@ export const insertEvents = async () => {
       ? JSON.parse(fs.readFileSync(RAW_BOOTSTRAP_STATIC_FILE, "utf8"))
       : {};
 
+    if (rawData.total_players > 0) {
+      await prisma.app_metadata.upsert({
+        where: { key: "current_total_players" },
+        update: { value: String(rawData.total_players) },
+        create: {
+          key: "current_total_players",
+          value: String(rawData.total_players),
+        },
+      });
+    }
+
     for (const event of rawData.events) {
       if (!event.finished && !event.is_current) break;
       await prisma.events.upsert({

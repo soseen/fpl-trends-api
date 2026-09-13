@@ -1,6 +1,6 @@
 import { prisma } from "../database/client.js";
 import { resolveTransfers, type TransferRow } from "./resolveTransfers.js";
-import { fetchEntryHistory } from "./fetchManager.js";
+import { fetchLiveManagerHistory } from "./liveManagerHistory.js";
 import {
   readPersistedPicks,
   resolvePicks,
@@ -653,7 +653,7 @@ export const getManagerTransfers = async (
   const [resolved, history, resolvedRequiredPicks, historicalPicks] =
     await Promise.all([
       resolveTransfers(entryId, true),
-      fetchEntryHistory(entryId),
+      fetchLiveManagerHistory(entryId),
       resolvePicks(entryId, requiredPicksRange),
       startGw > 1
         ? readPersistedPicks(entryId, 1, startGw - 1)

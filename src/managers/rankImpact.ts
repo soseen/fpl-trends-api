@@ -1,7 +1,9 @@
+import { fetchLiveManagerHistory } from "./liveManagerHistory.js";
+import { rankedPopulationSql } from "./rankedPopulation.js";
 import { prisma } from "../database/client.js";
 import type { PlayerHistory } from "../types.js";
 import { netPointsForEvent } from "./activityFilter.js";
-import { fetchEntryHistory, fetchEntrySummary } from "./fetchManager.js";
+import { fetchEntrySummary } from "./fetchManager.js";
 import {
   overallRankMovementEstimator,
   pickStratum,
@@ -57,7 +59,7 @@ export const resolveRankImpactContext = async (
 ): Promise<RankImpactContext> => {
   const [summary, resolvedHistory, cMax] = await Promise.all([
     fetchEntrySummary(entryId),
-    history ? Promise.resolve(history) : fetchEntryHistory(entryId),
+    history ? Promise.resolve(history) : fetchLiveManagerHistory(entryId),
     stratumCMax(),
   ]);
 
@@ -152,7 +154,7 @@ export const fetchPlayerGwRankStats = async (
       h.round,
       SUM(h.total_points)::int AS total_points,
       MAX(h.selected)::int AS selected,
-      COALESCE(MAX(e.ranked_count), 0)::int AS ranked_count
+      COALESCE(MAX(${rankedPopulationSql("e")}), 0)::int AS ranked_count
     FROM history h
     LEFT JOIN events e ON e.id = h.round
     WHERE h.footballer_id = ANY($1::int[])
@@ -204,9 +206,9 @@ export const fetchCaptainRatesInStratum = async (
           e.id AS gw,
           source.stratum,
           CASE source.stratum
-            WHEN 1 THEN LEAST(e.ranked_count, 10000)::numeric
-            WHEN 2 THEN GREATEST(LEAST(e.ranked_count, 100000) - 10000, 0)::numeric
-            ELSE GREATEST(e.ranked_count - 100000, 0)::numeric
+            WHEN 1 THEN LEAST(${rankedPopulationSql("e")}, 10000)::numeric
+            WHEN 2 THEN GREATEST(LEAST(${rankedPopulationSql("e")}, 100000) - 10000, 0)::numeric
+            ELSE GREATEST(${rankedPopulationSql("e")} - 100000, 0)::numeric
           END AS population
         FROM events e
         CROSS JOIN (VALUES (1), (2), (3)) AS source(stratum)
@@ -401,9 +403,9 @@ export const fetchCaptainRatesInRankBand = async (
         e.id AS gw,
         source.sample_stratum,
         CASE source.sample_stratum
-          WHEN 1 THEN LEAST(e.ranked_count, 10000)::numeric
-          WHEN 2 THEN GREATEST(LEAST(e.ranked_count, 100000) - 10000, 0)::numeric
-          ELSE GREATEST(e.ranked_count - 100000, 0)::numeric
+          WHEN 1 THEN LEAST(${rankedPopulationSql("e")}, 10000)::numeric
+          WHEN 2 THEN GREATEST(LEAST(${rankedPopulationSql("e")}, 100000) - 10000, 0)::numeric
+          ELSE GREATEST(${rankedPopulationSql("e")} - 100000, 0)::numeric
         END AS population
       FROM events e
       CROSS JOIN (VALUES (1), (2), (3)) AS source(sample_stratum)

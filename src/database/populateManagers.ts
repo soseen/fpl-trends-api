@@ -1,3 +1,4 @@
+import { rankedPopulationSql } from "../managers/rankedPopulation.js";
 import "dotenv/config";
 import fs from "fs";
 import path from "path";
@@ -558,6 +559,19 @@ const processEntry = async (
     await ingestPicksForMissingGws(entryId, currentGw, stratum, governor);
   }
 
+  if (isLiveCurrentGw) {
+    // Standings already include live scores while entry/history can contain
+    // a zero-point placeholder. Keep the same score/rank pair as the walk.
+    await prisma.$executeRaw`
+      UPDATE manager_history
+      SET points = ${totalPoints} - COALESCE((
+        SELECT SUM(previous.points) FROM manager_history previous
+        WHERE previous.entry_id = ${entryId} AND previous.gw < ${currentGw}
+      ), 0), overall_rank = ${overallRank}
+      WHERE entry_id = ${entryId} AND gw = ${currentGw}
+    `;
+  }
+
   // Rebuild manager_cumulative for this entry after optional picks are current
   // so captain-derived running fields are reflected immediately. Chip fields
   // come from manager_history.active_chip, stored from the history payload.
@@ -1007,9 +1021,9 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
           e.id AS gw,
           source.sample_stratum,
           CASE source.sample_stratum
-            WHEN 1 THEN LEAST(e.ranked_count, 10000)::numeric
-            WHEN 2 THEN GREATEST(LEAST(e.ranked_count, 100000) - 10000, 0)::numeric
-            ELSE GREATEST(e.ranked_count - 100000, 0)::numeric
+            WHEN 1 THEN LEAST(${rankedPopulationSql("e")}, 10000)::numeric
+            WHEN 2 THEN GREATEST(LEAST(${rankedPopulationSql("e")}, 100000) - 10000, 0)::numeric
+            ELSE GREATEST(${rankedPopulationSql("e")} - 100000, 0)::numeric
           END AS population
         FROM events e
         CROSS JOIN (VALUES (1), (2), (3)) AS source(sample_stratum)

@@ -1,3 +1,4 @@
+import { rankedCountForGw } from "./rangeStats.js";
 import { prisma } from "../database/client.js";
 import { delay } from "../utils.js";
 import { fetchLeagueStandingsPage, OVERALL_LEAGUE_ID } from "./fetchManager.js";
@@ -173,12 +174,17 @@ export const refreshOverallRankCurveSnapshot = async ({
   isFinal: boolean;
   rankedCount: number;
 }): Promise<PublishedRankCurveSnapshot> => {
+  // A zero bootstrap count must never publish a top-100k-only live curve.
+  const population =
+    rankedCount > 0
+      ? rankedCount
+      : ((await rankedCountForGw(gw)) ?? MAX_RANK_CAP);
   const maximumRank = Math.min(
     MAX_RANK_CAP,
-    Math.max(100_000, Math.ceil(rankedCount * 1.2)),
+    Math.max(100_000, Math.ceil(population * 1.2)),
   );
   const snapshot = await collectOverallRankCurveSnapshot(maximumRank);
-  const errors = validateOverallRankCurveSnapshot(snapshot, rankedCount);
+  const errors = validateOverallRankCurveSnapshot(snapshot, population);
   if (errors.length > 0) {
     throw new Error(`rank curve snapshot rejected: ${errors.join("; ")}`);
   }

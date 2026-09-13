@@ -13,6 +13,19 @@ export const refreshCurrentOverallRankCurve = async (): Promise<void> => {
     throw new Error("No current or finished gameweek is available");
   }
 
+  if (event.data_checked) {
+    const existing = await prisma.overall_rank_curve_snapshots.findUnique({
+      where: { gw: event.id },
+      select: { is_final: true },
+    });
+    if (existing?.is_final) {
+      console.info(
+        `[refreshOverallRankCurve] GW${event.id} already has a final snapshot.`,
+      );
+      return;
+    }
+  }
+
   const snapshot = await refreshOverallRankCurveSnapshot({
     gw: event.id,
     rankedCount: event.ranked_count,
