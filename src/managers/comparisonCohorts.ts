@@ -1,5 +1,11 @@
 import { prisma } from "../database/client.js";
-import { trueStratumSizes, type Stratum } from "./rangeStats.js";
+import { rankedPopulationSql } from "./rankedPopulation.js";
+import {
+  STRATUM_A_MAX,
+  STRATUM_B_MAX,
+  trueStratumSizes,
+  type Stratum,
+} from "./rangeStats.js";
 
 export type CohortAggregate = {
   avg_total_points: number | null;
@@ -70,6 +76,20 @@ type CaptainRow = {
   gw_sample: bigint | number;
 };
 
+export type CaptainBonusRow = {
+  stratum: number;
+  gw: number;
+  avg_bonus: number | null;
+  sample_size: number;
+  ranked_population: number;
+};
+
+export type CaptainBonusAverages = {
+  average: number | null;
+  top100k: number | null;
+  top10k: number | null;
+};
+
 type NumericCohortRow = {
   stratum: Stratum;
   sampleSize: number;
@@ -96,9 +116,88 @@ type NumericCohortRow = {
 
 const COVERAGE_THRESHOLD = 0.5;
 const ALL_STRATA: readonly Stratum[] = [1, 2, 3];
+const CAPTAIN_STRATUM_SAMPLE_MINIMUM: Record<Stratum, number> = {
+  1: 250,
+  2: 750,
+  3: 500,
+};
 
 const numberValue = (value: bigint | number | null | undefined): number =>
   typeof value === "bigint" ? Number(value) : (value ?? 0);
+
+const stratumPopulation = (
+  stratum: Stratum,
+  rankedPopulation: number,
+): number => {
+  if (stratum === 1) return Math.min(rankedPopulation, STRATUM_A_MAX);
+  if (stratum === 2) {
+    return Math.max(
+      Math.min(rankedPopulation, STRATUM_B_MAX) - STRATUM_A_MAX,
+      0,
+    );
+  }
+  return Math.max(rankedPopulation - STRATUM_B_MAX, 0);
+};
+
+// Captain picks are sampled independently in every GW, so requiring the same
+// manager to have picks for the whole selected range makes coverage collapse
+// as managers move between rank bands. Build the range value as the sum of
+// per-GW averages instead. Population weighting prevents the deliberately
+// oversized Top 100k samples from biasing the overall-manager comparison.
+export const combineCaptainBonusRows = (
+  rows: ReadonlyArray<CaptainBonusRow>,
+  startGw: number,
+  endGw: number,
+): CaptainBonusAverages => {
+  const rowsByGw = new Map<number, Map<Stratum, CaptainBonusRow>>();
+  for (const row of rows) {
+    if (!ALL_STRATA.includes(row.stratum as Stratum)) continue;
+    const stratum = row.stratum as Stratum;
+    const gwRows = rowsByGw.get(row.gw) ?? new Map();
+    gwRows.set(stratum, row);
+    rowsByGw.set(row.gw, gwRows);
+  }
+
+  const combine = (strata: readonly Stratum[]): number | null => {
+    let rangeTotal = 0;
+    for (let gw = startGw; gw <= endGw; gw += 1) {
+      const gwRows = rowsByGw.get(gw);
+      const rankedPopulation = Math.max(
+        0,
+        ...strata.map(
+          (stratum) => gwRows?.get(stratum)?.ranked_population ?? 0,
+        ),
+      );
+      if (!gwRows || rankedPopulation <= 0) return null;
+
+      let weightedBonus = 0;
+      let population = 0;
+      for (const stratum of strata) {
+        const weight = stratumPopulation(stratum, rankedPopulation);
+        if (weight <= 0) continue;
+        const row = gwRows.get(stratum);
+        if (
+          !row ||
+          row.avg_bonus === null ||
+          row.sample_size < CAPTAIN_STRATUM_SAMPLE_MINIMUM[stratum]
+        ) {
+          return null;
+        }
+        weightedBonus += row.avg_bonus * weight;
+        population += weight;
+      }
+      if (population <= 0) return null;
+      rangeTotal += weightedBonus / population;
+    }
+    return rangeTotal;
+  };
+
+  return {
+    average: combine([1, 2, 3]),
+    top100k: combine([1, 2]),
+    top10k: combine([1]),
+  };
+};
 
 const emptyAggregate = (): CohortAggregate => ({
   avg_total_points: null,
@@ -307,7 +406,7 @@ const loadComparisonCohorts = async (
     CASE WHEN NOT cohort_event.data_checked AND ms.last_checked_gw = $3
       THEN ms.overall_rank END, cohort_rank.overall_rank
   )`;
-  const [rawRows, captainRows, trueSizes] = await Promise.all([
+  const [rawRows, choiceRows, bonusRows, weights] = await Promise.all([
     prisma.$queryRawUnsafe<CohortRow[]>(
       `
       WITH cohort AS (
@@ -455,32 +554,81 @@ const loadComparisonCohorts = async (
       endGw,
       cohortGw,
     ),
+    prisma.$queryRawUnsafe<CaptainBonusRow[]>(
+      `
+      WITH player_points AS (
+        SELECT footballer_id, round, SUM(total_points)::int AS total_points
+        FROM history
+        WHERE round BETWEEN $1 AND $2
+        GROUP BY footballer_id, round
+      ), per_gw_stratum AS (
+        SELECT
+          sc.stratum,
+          sc.gw,
+          (
+            SUM(
+              sc.picks
+                * COALESCE(pp.total_points, 0)
+                * GREATEST(sc.captain_multiplier - 1, 0)
+            )::float / NULLIF(SUM(sc.picks), 0)
+          )::float AS avg_bonus,
+          SUM(sc.picks)::int AS sample_size
+        FROM stratum_captain_picks_gw sc
+        LEFT JOIN player_points pp
+          ON pp.footballer_id = sc.captain_element AND pp.round = sc.gw
+        WHERE sc.gw BETWEEN $1 AND $2
+        GROUP BY sc.stratum, sc.gw
+      )
+      SELECT
+        captain.stratum,
+        captain.gw,
+        captain.avg_bonus,
+        captain.sample_size,
+        ${rankedPopulationSql("e")}::int AS ranked_population
+      FROM per_gw_stratum captain
+      JOIN events e ON e.id = captain.gw
+      `,
+      startGw,
+      endGw,
+    ),
     trueStratumSizes(cohortGw),
   ]);
 
   const rows = rawRows
     .map(toNumericRow)
     .filter((row): row is NumericCohortRow => row !== null);
-  const aggregates = combineComparisonCohortRows(rows, trueSizes);
+  const aggregates = combineComparisonCohortRows(rows, weights);
+  const captainBonuses = combineCaptainBonusRows(bonusRows, startGw, endGw);
 
   return {
-    ...aggregates,
+    average: {
+      ...aggregates.average,
+      avg_captain_bonus: captainBonuses.average,
+    },
+    top100k: {
+      ...aggregates.top100k,
+      avg_captain_bonus: captainBonuses.top100k,
+    },
+    top10k: {
+      ...aggregates.top10k,
+      avg_captain_bonus: captainBonuses.top10k,
+    },
     averageCaptain: captainChoice(
-      captainRows,
+      choiceRows,
       new Set([1, 2, 3]),
-      trueSizes,
+      weights,
       expectedGws,
     ),
     top100kCaptain: captainChoice(
-      captainRows,
+      choiceRows,
       new Set([1, 2]),
-      trueSizes,
+      weights,
       expectedGws,
     ),
     top10kCaptain: captainChoice(
-      captainRows,
+      choiceRows,
       new Set([1]),
-      trueSizes,
+      weights,
       expectedGws,
     ),
   };

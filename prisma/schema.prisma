@@ -506,9 +506,10 @@ model manager_transfers {
 // GROUP-BY over manager_picks ⨝ manager_summary. Tiny table (~3 strata × 38
 // GWs × ~50 distinct captains × ~3 multipliers ≈ <17k rows total) — fits in
 // shared_buffers and replaces the per-request GROUP BY in
-// fetchCaptainRatesInStratum (getTeamImpact.ts). Sample-side captain/chip
-// comparison stats are hidden unless a dedicated historical picks coverage
-// model is added.
+// fetchCaptainRatesInStratum (getTeamImpact.ts). Manager comparison captain
+// averages also use this table: each GW is averaged independently, then rank
+// strata are population-weighted so ranges do not require the same sampled
+// managers to have captain rows in every GW.
 model stratum_captain_picks_gw {
   stratum            Int
   gw                 Int

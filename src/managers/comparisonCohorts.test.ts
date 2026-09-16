@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
 import {
+  combineCaptainBonusRows,
   combineCohortRows,
   combineComparisonCohortRows,
   comparisonCohortGw,
@@ -97,5 +98,98 @@ void describe("comparison cohorts", () => {
     assert.equal(aggregates.top10k.avg_total_points, 100);
     assert.equal(aggregates.top100k.avg_total_points, 55);
     assert.equal(aggregates.average.avg_total_points, 5.5);
+  });
+});
+
+void describe("combineCaptainBonusRows", () => {
+  const captainRow = (
+    gw: number,
+    stratum: 1 | 2 | 3,
+    avgBonus: number,
+    sampleSize: number,
+    rankedPopulation = 1_000_000,
+  ) => ({
+    stratum,
+    gw,
+    avg_bonus: avgBonus,
+    sample_size: sampleSize,
+    ranked_population: rankedPopulation,
+  });
+
+  void it("sums per-GW averages and population-weights rank strata", () => {
+    const averages = combineCaptainBonusRows(
+      [
+        captainRow(1, 1, 10, 500),
+        captainRow(1, 2, 5, 1_000),
+        captainRow(1, 3, 1, 1_500),
+        captainRow(2, 1, 8, 500),
+        captainRow(2, 2, 4, 1_000),
+        captainRow(2, 3, 2, 1_500),
+      ],
+      1,
+      2,
+    );
+
+    assert.equal(averages.top10k, 18);
+    assert.ok(Math.abs((averages.top100k ?? 0) - 9.9) < 1e-12);
+    assert.ok(Math.abs((averages.average ?? 0) - 3.69) < 1e-12);
+  });
+
+  void it("requires every GW and a sufficient sample", () => {
+    const missingGw = combineCaptainBonusRows(
+      [
+        captainRow(1, 1, 10, 500),
+        captainRow(1, 2, 5, 1_000),
+        captainRow(1, 3, 1, 1_500),
+      ],
+      1,
+      2,
+    );
+    assert.deepEqual(missingGw, {
+      average: null,
+      top100k: null,
+      top10k: null,
+    });
+
+    const thinSample = combineCaptainBonusRows(
+      [
+        captainRow(1, 1, 10, 200),
+        captainRow(1, 2, 5, 300),
+        captainRow(1, 3, 1, 400),
+      ],
+      1,
+      1,
+    );
+    assert.deepEqual(thinSample, {
+      average: null,
+      top100k: null,
+      top10k: null,
+    });
+  });
+
+  void it("does not require rank strata with no real population", () => {
+    const averages = combineCaptainBonusRows(
+      [captainRow(1, 1, 7, 1_500, 5_000)],
+      1,
+      1,
+    );
+
+    assert.deepEqual(averages, {
+      average: 7,
+      top100k: 7,
+      top10k: 7,
+    });
+  });
+
+  void it("rejects an overall average when a populated stratum is absent", () => {
+    const averages = combineCaptainBonusRows(
+      [captainRow(1, 1, 10, 500), captainRow(1, 2, 5, 1_000)],
+      1,
+      1,
+    );
+
+    assert.equal(averages.average, null);
+    assert.equal(averages.top100k, 5.5);
+    assert.equal(averages.top10k, 10);
   });
 });

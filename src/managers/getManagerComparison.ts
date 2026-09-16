@@ -55,10 +55,9 @@ export type ManagerComparisonResponse = {
   hits: ComparisonStat;
   bench_points: ComparisonStat;
   // Sum of (captained_player_points × (multiplier − 1)) across the range.
-  // Elite averages use end-of-range rank when the range begins at GW1, and
-  // the manager's rank immediately before the selected range otherwise.
-  // Missing picks are excluded from the denominator rather than silently
-  // contributing zero.
+  // Sample averages sum independently sampled per-GW captain results. Rank
+  // strata are population-weighted so the larger elite samples do not bias
+  // the overall-manager value.
   captain_bonus: ComparisonStat;
   // Average net points per transfer made in range. User value:
   // (sum of (in_player_points − out_player_points) over [transfer.gw, end_gw])
@@ -961,13 +960,9 @@ export const getManagerComparison = async (
         avgHits !== null && activeAgg.with_hits_data < activeAgg.sample_size,
       bench_average_partial:
         avgBench !== null && activeAgg.with_bench_data < activeAgg.sample_size,
-      // Captain bonus accuracy in the new path is bounded by picks coverage
-      // in the sample. cumulative_captain_bonus accumulates 0 for GWs
-      // without picks ingested (LEFT JOIN), so the average converges as
-      // backfillPicks fills in historical picks. Flagged as partial when
-      // the user's own picks resolution wasn't complete (a stricter signal
-      // than the previous sample-size heuristic — the user can see for
-      // themselves that some of their own picks weren't fetched).
+      // Captain averages require a sufficient independently sampled cohort
+      // in every GW. Also flag the section when the user's own picks or the
+      // most-captained sample could not be resolved across the full range.
       captain_average_partial:
         userPicks.incomplete ||
         activeAgg.avg_captain_bonus === null ||
