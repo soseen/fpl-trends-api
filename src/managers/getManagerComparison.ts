@@ -687,7 +687,7 @@ export const getManagerComparison = async (
   const ingestedGws = events.map((e) => e.id).sort((a, b) => a - b);
 
   let avgTotalPoints = 0;
-  let avgTransfersTotal = 0;
+  let avgTransfersTotal: number | null = 0;
   let avgWildcardH1Rate = 0;
   let avgWildcardH2Rate = 0;
   let avgFreeHitH1Rate = 0;
@@ -707,8 +707,12 @@ export const getManagerComparison = async (
       : null;
     avgTotalPoints +=
       liveCohort?.average.avg_total_points ?? ev.average_entry_score;
-    if (population > 0) {
+    if (ev.transfers_made === null || population <= 0) {
+      avgTransfersTotal = null;
+    } else if (avgTransfersTotal !== null) {
       avgTransfersTotal += ev.transfers_made / population;
+    }
+    if (population > 0) {
       const cp = ev.chip_plays as ChipPlay[] | null;
       const isH1 = ev.id <= 19;
       const wcRate = sumChipPlays(cp, CHIP_NAME_WILDCARD) / population;

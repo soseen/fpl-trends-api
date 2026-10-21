@@ -114,24 +114,24 @@ prisma/
 
 ## Database schema
 
-10 tables, all defined in `prisma/schema.prisma`.
+Core tables are defined in `prisma/schema.prisma`.
 
-| Table                 | Purpose                                                                            | Key fields                                                                                                            |
-| --------------------- | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
-| `app_metadata`        | Application state KV store                                                         | `key`, `value` (stores `current_season`, manager ingest cursors)                                                      |
-| `footballers`         | Player data (~100+ columns)                                                        | `id`, `web_name`, `team_id`, `now_cost`, `total_points`, `xG`, `xA`, `xGI`, `ICT`, `form`, `status`, per-90 variants  |
-| `history`             | Per-match player stats                                                             | composite PK `(footballer_id, fixture_id)`, `total_points`, goals, assists, xG, xGI, xGC, minutes, opponent           |
-| `footballer_fixtures` | Upcoming fixtures per player                                                       | `footballer_id`, `fixture_id`, `difficulty`, `is_home`, `team_h`, `team_a`                                            |
-| `teams`               | Club data + strength ratings                                                       | `id`, `name`, `short_name`, `strength_*` (attack/defence × home/away)                                                 |
-| `team_history`        | Aggregated team stats per GW                                                       | composite PK `(team_id, round)`, `teamXGS`, `teamXGC`, `goals`, `goals_conceded`                                      |
-| `events`              | Gameweek metadata                                                                  | `id`, `name`, `finished`, `is_current`, `deadline_time`, `most_selected`, `top_element`, `ranked_count`, `chip_plays` |
-| `manager_summary`     | One row per FPL manager evaluated for the rank-estimation sample                   | `entry_id`, `overall_rank`, `total_points`, `stratum` (1/2/3), `rejected_reason`, `last_checked_gw`                   |
-| `manager_history`     | Per-GW net points + transfer/bench data for sampled managers (all classifications) | composite PK `(entry_id, gw)`, `points`, `event_transfers`, `event_transfers_cost`, `points_on_bench`                 |
-| `manager_picks`       | Per-GW captain choice + active chip per sampled manager                            | composite PK `(entry_id, gw)`, `captain_element`, `vice_captain_element`, `captain_multiplier`, `active_chip`         |
+| Table                    | Purpose                                                                            | Key fields                                                                                                            |
+| ------------------------ | ---------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `app_metadata`           | Application state KV store                                                         | `key`, `value` (stores `current_season`, manager ingest cursors)                                                      |
+| `footballers`            | Player data (~100+ columns)                                                        | `id`, `web_name`, `team_id`, `now_cost`, `total_points`, `xG`, `xA`, `xGI`, `ICT`, `form`, `status`, per-90 variants  |
+| `history`                | Per-match player stats                                                             | composite PK `(footballer_id, fixture_id)`, `total_points`, goals, assists, xG, xGI, xGC, minutes, opponent           |
+| `footballer_fixtures`    | Upcoming fixtures per player                                                       | `footballer_id`, `fixture_id`, `difficulty`, `is_home`, `team_h`, `team_a`                                            |
+| `teams`                  | Club data + strength ratings                                                       | `id`, `name`, `short_name`, `strength_*` (attack/defence × home/away)                                                 |
+| `team_history`           | Aggregated team stats per GW                                                       | composite PK `(team_id, round)`, `teamXGS`, `teamXGC`, `goals`, `goals_conceded`                                      |
+| `events`                 | Gameweek metadata                                                                  | `id`, `name`, `finished`, `is_current`, `deadline_time`, `most_selected`, `top_element`, `ranked_count`, `chip_plays` |
+| `manager_summary`        | One row per FPL manager evaluated for the rank-estimation sample                   | `entry_id`, `overall_rank`, `total_points`, `stratum` (1/2/3), coverage flags, `last_checked_gw`                      |
+| `manager_history`        | Per-GW net points + transfer/bench data for sampled managers (all classifications) | composite PK `(entry_id, gw)`, `points`, `event_transfers`, `event_transfers_cost`, `points_on_bench`                 |
+| `manager_picks`          | Per-GW captain choice + active chip per sampled manager                            | composite PK `(entry_id, gw)`, `captain_element`, `vice_captain_element`, `captain_multiplier`, `active_chip`         |
+| `manager_cumulative`     | Per-manager running totals and coverage counters                                   | composite PK `(entry_id, gw)`, cumulative points/transfers/hits/bench/captain/chips                                   |
+| `comparison_range_stats` | Causal cohort aggregates for fast comparison reads                                 | composite PK `(stratum, start_gw, end_gw)`, sums, complete-data counts, chip totals                                   |
 
-Cascade delete is set on the `footballers → history`, `footballers → footballer_fixtures`, `teams → team_history`, `manager_summary → manager_history`, and `manager_summary → manager_picks` relations. The three manager tables are wiped on season change (they're season-scoped — points and picks only make sense within the season they were earned).
-
-> **Note on `manager_history` for non-active managers:** prior to commit `023c25e` we deleted history rows on inactive/troll classification. This biased range-rank counts (managers who played early then quit looked invisible). The classifier still tags them via `rejected_reason`, but their per-GW history is now retained so the rank-count predicate sees real scores. Comparison-average queries continue to filter `rejected_reason IS NULL` so a 60-hit account doesn't skew "average hits taken".
+Cascade delete is set on the `footballers → history`, `footballers → footballer_fixtures`, `teams → team_history`, and manager-summary child relations. Manager analytics and derived read models are wiped on season change because their points, ranks and picks are season-scoped.
 
 ---
 
@@ -742,70 +742,67 @@ GROUP BY ms.stratum;
 
 ---
 
-## Manager comparison (sample averages + top 10k)
+## Manager comparison (sample averages + elite cohorts)
 
-`/api/manager/:id/comparison?start=X&end=Y` returns the user's stats next to two reference columns: the overall sample average (active managers across all strata) and the **top 10k** average (stratum 1 only — full census, so a direct measurement, not extrapolated).
+`/api/manager/:id/comparison?start=X&end=Y` returns the user's stats next to population-weighted **Average**, **Top 100k**, and **Top 10k** cohorts. For ranges after GW1, cohort membership comes from each manager's overall rank after `start - 1`, before the selected range can affect it. GW1 ranges use end-of-range rank because no pre-season rank exists.
 
 ### Stats returned
 
-| Stat                                     | User-side source                                                     | Sample / top-10k source                                                                       |
-| ---------------------------------------- | -------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
-| **Total points**                         | sum of `netPointsForEvent(ev)` over range                            | `AVG(SUM(mh.points))` per manager in stratum                                                  |
-| **Avg GW score**                         | range total ÷ GWs in range                                           | `AVG(AVG(mh.points))` per manager — mean of per-manager means                                 |
-| **Captain bonus**                        | per-GW picks fetch from FPL × captain GW points × `(multiplier − 1)` | `manager_picks ⨝ history` join, sum per manager, average across stratum                       |
-| **Most captained**                       | mode of captain elements across the range                            | mode of `mp.captain_element` across the stratum sample                                        |
-| **Transfers made**                       | sum of `event_transfers` from FPL history                            | `AVG(SUM(mh.event_transfers))` per manager                                                    |
-| **Wildcards / Free hits / Bench boosts** | did the user play it in range? (0 / 1)                               | overall avg falls back to `events.chip_plays` rates; top-10k uses `manager_picks.active_chip` |
-| **Hits taken**                           | sum of `floor(event_transfers_cost / 4)`                             | `AVG(SUM(event_transfers_cost) / 4)` per manager                                              |
-| **Points benched**                       | sum of `points_on_bench`                                             | `AVG(SUM(points_on_bench))` per manager                                                       |
+| Stat                                              | User-side source                                      | Sample / elite source                             |
+| ------------------------------------------------- | ----------------------------------------------------- | ------------------------------------------------- |
+| **Total points**                                  | sum of `netPointsForEvent(ev)` over range             | `comparison_range_stats.sum_points / sample_size` |
+| **Avg GW score**                                  | range total ÷ GWs in range                            | range points ÷ sampled manager-GWs                |
+| **Captain bonus**                                 | per-GW picks × captain GW points × `(multiplier − 1)` | precomputed complete-coverage captain bonus       |
+| **Most captained**                                | mode of captain elements across the range             | small live aggregate over causal-cohort picks     |
+| **Transfers made**                                | sum of `event_transfers` from FPL history             | precomputed complete-coverage transfer total      |
+| **Wildcards / Free hits / Bench boosts / 3× cap** | chip plays from FPL history                           | precomputed per-half chip rates                   |
+| **Hits taken**                                    | sum of `floor(event_transfers_cost / 4)`              | precomputed complete-coverage hit cost ÷ 4        |
+| **Points benched**                                | sum of `points_on_bench`                              | precomputed complete-coverage bench total         |
 
 ### Captain stats (user-side)
 
-Per query, we fetch `/entry/{id}/event/{gw}/picks/` for each GW in the requested range. To stay under the frontend's 8s timeout we batch in groups of 6 with a 60ms inter-batch delay (38 GWs ≈ 1.5–2 s of API time). Each successful payload yields the captain element + multiplier. The captain's GW points come from our local `history` table (sums all rows for the round in case of a double-GW), and we tally the captain element across the range to surface "most captained" as a player name.
+Per query, the shared picks resolver fetches any missing `/entry/{id}/event/{gw}/picks/` payloads for the requested manager. Successful payloads yield the captain element and multiplier. Captain GW points come from the local `history` table, including all fixtures in a double gameweek, and the captain mode supplies "most captained".
 
 If a single GW's picks call fails, we skip it — the bonus is undercounted by that GW only. The whole endpoint stays reliable because we don't await every call sequentially.
 
-### Captain stats (sample / top-10k)
+### Sample read model
 
-A single SQL query per stratum scope, with a `LEFT JOIN LATERAL` to sum the captain's GW points from `history`:
+Population-wide numeric and chip stats are served from `comparison_range_stats`. The manager-ingestion job rebuilds every start range ending at the current GW; `npm run backfill-comparison-ranges` fills historical combinations. Each rebuild subtracts two `manager_cumulative` snapshots, then groups the result by the causal rank cohort.
 
-```sql
-SELECT AVG(t.bonus_per_manager)::float, COUNT(*)::int
-FROM (
-  SELECT mp.entry_id,
-    SUM(
-      COALESCE(gw_pts.pts, 0)
-      * GREATEST(COALESCE(mp.captain_multiplier, 1) - 1, 0)
-    )::float AS bonus_per_manager
-  FROM manager_picks mp
-  JOIN manager_summary ms ON ms.entry_id = mp.entry_id
-  LEFT JOIN LATERAL (
-    SELECT SUM(h.total_points)::int AS pts
-    FROM history h
-    WHERE h.footballer_id = mp.captain_element AND h.round = mp.gw
-  ) gw_pts ON TRUE
-  WHERE mp.gw BETWEEN $1 AND $2
-    AND ms.rejected_reason IS NULL
-    [AND ms.stratum = 1 for top-10k]
-  GROUP BY mp.entry_id
-) t
-```
-
-`GREATEST(multiplier − 1, 0)` zeros out the contribution when the captain ended up benched (`multiplier = 0`).
+The endpoint reads at most three range rows and applies true FPL population weights. Captain choice remains a live `manager_picks` aggregate because that slice is small and was not responsible for comparison latency.
 
 ### Coverage gating
 
-For columns built on per-manager `manager_history` fields (hits, bench, transfers), we only surface the average if **at least 50% of the sample has non-null data** for that field. Backfills can leave this partially populated for a few hours; `notes.hits_average_partial` / `bench_average_partial` / `captain_average_partial` flags let the UI render an `≈` prefix instead of a misleadingly precise number.
+For columns built on partially backfilled fields, an average is surfaced only when at least **50% of the weighted sample** has complete range data. Cumulative non-null counters preserve the difference between a genuine zero and a missing value. Response notes let the UI render an `≈` prefix when coverage is partial.
 
-### Why top-10k is "current top 10k", not "top 10k after GW X"
+### Performance history
 
-Reconstructing per-GW historical leaderboards for 10k+ managers is impractical without storing ranks per GW. We use the _currently_ top-10k cohort as the reference, which is — empirically — close to "best-of-season" for medium ranges and skews slightly toward "best-late-season" for short early ranges. For the comparison-table use case (i.e. "how do I stack up against the elite right now") this is the right framing.
+The causal-cohort correction initially moved a large `manager_history` group-by back onto the HTTP path, producing 12-30 second cold requests. The range read model moves that shared work into ingestion while preserving the corrected cohort semantics. See [My Trends comparison performance incident](docs/my-trends-comparison-performance.md) for measurements, root cause, rollout and future case-study notes.
 
 ---
 
 ## Backfill scripts (one-off)
 
-Two `npm run` scripts cover gaps the regular cron can't fill on its own.
+Backfill scripts cover schema rollouts and historical gaps that the bounded
+steady-state cron does not fill in one pass.
+
+### Comparison range read-model rollout
+
+After deploying the `comparison_range_stats` migration, refresh cumulative
+coverage counters before building historical range rows:
+
+```bash
+# If check-local-state reports missing historical ranks:
+npm run backfill-manager-ranks
+npm run backfill-cumulative
+npm run backfill-comparison-ranges
+npm run check-local-state
+```
+
+The normal manager ingest keeps ranges ending at the current GW refreshed.
+Use `npm run backfill-comparison-ranges -- --latest` for a targeted repair.
+Repeat the full pass only when historical samples materially change or a
+complete rebuild is required.
 
 ### `npm run backfill-nonactive-history`
 

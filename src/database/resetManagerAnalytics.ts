@@ -30,6 +30,7 @@ export const resetManagerAnalytics = async (): Promise<void> => {
         stratum_captain_picks_gw,
         stratum_gw_running_stats,
         stratum_range_xfer_avg,
+        comparison_range_stats,
         manager_range_score_buckets,
         overall_rank_curve_points,
         overall_rank_curve_snapshots

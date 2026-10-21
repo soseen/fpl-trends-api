@@ -406,112 +406,41 @@ const loadComparisonCohorts = async (
     CASE WHEN NOT cohort_event.data_checked AND ms.last_checked_gw = $3
       THEN ms.overall_rank END, cohort_rank.overall_rank
   )`;
+  // Numeric cohort stats come from the range read model maintained by the
+  // manager-ingest job. The captain-choice query stays live: it touches only
+  // the much smaller manager_picks slice and was not the latency bottleneck.
   const [rawRows, choiceRows, bonusRows, weights] = await Promise.all([
     prisma.$queryRawUnsafe<CohortRow[]>(
       `
-      WITH cohort AS (
-        SELECT
-          c_end.entry_id,
-          CASE
-            WHEN ${cohortRank} BETWEEN 1 AND 10000 THEN 1
-            WHEN ${cohortRank} BETWEEN 10001 AND 100000 THEN 2
-            WHEN ${cohortRank} > 100000 THEN 3
-            ELSE NULL
-          END::int AS stratum,
-          c_end.cumulative_captain_bonus
-            - COALESCE(c_start.cumulative_captain_bonus, 0) AS captain_bonus,
-          c_end.picks_count_cum - COALESCE(c_start.picks_count_cum, 0) AS pick_gws,
-          ms.has_chip_history,
-          CASE WHEN NOT range_end_event.data_checked AND ms.last_checked_gw = $2
-            THEN ms.total_points - COALESCE(c_start.cumulative_points, 0)
-          END AS live_range_points
-        FROM manager_cumulative c_end
-        JOIN manager_summary ms ON ms.entry_id = c_end.entry_id
-        LEFT JOIN manager_cumulative c_start
-          ON c_start.entry_id = c_end.entry_id AND c_start.gw = $1 - 1
-        JOIN manager_history cohort_rank
-          ON cohort_rank.entry_id = c_end.entry_id AND cohort_rank.gw = $3
-        JOIN events cohort_event ON cohort_event.id = $3
-        JOIN events range_end_event ON range_end_event.id = $2
-        WHERE c_end.gw = $2
-          AND ${cohortRank} > 0
-      ), range_history AS (
-        SELECT
-          mh.entry_id,
-          COUNT(*)::int AS played_gws,
-          SUM(mh.points)::bigint AS points,
-          COUNT(mh.event_transfers)::int AS transfer_gws,
-          COALESCE(SUM(mh.event_transfers), 0)::bigint AS transfers,
-          COUNT(mh.event_transfers_cost)::int AS hits_gws,
-          COALESCE(SUM(mh.event_transfers_cost), 0)::bigint AS hits_cost,
-          COUNT(mh.points_on_bench)::int AS bench_gws,
-          COALESCE(SUM(mh.points_on_bench), 0)::bigint AS bench,
-          COUNT(*) FILTER (
-            WHERE mh.active_chip = 'wildcard' AND mh.gw <= 19
-          )::int AS wildcard_h1,
-          COUNT(*) FILTER (
-            WHERE mh.active_chip = 'wildcard' AND mh.gw > 19
-          )::int AS wildcard_h2,
-          COUNT(*) FILTER (
-            WHERE mh.active_chip = 'freehit' AND mh.gw <= 19
-          )::int AS freehit_h1,
-          COUNT(*) FILTER (
-            WHERE mh.active_chip = 'freehit' AND mh.gw > 19
-          )::int AS freehit_h2,
-          COUNT(*) FILTER (
-            WHERE mh.active_chip = 'bboost' AND mh.gw <= 19
-          )::int AS bboost_h1,
-          COUNT(*) FILTER (
-            WHERE mh.active_chip = 'bboost' AND mh.gw > 19
-          )::int AS bboost_h2,
-          COUNT(*) FILTER (
-            WHERE mh.active_chip = '3xc' AND mh.gw <= 19
-          )::int AS triplecaptain_h1,
-          COUNT(*) FILTER (
-            WHERE mh.active_chip = '3xc' AND mh.gw > 19
-          )::int AS triplecaptain_h2
-        FROM manager_history mh
-        JOIN cohort c ON c.entry_id = mh.entry_id
-        WHERE mh.gw BETWEEN $1 AND $2
-        GROUP BY mh.entry_id
-      )
       SELECT
-        c.stratum,
-        COUNT(*)::bigint AS sample_size,
-        SUM(COALESCE(c.live_range_points, r.points))::bigint AS sum_points,
-        SUM(r.played_gws)::bigint AS sum_gws,
-        COUNT(*) FILTER (WHERE r.transfer_gws = $4)::bigint AS complete_transfers,
-        SUM(r.transfers) FILTER (WHERE r.transfer_gws = $4)::bigint
-          AS sum_transfers_complete,
-        COUNT(*) FILTER (WHERE r.hits_gws = $4)::bigint AS complete_hits,
-        SUM(r.hits_cost) FILTER (WHERE r.hits_gws = $4)::bigint
-          AS sum_hits_cost_complete,
-        COUNT(*) FILTER (WHERE r.bench_gws = $4)::bigint AS complete_bench,
-        SUM(r.bench) FILTER (WHERE r.bench_gws = $4)::bigint
-          AS sum_bench_complete,
-        COUNT(*) FILTER (WHERE c.pick_gws = $4)::bigint AS complete_captain,
-        SUM(c.captain_bonus) FILTER (WHERE c.pick_gws = $4)::bigint
-          AS sum_captain_complete,
-        COUNT(*) FILTER (WHERE c.has_chip_history)::bigint AS complete_chips,
-        SUM(r.wildcard_h1) FILTER (WHERE c.has_chip_history)::bigint AS wildcards_h1,
-        SUM(r.wildcard_h2) FILTER (WHERE c.has_chip_history)::bigint AS wildcards_h2,
-        SUM(r.freehit_h1) FILTER (WHERE c.has_chip_history)::bigint AS freehits_h1,
-        SUM(r.freehit_h2) FILTER (WHERE c.has_chip_history)::bigint AS freehits_h2,
-        SUM(r.bboost_h1) FILTER (WHERE c.has_chip_history)::bigint AS bboosts_h1,
-        SUM(r.bboost_h2) FILTER (WHERE c.has_chip_history)::bigint AS bboosts_h2,
-        SUM(r.triplecaptain_h1) FILTER (WHERE c.has_chip_history)::bigint
-          AS triplecaptains_h1,
-        SUM(r.triplecaptain_h2) FILTER (WHERE c.has_chip_history)::bigint
-          AS triplecaptains_h2
-      FROM cohort c
-      JOIN range_history r ON r.entry_id = c.entry_id
-      WHERE c.stratum IS NOT NULL
-      GROUP BY c.stratum
+        stratum,
+        sample_size,
+        sum_points,
+        sum_gws,
+        complete_transfers,
+        sum_transfers_complete,
+        complete_hits,
+        sum_hits_cost_complete,
+        complete_bench,
+        sum_bench_complete,
+        complete_captain,
+        sum_captain_complete,
+        complete_chips,
+        wildcards_h1,
+        wildcards_h2,
+        freehits_h1,
+        freehits_h2,
+        bboosts_h1,
+        bboosts_h2,
+        triplecaptains_h1,
+        triplecaptains_h2
+      FROM comparison_range_stats
+      WHERE start_gw = $1 AND end_gw = $2
+      ORDER BY stratum
+
       `,
       startGw,
       endGw,
-      cohortGw,
-      expectedGws,
     ),
     prisma.$queryRawUnsafe<CaptainRow[]>(
       `
@@ -593,6 +522,13 @@ const loadComparisonCohorts = async (
     ),
     trueStratumSizes(cohortGw),
   ]);
+
+  if (rawRows.length === 0) {
+    throw new Error(
+      `comparison_range_stats missing for ${startGw}..${endGw}; ` +
+        "run backfill-comparison-ranges",
+    );
+  }
 
   const rows = rawRows
     .map(toNumericRow)

@@ -322,7 +322,7 @@ model events {
   most_selected             Int?
   most_transferred_in       Int?
   top_element               Int?
-  transfers_made            Int
+  transfers_made            Int?
   most_captained            Int?
   most_vice_captained       Int?
   chip_plays                Json?
@@ -441,12 +441,19 @@ model manager_cumulative {
   cumulative_bench         Int     @default(0) // SUM(points_on_bench)
   cumulative_captain_bonus Int     @default(0) // SUM(captain_pts × (multiplier − 1))
   gws_played               Int     @default(0) // COUNT(*) — for avg_gw_score over a range
+  // Running non-null counts for partially-backfilled history fields. Range
+  // deltas preserve comparison coverage gates without rescanning history.
+  transfer_gws_cum         Int     @default(0)
+  hits_gws_cum             Int     @default(0)
+  bench_gws_cum            Int     @default(0)
   chip_wildcard_h1         Boolean @default(false) // wildcard played in [1..min(gw, CHIP_HALVES_BOUNDARY)]
   chip_wildcard_h2         Boolean @default(false) // wildcard played in (CHIP_HALVES_BOUNDARY..gw]
   chip_freehit_h1          Boolean @default(false)
   chip_freehit_h2          Boolean @default(false)
   chip_bboost_h1           Boolean @default(false)
   chip_bboost_h2           Boolean @default(false)
+  chip_triplecaptain_h1    Boolean @default(false)
+  chip_triplecaptain_h2    Boolean @default(false)
   has_transfers            Boolean @default(false) // BOOL_OR(event_transfers IS NOT NULL)      — coverage gate
   has_hits                 Boolean @default(false) // BOOL_OR(event_transfers_cost IS NOT NULL) — coverage gate
   has_bench                Boolean @default(false) // BOOL_OR(points_on_bench IS NOT NULL)      — coverage gate
@@ -626,6 +633,40 @@ model stratum_range_xfer_avg {
   with_data           Int      @default(0)
   stratum_size        Int      @default(0)
   last_rebuilt        DateTime @updatedAt
+
+  @@id([stratum, start_gw, end_gw])
+  @@index([start_gw, end_gw, stratum])
+}
+
+// Precomputed causal-cohort aggregates for the manager comparison table.
+// One row per (stratum, start_gw, end_gw), so requests read at most three
+// rows instead of grouping manager_history across the sampled population.
+// start_gw > 1 uses rank after start_gw - 1; start_gw = 1 uses end-gw rank.
+model comparison_range_stats {
+  stratum                Int
+  start_gw               Int
+  end_gw                 Int
+  sample_size            Int
+  sum_points             BigInt
+  sum_gws                BigInt
+  complete_transfers     Int
+  sum_transfers_complete BigInt
+  complete_hits          Int
+  sum_hits_cost_complete BigInt
+  complete_bench         Int
+  sum_bench_complete     BigInt
+  complete_captain       Int
+  sum_captain_complete   BigInt
+  complete_chips         Int
+  wildcards_h1           BigInt
+  wildcards_h2           BigInt
+  freehits_h1            BigInt
+  freehits_h2            BigInt
+  bboosts_h1             BigInt
+  bboosts_h2             BigInt
+  triplecaptains_h1      BigInt
+  triplecaptains_h2      BigInt
+  last_rebuilt           DateTime @updatedAt
 
   @@id([stratum, start_gw, end_gw])
   @@index([start_gw, end_gw, stratum])

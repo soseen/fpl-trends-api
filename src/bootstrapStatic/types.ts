@@ -59,7 +59,7 @@ export type Event = {
   most_transferred_in: number | null;
   top_element: number | null;
   top_element_info: TopElementInfo | null;
-  transfers_made: number;
+  transfers_made: number | null;
   most_captained: number | null;
   most_vice_captained: number | null;
 };

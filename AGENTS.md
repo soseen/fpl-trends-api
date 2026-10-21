@@ -154,9 +154,15 @@ Manager analytics:
 - `manager_transfers`: full transfer history rows
 - `stratum_captain_picks_gw`: pre-aggregated captain rates
 - `stratum_gw_running_stats`: per-stratum running aggregate snapshots
+- `comparison_range_stats`: precomputed causal-cohort range aggregates for
+  the comparison endpoint; requests must read this instead of grouping
+  `manager_history`
 
 Hot manager reads should prefer cumulative/pre-aggregated tables rather
 than scanning `manager_history` or `manager_picks` on every request.
+After adding cumulative comparison fields, run `backfill-cumulative` before
+`backfill-comparison-ranges`; steady-state manager ingest refreshes current-GW
+comparison ranges automatically.
 
 ## Production Notes
 

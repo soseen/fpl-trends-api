@@ -14,11 +14,24 @@ const main = async (): Promise<void> => {
   );
   const transferAverages =
     transferAverageArg?.split("=")[1] === "skip" ? "skip" : "latest";
+  const comparisonArg = process.argv.find((arg) =>
+    arg.startsWith("--comparison-ranges="),
+  );
+  const comparisonRanges =
+    comparisonArg?.split("=")[1] === "skip"
+      ? "skip"
+      : comparisonArg?.split("=")[1] === "latest"
+        ? "latest"
+        : "all";
 
   console.info("[rebuildManagerReadModels] Starting...");
   const startedAt = Date.now();
 
-  await rebuildManagerReadModels({ rangeBuckets, transferAverages });
+  await rebuildManagerReadModels({
+    rangeBuckets,
+    transferAverages,
+    comparisonRanges,
+  });
 
   const elapsedSec = Math.round((Date.now() - startedAt) / 1000);
   const counts = await prisma.$queryRaw<
@@ -35,6 +48,9 @@ const main = async (): Promise<void> => {
     UNION ALL
     SELECT 'manager_range_score_buckets', COUNT(*)::bigint
     FROM manager_range_score_buckets
+    UNION ALL
+    SELECT 'comparison_range_stats', COUNT(*)::bigint
+    FROM comparison_range_stats
     UNION ALL
     SELECT 'stratum_range_xfer_avg', COUNT(*)::bigint
     FROM stratum_range_xfer_avg

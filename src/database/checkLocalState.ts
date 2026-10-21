@@ -104,11 +104,21 @@ const main = async (): Promise<void> => {
   `;
 
   const cumulative = await prisma.$queryRaw<
-    Array<{ rows: bigint; managers: bigint; gws: bigint }>
+    Array<{
+      rows: bigint;
+      managers: bigint;
+      gws: bigint;
+      with_coverage_counters: bigint;
+    }>
   >`
     SELECT COUNT(*)::bigint AS rows,
            COUNT(DISTINCT entry_id)::bigint AS managers,
-           COUNT(DISTINCT gw)::bigint AS gws
+           COUNT(DISTINCT gw)::bigint AS gws,
+           COUNT(*) FILTER (
+             WHERE transfer_gws_cum > 0
+                OR hits_gws_cum > 0
+                OR bench_gws_cum > 0
+           )::bigint AS with_coverage_counters
     FROM manager_cumulative
   `;
 
@@ -134,6 +144,21 @@ const main = async (): Promise<void> => {
     SELECT stratum, COUNT(*)::bigint AS rows, SUM(sample_size)::bigint AS total_sample
     FROM stratum_gw_running_stats
     GROUP BY stratum ORDER BY stratum
+  `;
+
+  const comparisonStats = await prisma.$queryRaw<
+    Array<{
+      rows: bigint;
+      ranges: bigint;
+      max_end_gw: number | null;
+      latest: Date | null;
+    }>
+  >`
+    SELECT COUNT(*)::bigint AS rows,
+           COUNT(DISTINCT (start_gw, end_gw))::bigint AS ranges,
+           MAX(end_gw)::int AS max_end_gw,
+           MAX(last_rebuilt) AS latest
+    FROM comparison_range_stats
   `;
 
   const events = await prisma.$queryRaw<
@@ -268,6 +293,9 @@ const main = async (): Promise<void> => {
   console.info(
     `  ${cumulative[0]?.rows ?? 0n} rows across ${cumulative[0]?.managers ?? 0n} managers, ${cumulative[0]?.gws ?? 0n} distinct GWs`,
   );
+  console.info(
+    `  rows with comparison coverage counters: ${cumulative[0]?.with_coverage_counters ?? 0n}`,
+  );
 
   console.info("\nstratum_captain_picks_gw (captain-rate read path):");
   if (captainPicks.length === 0) {
@@ -310,12 +338,27 @@ const main = async (): Promise<void> => {
     }
   }
 
+  console.info("\ncomparison_range_stats (comparison hot path):");
+  const comparison = comparisonStats[0];
+  if (!comparison || comparison.rows === 0n) {
+    console.info(
+      "  EMPTY - ensure manager-history ranks exist, then run cumulative and comparison backfills.",
+    );
+  } else {
+    console.info(
+      `  ${comparison.rows} rows across ${comparison.ranges} ranges through GW${comparison.max_end_gw ?? "?"}, rebuilt ${comparison.latest?.toISOString() ?? "?"}`,
+    );
+  }
+
   console.info("\n=== Diagnosis ===");
   const picksRows = Number(picks[0]?.rows ?? 0n);
   const picksWithSamplingProvenance = Number(
     picks[0]?.with_sampling_provenance ?? 0n,
   );
   const cumRows = Number(cumulative[0]?.rows ?? 0n);
+  const cumulativeCoverageRows = Number(
+    cumulative[0]?.with_coverage_counters ?? 0n,
+  );
   const captainBuckets = captainPicks.reduce(
     (acc, r) => acc + Number(r.rows),
     0,
@@ -335,6 +378,18 @@ const main = async (): Promise<void> => {
     );
   } else {
     console.info("  ✅ manager_cumulative populated.");
+  }
+  if (cumRows > 0 && cumulativeCoverageRows === 0) {
+    console.info(
+      "  ⚠️  manager_cumulative comparison counters are empty - run `npm run backfill-cumulative`.",
+    );
+  }
+  if (!comparison || comparison.rows === 0n) {
+    console.info(
+      "  ❌ comparison_range_stats empty - run rank/cumulative backfills as needed, then `npm run backfill-comparison-ranges`.",
+    );
+  } else {
+    console.info("  ✅ comparison_range_stats populated.");
   }
 
   const currentGw = events[0]?.current_gw ?? null;

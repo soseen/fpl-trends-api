@@ -27,6 +27,7 @@
     "backfill-manager-ranks": "tsx src/database/backfillManagerRanks.ts",
     "backfill-manager-transfers": "tsx src/database/backfillManagerTransfers.ts",
     "backfill-stratum-range-xfer-avg": "tsx src/database/backfillStratumRangeXferAvg.ts",
+    "backfill-comparison-ranges": "tsx src/database/backfillComparisonRangeStats.ts",
     "backfill-non-penalty": "tsx src/database/backfillNonPenalty.ts",
     "check-non-penalty": "tsx src/database/checkNonPenaltyIntegrity.ts",
     "kill-populate": "tsx src/database/killPopulate.ts",

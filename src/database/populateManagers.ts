@@ -630,10 +630,11 @@ export const rebuildCumulativeForEntry = async (
       INSERT INTO manager_cumulative
         (entry_id, gw, cumulative_points, cumulative_transfers,
          cumulative_hits_cost, cumulative_bench, cumulative_captain_bonus,
-         gws_played,
+         gws_played, transfer_gws_cum, hits_gws_cum, bench_gws_cum,
          chip_wildcard_h1, chip_wildcard_h2,
          chip_freehit_h1,  chip_freehit_h2,
          chip_bboost_h1,   chip_bboost_h2,
+         chip_triplecaptain_h1, chip_triplecaptain_h2,
          has_transfers, has_hits, has_bench,
          picks_count_cum,
          stratum)
@@ -645,6 +646,9 @@ export const rebuildCumulativeForEntry = async (
         (SUM(COALESCE(base.points_on_bench,      0)) OVER w)::int AS cumulative_bench,
         (SUM(base.captain_bonus)                     OVER w)::int AS cumulative_captain_bonus,
         (COUNT(*)                                    OVER w)::int AS gws_played,
+        (COUNT(base.event_transfers)                  OVER w)::int AS transfer_gws_cum,
+        (COUNT(base.event_transfers_cost)             OVER w)::int AS hits_gws_cum,
+        (COUNT(base.points_on_bench)                  OVER w)::int AS bench_gws_cum,
         -- active_chip comes from entry history. Null means no chip that GW.
         BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw <= $3, false)) OVER w AS chip_wildcard_h1,
         BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw  > $3, false)) OVER w AS chip_wildcard_h2,
@@ -652,6 +656,8 @@ export const rebuildCumulativeForEntry = async (
         BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw  > $3, false)) OVER w AS chip_freehit_h2,
         BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw <= $3, false)) OVER w AS chip_bboost_h1,
         BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw  > $3, false)) OVER w AS chip_bboost_h2,
+        BOOL_OR(COALESCE(base.active_chip = '3xc'      AND base.gw <= $3, false)) OVER w AS chip_triplecaptain_h1,
+        BOOL_OR(COALESCE(base.active_chip = '3xc'      AND base.gw  > $3, false)) OVER w AS chip_triplecaptain_h2,
         BOOL_OR(base.event_transfers      IS NOT NULL) OVER w AS has_transfers,
         BOOL_OR(base.event_transfers_cost IS NOT NULL) OVER w AS has_hits,
         BOOL_OR(base.points_on_bench      IS NOT NULL) OVER w AS has_bench,
@@ -988,7 +994,9 @@ export const rebuildStratumCaptainPicks = async (): Promise<void> => {
 export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
   const previousRankBand = rankBandSqlCase("mh_previous.overall_rank");
   await prisma.$transaction([
-    prisma.$executeRawUnsafe(`TRUNCATE rank_band_player_exposure_gw`),
+    // DELETE lets concurrent readers keep the previous committed snapshot.
+    // TRUNCATE held an exclusive table lock throughout this expensive rebuild.
+    prisma.$executeRawUnsafe(`DELETE FROM rank_band_player_exposure_gw`),
     prisma.$executeRawUnsafe(`
       INSERT INTO rank_band_player_exposure_gw
         (rank_band, gw, element_id, sample_size, squad_picks, active_picks,
@@ -1296,6 +1304,215 @@ export const rebuildStratumGwRunningStats = async (): Promise<void> => {
   ]);
 };
 
+// Precompute the range aggregates served by getComparisonCohorts. The HTTP
+// path used to build the same result by scanning manager_history and grouping
+// every sampled manager on each cold request (12-30s on production). Here we
+// use two manager_cumulative snapshots per manager and pay that cost once,
+// after ingestion, for every start GW ending at the refreshed end GW.
+//
+// The cohort rank remains causal: ranges starting after GW1 use rank after
+// start_gw - 1. GW1 ranges use end-gw rank because no pre-season rank exists.
+// Coverage counters are cumulative non-null counts, so the existing complete-
+// range gates for transfers, hits and bench points remain unchanged.
+export const rebuildComparisonRangeStats = async (options?: {
+  endGwOnly?: number;
+}): Promise<void> => {
+  const sampledGw = await prisma.manager_cumulative.aggregate({
+    _max: { gw: true },
+  });
+  const maxGw = sampledGw._max.gw ?? 0;
+  if (maxGw < 1) {
+    if (options?.endGwOnly === undefined) {
+      await prisma.$executeRawUnsafe(`TRUNCATE comparison_range_stats`);
+    }
+    return;
+  }
+
+  const rankedHistoryRows = await prisma.manager_history.count({
+    where: { overall_rank: { gt: 0 } },
+  });
+  if (rankedHistoryRows === 0) {
+    throw new Error(
+      "comparison_range_stats requires manager_history.overall_rank; run backfill-manager-ranks first",
+    );
+  }
+
+  const endGws =
+    options?.endGwOnly !== undefined
+      ? options.endGwOnly >= 1 && options.endGwOnly <= maxGw
+        ? [options.endGwOnly]
+        : []
+      : Array.from({ length: maxGw }, (_, index) => maxGw - index);
+
+  // Match the live request's coherent summary points/rank pair while a GW
+  // is provisional; finalized cohorts continue to use historical snapshots.
+  const cohortRank = `COALESCE(
+    CASE WHEN NOT cohort_event.data_checked
+      AND ms.last_checked_gw = cohort_event.id
+      THEN ms.overall_rank END, cohort_rank.overall_rank
+  )`;
+
+  for (const endGw of endGws) {
+    await prisma.$transaction(
+      async (tx) => {
+        await tx.$executeRawUnsafe(
+          `DELETE FROM comparison_range_stats WHERE end_gw = $1`,
+          endGw,
+        );
+        await tx.$executeRawUnsafe(
+          `
+          INSERT INTO comparison_range_stats
+            (stratum, start_gw, end_gw, sample_size,
+             sum_points, sum_gws,
+             complete_transfers, sum_transfers_complete,
+             complete_hits, sum_hits_cost_complete,
+             complete_bench, sum_bench_complete,
+             complete_captain, sum_captain_complete,
+             complete_chips,
+             wildcards_h1, wildcards_h2,
+             freehits_h1, freehits_h2,
+             bboosts_h1, bboosts_h2,
+             triplecaptains_h1, triplecaptains_h2,
+             last_rebuilt)
+          WITH starts AS (
+            SELECT generate_series(1, $1::int)::int AS start_gw
+          ), range_rows AS (
+            SELECT
+              starts.start_gw,
+              CASE
+                WHEN ${cohortRank} BETWEEN 1 AND 10000 THEN 1
+                WHEN ${cohortRank} BETWEEN 10001 AND 100000 THEN 2
+                WHEN ${cohortRank} > 100000 THEN 3
+                ELSE NULL
+              END::int AS stratum,
+              ($1::int - starts.start_gw + 1)::int AS expected_gws,
+              (CASE WHEN NOT range_end_event.data_checked
+                AND ms.last_checked_gw = $1::int
+                THEN ms.total_points ELSE c_end.cumulative_points END)
+                - COALESCE(c_start.cumulative_points, 0) AS points,
+              c_end.gws_played
+                - COALESCE(c_start.gws_played, 0) AS played_gws,
+              c_end.cumulative_transfers
+                - COALESCE(c_start.cumulative_transfers, 0) AS transfers,
+              c_end.transfer_gws_cum
+                - COALESCE(c_start.transfer_gws_cum, 0) AS transfer_gws,
+              c_end.cumulative_hits_cost
+                - COALESCE(c_start.cumulative_hits_cost, 0) AS hits_cost,
+              c_end.hits_gws_cum
+                - COALESCE(c_start.hits_gws_cum, 0) AS hits_gws,
+              c_end.cumulative_bench
+                - COALESCE(c_start.cumulative_bench, 0) AS bench,
+              c_end.bench_gws_cum
+                - COALESCE(c_start.bench_gws_cum, 0) AS bench_gws,
+              c_end.cumulative_captain_bonus
+                - COALESCE(c_start.cumulative_captain_bonus, 0) AS captain_bonus,
+              c_end.picks_count_cum
+                - COALESCE(c_start.picks_count_cum, 0) AS pick_gws,
+              ms.has_chip_history,
+              c_end.chip_wildcard_h1::int
+                - COALESCE(c_start.chip_wildcard_h1, false)::int AS wildcard_h1,
+              c_end.chip_wildcard_h2::int
+                - COALESCE(c_start.chip_wildcard_h2, false)::int AS wildcard_h2,
+              c_end.chip_freehit_h1::int
+                - COALESCE(c_start.chip_freehit_h1, false)::int AS freehit_h1,
+              c_end.chip_freehit_h2::int
+                - COALESCE(c_start.chip_freehit_h2, false)::int AS freehit_h2,
+              c_end.chip_bboost_h1::int
+                - COALESCE(c_start.chip_bboost_h1, false)::int AS bboost_h1,
+              c_end.chip_bboost_h2::int
+                - COALESCE(c_start.chip_bboost_h2, false)::int AS bboost_h2,
+              c_end.chip_triplecaptain_h1::int
+                - COALESCE(c_start.chip_triplecaptain_h1, false)::int AS triplecaptain_h1,
+              c_end.chip_triplecaptain_h2::int
+                - COALESCE(c_start.chip_triplecaptain_h2, false)::int AS triplecaptain_h2
+            FROM starts
+            JOIN manager_cumulative c_end ON c_end.gw = $1::int
+            JOIN manager_summary ms ON ms.entry_id = c_end.entry_id
+            LEFT JOIN manager_cumulative c_start
+              ON c_start.entry_id = c_end.entry_id
+             AND c_start.gw = starts.start_gw - 1
+            JOIN manager_history cohort_rank
+              ON cohort_rank.entry_id = c_end.entry_id
+             AND cohort_rank.gw = CASE
+               WHEN starts.start_gw = 1 THEN $1::int
+               ELSE starts.start_gw - 1
+             END
+            JOIN events cohort_event ON cohort_event.id = cohort_rank.gw
+            JOIN events range_end_event ON range_end_event.id = $1::int
+            WHERE ${cohortRank} > 0
+          )
+          SELECT
+            stratum,
+            start_gw,
+            $1::int AS end_gw,
+            COUNT(*)::int AS sample_size,
+            SUM(points)::bigint AS sum_points,
+            SUM(played_gws)::bigint AS sum_gws,
+            COUNT(*) FILTER (WHERE transfer_gws = expected_gws)::int
+              AS complete_transfers,
+            COALESCE(SUM(transfers) FILTER (
+              WHERE transfer_gws = expected_gws
+            ), 0)::bigint AS sum_transfers_complete,
+            COUNT(*) FILTER (WHERE hits_gws = expected_gws)::int
+              AS complete_hits,
+            COALESCE(SUM(hits_cost) FILTER (
+              WHERE hits_gws = expected_gws
+            ), 0)::bigint AS sum_hits_cost_complete,
+            COUNT(*) FILTER (WHERE bench_gws = expected_gws)::int
+              AS complete_bench,
+            COALESCE(SUM(bench) FILTER (
+              WHERE bench_gws = expected_gws
+            ), 0)::bigint AS sum_bench_complete,
+            COUNT(*) FILTER (WHERE pick_gws = expected_gws)::int
+              AS complete_captain,
+            COALESCE(SUM(captain_bonus) FILTER (
+              WHERE pick_gws = expected_gws
+            ), 0)::bigint AS sum_captain_complete,
+            COUNT(*) FILTER (WHERE has_chip_history)::int AS complete_chips,
+            COALESCE(SUM(wildcard_h1) FILTER (
+              WHERE has_chip_history
+            ), 0)::bigint AS wildcards_h1,
+            COALESCE(SUM(wildcard_h2) FILTER (
+              WHERE has_chip_history
+            ), 0)::bigint AS wildcards_h2,
+            COALESCE(SUM(freehit_h1) FILTER (
+              WHERE has_chip_history
+            ), 0)::bigint AS freehits_h1,
+            COALESCE(SUM(freehit_h2) FILTER (
+              WHERE has_chip_history
+            ), 0)::bigint AS freehits_h2,
+            COALESCE(SUM(bboost_h1) FILTER (
+              WHERE has_chip_history
+            ), 0)::bigint AS bboosts_h1,
+            COALESCE(SUM(bboost_h2) FILTER (
+              WHERE has_chip_history
+            ), 0)::bigint AS bboosts_h2,
+            COALESCE(SUM(triplecaptain_h1) FILTER (
+              WHERE has_chip_history
+            ), 0)::bigint AS triplecaptains_h1,
+            COALESCE(SUM(triplecaptain_h2) FILTER (
+              WHERE has_chip_history
+            ), 0)::bigint AS triplecaptains_h2,
+            NOW()
+          FROM range_rows
+          WHERE stratum IS NOT NULL
+          GROUP BY stratum, start_gw
+          `,
+          endGw,
+        );
+      },
+      { timeout: 10 * 60 * 1000 },
+    );
+  }
+
+  if (options?.endGwOnly === undefined) {
+    await prisma.$executeRawUnsafe(
+      `DELETE FROM comparison_range_stats WHERE end_gw > $1`,
+      maxGw,
+    );
+  }
+};
+
 // Per-(comparison cohort, start_gw, end_gw) precomputed avg net points per
 // transfer. For start_gw > 1, stratum is determined by overall rank after
 // start_gw - 1, before any points in the selected range can affect it. Ranges
@@ -1593,11 +1810,13 @@ export const rangeScoreBucketsNeedRefresh = async (
 type ManagerReadModelRebuildOptions = {
   rangeBuckets?: "all" | "latest";
   transferAverages?: "latest" | "skip";
+  comparisonRanges?: "all" | "latest" | "skip";
 };
 
 export const rebuildManagerReadModels = async ({
   rangeBuckets = "all",
   transferAverages = "latest",
+  comparisonRanges = "all",
 }: ManagerReadModelRebuildOptions = {}): Promise<void> => {
   const captainStarted = Date.now();
   await rebuildStratumCaptainPicks();
@@ -1630,6 +1849,21 @@ export const rebuildManagerReadModels = async ({
   console.info(
     `[populateManagers] manager_range_score_buckets rebuilt${rangeBuckets === "latest" && currentGw >= 1 ? ` (end_gw=${currentGw})` : ""} in ${Math.round((Date.now() - bucketStarted) / 1000)}s`,
   );
+
+  const comparisonStarted = Date.now();
+  if (comparisonRanges === "latest" && currentGw >= 1) {
+    await rebuildComparisonRangeStats({ endGwOnly: currentGw });
+    console.info(
+      `[populateManagers] comparison_range_stats (end_gw=${currentGw}) rebuilt in ${Math.round((Date.now() - comparisonStarted) / 1000)}s`,
+    );
+  } else if (comparisonRanges === "all") {
+    await rebuildComparisonRangeStats();
+    console.info(
+      `[populateManagers] comparison_range_stats fully rebuilt in ${Math.round((Date.now() - comparisonStarted) / 1000)}s`,
+    );
+  } else {
+    console.info("[populateManagers] comparison_range_stats rebuild skipped");
+  }
 
   // Refresh only the latest end_gw column of stratum_range_xfer_avg. This
   // includes every possible start GW for the current endpoint and keeps the
@@ -1861,6 +2095,7 @@ export const populateManagers = async (
         await rebuildManagerReadModels({
           rangeBuckets: "latest",
           transferAverages: "latest",
+          comparisonRanges: "latest",
         });
         console.info(
           `[populateManagers] manager read models rebuilt in ${Math.round((Date.now() - readModelsStarted) / 1000)}s`,
