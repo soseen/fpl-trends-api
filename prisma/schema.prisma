@@ -322,7 +322,7 @@ model events {
   most_selected             Int?
   most_transferred_in       Int?
   top_element               Int?
-  transfers_made            Int
+  transfers_made            Int?
   most_captained            Int?
   most_vice_captained       Int?
   chip_plays                Json?

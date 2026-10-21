@@ -571,6 +571,14 @@ If the health check returns `503` with `db.status: "down"`, the `.env` and the p
 
 ## Data refresh / populate
 
+Production manager ingestion uses
+`node dist/database/populateManagersWithDiskGuard.js` from the API directory.
+The wrapper skips a run when the shared root filesystem has less than 4 GiB
+available, preserving headroom for PostgreSQL. The existing manager lock and
+outer cron timeout still apply. Manual `npm run populate-managers` bypasses this
+production wrapper. See the [October 21 change review](docs/2026-10-21-change-review.md)
+for the retained fixes, archived optimization, and outstanding capacity work.
+
 `npm run populate` runs `tsx src/database/populateDatabase.ts`, which:
 
 1. Fetches `bootstrap-static` (teams, events, all players' bulk fields).

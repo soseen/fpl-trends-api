@@ -988,7 +988,9 @@ export const rebuildStratumCaptainPicks = async (): Promise<void> => {
 export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
   const previousRankBand = rankBandSqlCase("mh_previous.overall_rank");
   await prisma.$transaction([
-    prisma.$executeRawUnsafe(`TRUNCATE rank_band_player_exposure_gw`),
+    // Readers retain the previous committed snapshot during this long rebuild.
+    // TRUNCATE would hold an exclusive table lock until the aggregate completes.
+    prisma.$executeRawUnsafe(`DELETE FROM rank_band_player_exposure_gw`),
     prisma.$executeRawUnsafe(`
       INSERT INTO rank_band_player_exposure_gw
         (rank_band, gw, element_id, sample_size, squad_picks, active_picks,
