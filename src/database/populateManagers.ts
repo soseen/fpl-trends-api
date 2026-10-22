@@ -55,7 +55,7 @@ const MAX_MANAGERS_PER_RUN = readEnvInt("MANAGER_MAX_PER_RUN", 20_000, 1_000);
 
 // Split each run across the bounded 10k / 10k / 20k source samples. Tail
 // sampling gets the remaining budget because its extrapolation is largest.
-const BUDGET_A_WHILE_RUNNING = readEnvInt("MANAGER_BUDGET_A", 2_000, 0);
+const BUDGET_A_WHILE_RUNNING = readEnvInt("MANAGER_BUDGET_A", 5_000, 0);
 const BUDGET_B_WHILE_RUNNING = readEnvInt("MANAGER_BUDGET_B", 5_000, 0);
 
 // Sample-side enrichment used by My Trends captaincy, EO, and transfer-value
@@ -390,6 +390,12 @@ const processEntry = async (
     if (axios.isAxiosError(error) && error.response?.status === 404)
       return "skipped";
     return "fetch_failed";
+  }
+
+  if (history.current.some((ev) => ev.event > currentGw)) {
+    throw new Error(
+      "Manager history is ahead of local event data; refresh bulk data before collecting the sample",
+    );
   }
 
   await prisma.manager_summary.upsert({
@@ -938,7 +944,10 @@ export const populateManagers = async (
       console.info(
         `[populateManagers] Cursor format ${cursorVersion} → ${CURRENT_CURSOR_FORMAT_VERSION}: resetting walk cursors.`,
       );
-      if (needsCurrentGwSampleReset) {
+      if (
+        needsCurrentGwSampleReset ||
+        cursorVersion < CURRENT_CURSOR_FORMAT_VERSION
+      ) {
         await clearCurrentGwSampleRows(currentGw);
         await writeIntCursor(SAMPLE_GW_CLEANED_KEY, currentGw);
       }
