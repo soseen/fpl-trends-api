@@ -734,7 +734,16 @@ const ingestFromStandings = async ({
               governor,
               page,
             );
-          } catch {
+          } catch (error) {
+            console.error(
+              JSON.stringify({
+                event: "sample_entry_failed",
+                entry: e.entry,
+                gw: currentGw,
+                stratum: walk.stratum,
+                cause: error instanceof Error ? error.message : String(error),
+              }),
+            );
             return "fetch_failed" as const;
           }
         }),
