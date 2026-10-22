@@ -200,7 +200,10 @@ app.get(
   requireAdminToken,
   async (_req: Request, res: Response) => {
     try {
-      await populateDatabase();
+      if (!(await populateDatabase())) {
+        res.status(202).json({ success: false, state: "already_running" });
+        return;
+      }
       invalidateCache();
       res.status(200).json({ success: true });
     } catch (error: unknown) {

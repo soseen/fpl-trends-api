@@ -248,9 +248,8 @@ const populateDatabaseUnlocked = async () => {
   }
 };
 
-export const populateDatabase = async (): Promise<void> => {
-  await withBulkRefreshLock(populateDatabaseUnlocked);
-};
+export const populateDatabase = (): Promise<boolean> =>
+  withBulkRefreshLock(populateDatabaseUnlocked);
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   try {

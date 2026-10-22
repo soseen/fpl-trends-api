@@ -65,6 +65,10 @@ the same release window: the former seven manager routes are replaced by
   HTTP and cron refreshes before they touch shared raw files. Integration tests
   verify stable IDs, idempotency, rollback after a later batch fails and lock
   release after errors.
+  The corrected production refresh completed at 16:33:48 UTC with 20,708
+  fixtures, cleared the bulk guard, advanced the refresh revision and restored
+  HTTP 200 readiness. A competing admin refresh returns 202 without invalidating
+  the previously served bulk cache.
 - Latest release validation passed 84 tests with no skips, backend lint and
   contract drift checks, both type checks and production builds. Source-buffer
   copies are released before calculation to reduce late-season worker memory.
