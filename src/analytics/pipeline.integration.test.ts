@@ -44,6 +44,7 @@ void test(
       "rank_band_player_exposure_gw",
       "history",
       "footballers",
+      "footballer_fixtures",
       "teams",
       "overall_rank_curve_snapshots",
       "overall_rank_curve_points",
@@ -684,6 +685,147 @@ void test(
               "DROP TRIGGER fail_enqueue ON analytics_jobs; DROP FUNCTION fail_analytics_enqueue()",
             );
           }
+        },
+      );
+      await t.test(
+        "fixture replacement uses natural keys, handles postponed games and rolls back failed batches",
+        async () => {
+          const { replaceFootballersFixtures } = await import(
+            "../database/insertFootballersFixtures.js"
+          );
+          await admin.query(
+            "ALTER TABLE footballer_fixtures ADD FOREIGN KEY(footballer_id) REFERENCES footballers(id)",
+          );
+          await admin.query(
+            "INSERT INTO footballer_fixtures(id,footballer_id,fixture_id,difficulty) VALUES (10,1,900,1),(900,2,901,1)",
+          );
+          const fixture = {
+            id: 900,
+            is_home: true,
+            difficulty: 3,
+            team_h: 1,
+            team_h_score: null,
+            team_a: 2,
+            team_a_score: null,
+            event: 4,
+            finished: false,
+            minutes: 0,
+            provisional_start_time: false,
+            kickoff_time: "2026-10-24T14:00:00Z",
+            event_name: "Gameweek 4",
+          };
+          const snapshot = {
+            "1": { fixtures: [fixture] },
+            "2": {
+              fixtures: [
+                {
+                  ...fixture,
+                  is_home: false,
+                  event: null,
+                  kickoff_time: null,
+                  event_name: null,
+                },
+              ],
+            },
+          };
+          await replaceFootballersFixtures(snapshot);
+          const before = (
+            await admin.query(
+              "SELECT * FROM footballer_fixtures ORDER BY footballer_id,fixture_id",
+            )
+          ).rows;
+          assert.equal(before.length, 2);
+          assert.equal(
+            before[0]["id"],
+            10,
+            "Existing player/fixture IDs must remain stable",
+          );
+          assert.equal(
+            before[1]["fixture_id"],
+            900,
+            "Stale membership must be removed even when its serial ID equals a wanted FPL ID",
+          );
+          assert.equal(before[1]["kickoff_time"], null);
+          await replaceFootballersFixtures(snapshot);
+          assert.deepEqual(
+            (
+              await admin.query(
+                "SELECT * FROM footballer_fixtures ORDER BY footballer_id,fixture_id",
+              )
+            ).rows,
+            before,
+          );
+          const invalid = {
+            "1": {
+              fixtures: [
+                { ...fixture, difficulty: 5 },
+                ...Array.from({ length: 499 }, (_, i) => ({
+                  ...fixture,
+                  id: 1000 + i,
+                })),
+              ],
+            },
+            "999999": { fixtures: [fixture] },
+          };
+          await assert.rejects(replaceFootballersFixtures(invalid));
+          assert.deepEqual(
+            (
+              await admin.query(
+                "SELECT * FROM footballer_fixtures ORDER BY footballer_id,fixture_id",
+              )
+            ).rows,
+            before,
+            "A later batch failure must roll back updates, inserts and deletions",
+          );
+          await assert.rejects(
+            replaceFootballersFixtures({}),
+            /Empty player snapshot/,
+          );
+          await assert.rejects(
+            replaceFootballersFixtures({
+              "1": { fixtures: [fixture, fixture] },
+            }),
+            /Duplicate player fixture/,
+          );
+        },
+      );
+      await t.test(
+        "bulk refresh locks exclude competing callers and release after failure",
+        async () => {
+          const { withBulkRefreshLock } = await import(
+            "../database/bulkRefreshLock.js"
+          );
+          let release = () => {};
+          const hold = new Promise<void>((resolve) => {
+            release = resolve;
+          });
+          let started = () => {};
+          const ready = new Promise<void>((resolve) => {
+            started = resolve;
+          });
+          const first = withBulkRefreshLock(async () => {
+            started();
+            await hold;
+          });
+          try {
+            await ready;
+            assert.equal(
+              await withBulkRefreshLock(() => {
+                throw new Error("Competing refresh must not execute");
+              }),
+              false,
+            );
+          } finally {
+            release();
+            await first;
+          }
+          await assert.rejects(
+            withBulkRefreshLock(() => {
+              throw new Error("Failed refresh");
+            }),
+            /Failed refresh/,
+          );
+          assert.equal(await withBulkRefreshLock(async () => {}), true);
         },
       );
       await t.test(

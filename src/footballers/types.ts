@@ -5,12 +5,12 @@ export type Fixture = {
   team_h_score: number | null;
   team_a: number;
   team_a_score: number | null;
-  event: number;
+  event: number | null;
   finished: boolean;
   minutes: number;
   provisional_start_time: boolean;
-  kickoff_time: string;
-  event_name: string;
+  kickoff_time: string | null;
+  event_name: string | null;
   is_home: boolean;
   difficulty: number;
 };

@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { withBulkRefreshLock } from "./bulkRefreshLock.js";
 import fs from "fs";
 import { fileURLToPath } from "node:url";
 import { insertFootballersFixtures } from "./insertFootballersFixtures.js";
@@ -110,7 +111,7 @@ const assertBulkPublicationFresh = async ({
   );
 };
 
-export const populateDatabase = async () => {
+const populateDatabaseUnlocked = async () => {
   try {
     // 1. Fetch bootstrap data first (needed for season detection)
     console.info("Fetching Bootstrap Static...");
@@ -245,6 +246,10 @@ export const populateDatabase = async () => {
     console.error("❌ Failed to populate the database:", error);
     throw error;
   }
+};
+
+export const populateDatabase = async (): Promise<void> => {
+  await withBulkRefreshLock(populateDatabaseUnlocked);
 };
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {

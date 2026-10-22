@@ -58,7 +58,14 @@ the same release window: the former seven manager routes are replaced by
   four connections. Creating a restricted read role and setting temp_file_limit
   still require a database administrator; the deploy account has no sudo or
   PostgreSQL superuser access.
-- Latest release validation passed 82 tests with no skips, backend lint and
+- A full bulk-refresh smoke test exposed an unbounded fixture upsert queue
+  against the new four-connection Prisma pool. Fixture publishing now uses
+  atomic 500-row batches, removes stale natural player/fixture keys correctly,
+  and preserves postponed schedules as NULL. A session advisory lock serializes
+  HTTP and cron refreshes before they touch shared raw files. Integration tests
+  verify stable IDs, idempotency, rollback after a later batch fails and lock
+  release after errors.
+- Latest release validation passed 84 tests with no skips, backend lint and
   contract drift checks, both type checks and production builds. Source-buffer
   copies are released before calculation to reduce late-season worker memory.
   The full 38-GW SQL path still needs capacity testing beyond the synthetic
@@ -177,7 +184,7 @@ retain calibration reports on representative production snapshots before rollout
 ## Validation and release sequence
 
 1. Review both repository diffs together. Run `npm ci`, backend `build`, `lint`,
-   `contracts:check`, `test`, and frontend `typecheck`, `lint`, `build`. Release validation passed all 82 tests with no skips, both builds and type
+   `contracts:check`, `test`, and frontend `typecheck`, `lint`, `build`. Release validation passed all 84 tests with no skips, both builds and type
    checks, backend lint and frontend lint (which retains pre-existing warnings).
    The new CI
    job provisions PostgreSQL 16 and executes the migration/integration tests.
