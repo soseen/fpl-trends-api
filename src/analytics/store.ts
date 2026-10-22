@@ -21,7 +21,11 @@ export const withBenchmarks = <T>(value: BenchmarkContext, run: () => T): T =>
   context.run(value, run);
 export const currentBenchmarks = (): BenchmarkContext | undefined =>
   context.getStore();
-export const seasonState = async (): Promise<{
+export const seasonState = async (
+  options: {
+    allowBulkRefresh?: boolean;
+  } = {},
+): Promise<{
   season: string;
   bulkRevision: string;
 }> => {
@@ -29,8 +33,9 @@ export const seasonState = async (): Promise<{
     Array<{ key: string; value: string }>
   >`SELECT key,value FROM app_metadata WHERE key IN ('current_season','bulk_data_refresh_version','analytics_bulk_refresh_in_progress')`;
   if (
+    !options.allowBulkRefresh &&
     rows.find((r) => r.key === "analytics_bulk_refresh_in_progress")?.value ===
-    "1"
+      "1"
   )
     throw new AnalyticsError(
       "bulk_refresh_in_progress",

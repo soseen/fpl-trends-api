@@ -2,7 +2,7 @@ import "dotenv/config";
 import { prisma } from "./client.js";
 import { enqueue, seasonState } from "../analytics/store.js";
 try {
-  const { season } = await seasonState();
+  const { season } = await seasonState({ allowBulkRefresh: true });
   const latest =
     (await prisma.events.aggregate({ _max: { id: true } }))._max.id ?? 0;
   const selected = process.argv

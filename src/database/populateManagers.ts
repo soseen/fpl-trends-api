@@ -785,7 +785,7 @@ export const rebuildManagerReadModels = async ({
   rangeBuckets = "all",
   exposureGw,
 }: ManagerReadModelRebuildOptions = {}): Promise<void> => {
-  const { season } = await seasonState();
+  const { season } = await seasonState({ allowBulkRefresh: true });
   const latest = await prisma.events.aggregate({ _max: { id: true } });
   const end = exposureGw ?? latest._max.id ?? 0;
   for (let gw = rangeBuckets === "all" ? 1 : end; gw <= end; gw++)

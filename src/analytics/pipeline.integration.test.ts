@@ -826,6 +826,32 @@ void test(
             /Failed refresh/,
           );
           assert.equal(await withBulkRefreshLock(async () => {}), true);
+          await admin.query(
+            "INSERT INTO app_metadata(key,value) VALUES ('analytics_bulk_refresh_in_progress','1') ON CONFLICT(key) DO UPDATE SET value='1'",
+          );
+          try {
+            const { seasonState } = await import("./store.js");
+            await assert.rejects(seasonState(), /being refreshed/);
+            const { rebuildManagerReadModels } = await import(
+              "../database/populateManagers.js"
+            );
+            await rebuildManagerReadModels({
+              rangeBuckets: "latest",
+              exposureGw: 3,
+            });
+            const queued = await admin.query<{ n: number }>(
+              "SELECT count(*)::int n FROM analytics_jobs WHERE kind='benchmark' AND status='queued' AND end_gw=3",
+            );
+            assert.equal(
+              queued.rows[0]?.n,
+              1,
+              "Collection can queue dependent work while calculations remain blocked by the bulk guard",
+            );
+          } finally {
+            await admin.query(
+              "UPDATE app_metadata SET value='0' WHERE key='analytics_bulk_refresh_in_progress'",
+            );
+          }
         },
       );
       await t.test(

@@ -46,6 +46,9 @@ the same release window: the former seven manager routes are replaced by
   Production runs are tuned to 10,000 managers (2,500 / 2,500 / 5,000 budgets)
   so the three upstream fetches per manager fit the 30-minute cron watchdog.
   Lock cleanup checks the owning PID before removing a replacement run's lock.
+  Enqueueing benchmarks remains allowed during a bulk refresh; only their
+  calculation waits. This prevents successful sample collection from being
+  reported as failed merely because bulk publication is in progress.
 - `ANALYTICS_PRUNE_WORKING_FACTS=true` is configured after the archive/export
   audit. Its guard defers cleanup until the latest replacement sample and all
   finalized replay archives are complete, then removes at most 500 obsolete
