@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'printf "{\"event\":\"analytics_probe_failed\",\"checkedAt\":\"%s\"}\n" "$(date -u +%FT%TZ)" >&2' ERR
 # Use an external uptime service for host-down alerts as well. This local probe
 # exits nonzero for cron/systemd monitoring and never transmits notifications.
 curl --fail --silent --show-error --max-time 5 http://127.0.0.1:3000/api/health/ready >/dev/null
@@ -10,3 +11,4 @@ if [[ "${REQUIRE_OFFSITE_BACKUP:-false}" == true ]]; then
   recent=$(psql -X -At -v ON_ERROR_STOP=1 -c "SELECT COALESCE((SELECT value::timestamptz>now()-interval '26 hours' FROM app_metadata WHERE key='analytics_last_offsite_backup'),false)")
   [[ "$recent" == t ]] || { echo 'Off-site backup is missing or stale' >&2; exit 1; }
 fi
+printf '{"event":"analytics_probe_succeeded","checkedAt":"%s"}\n' "$(date -u +%FT%TZ)"
