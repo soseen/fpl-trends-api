@@ -36,6 +36,12 @@ void test(
       "manager_picks",
       "manager_pick_elements",
       "manager_transfers",
+      "manager_cumulative",
+      "manager_range_score_buckets",
+      "stratum_captain_picks_gw",
+      "stratum_gw_running_stats",
+      "stratum_range_xfer_avg",
+      "rank_band_player_exposure_gw",
       "history",
       "footballers",
       "teams",
@@ -678,6 +684,45 @@ void test(
               "DROP TRIGGER fail_enqueue ON analytics_jobs; DROP FUNCTION fail_analytics_enqueue()",
             );
           }
+        },
+      );
+      await t.test(
+        "manager reset retires jobs and cached results while retaining replay archives",
+        async () => {
+          const { resetManagerAnalytics } = await import(
+            "../database/resetManagerAnalytics.js"
+          );
+          const before = (
+            await admin.query<{ n: number }>(
+              "SELECT count(*)::int n FROM analytics_benchmarks",
+            )
+          ).rows[0]!.n;
+          assert.ok(before > 0);
+          await resetManagerAnalytics();
+          for (const table of [
+            "analytics_jobs",
+            "analytics_manager_results",
+            "analytics_manager_sources",
+            "analytics_publications",
+            "manager_summary",
+          ])
+            assert.equal(
+              (
+                await admin.query<{ n: number }>(
+                  `SELECT count(*)::int n FROM ${table}`,
+                )
+              ).rows[0]!.n,
+              0,
+              table,
+            );
+          assert.equal(
+            (
+              await admin.query<{ n: number }>(
+                "SELECT count(*)::int n FROM analytics_benchmarks",
+              )
+            ).rows[0]!.n,
+            before,
+          );
         },
       );
     } finally {

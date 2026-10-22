@@ -18,6 +18,12 @@ export const resetManagerAnalytics = async (): Promise<void> => {
   );
 
   await prisma.$transaction([
+    // Retire current-season leases/results together. Immutable benchmark
+    // archives remain available for replay after mutable facts are reset.
+    prisma.$executeRaw`DELETE FROM analytics_jobs WHERE season=(SELECT value FROM app_metadata WHERE key='current_season')`,
+    prisma.$executeRaw`DELETE FROM analytics_manager_results WHERE season=(SELECT value FROM app_metadata WHERE key='current_season')`,
+    prisma.$executeRaw`DELETE FROM analytics_manager_sources WHERE season=(SELECT value FROM app_metadata WHERE key='current_season')`,
+    prisma.$executeRaw`DELETE FROM analytics_publications WHERE season=(SELECT value FROM app_metadata WHERE key='current_season')`,
     prisma.$executeRawUnsafe(`
       TRUNCATE
         manager_pick_elements,
@@ -39,6 +45,9 @@ export const resetManagerAnalytics = async (): Promise<void> => {
       `
       DELETE FROM app_metadata
       WHERE key = ANY($1::text[])
+        OR key LIKE 'analytics_sample_population:%'
+        OR key LIKE 'analytics_source_repair:%'
+        OR key = 'analytics_last_collector_success'
       `,
       [...MANAGER_CURSOR_KEYS],
     ),
