@@ -47,7 +47,9 @@ the same release window: the former seven manager routes are replaced by
   audit. Its guard defers cleanup until the latest replacement sample and all
   finalized replay archives are complete, then removes at most 500 obsolete
   managers per maintenance pass. Do not bypass that guard.
-- Bulk and rank-curve cron are restored. Readiness/disk probes run every minute;
+- Bulk and rank-curve cron are restored. The bulk helper refreshes hourly when
+  idle and every five minutes during live matches; its cron wrapper uses flock
+  and a 15-minute timeout. Readiness/disk probes run every minute;
   unprivileged log rotation runs hourly for PM2 and collector logs. Probe results
   are in `/home/deploy/analytics-monitor.log`. External alert delivery is still
   unconfigured. Readiness returned HTTP 200 after cutover.
