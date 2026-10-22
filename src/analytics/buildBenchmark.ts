@@ -223,6 +223,14 @@ export const buildBenchmark = async (
               out: t.element_out,
             }));
       }
+      // Raw Prisma rows duplicate the normalized replay model. Release them
+      // before validating/cloning that model, especially for late-season GWs.
+      history.length = 0;
+      picks.length = 0;
+      captains.length = 0;
+      transfers.length = 0;
+      transferSources.length = 0;
+      captainMap.clear();
       const eligible = [...managers.values()]
         .filter((m) => m.facts.some((f) => f.gw === gw))
         .sort((a, b) => a.entry - b.entry);
@@ -297,6 +305,9 @@ export const buildBenchmark = async (
         managers: eligible,
         points: players,
       });
+      managers.clear();
+      eligible.length = 0;
+      players.length = 0;
       const sourceRevision = createHash("sha256")
         .update(JSON.stringify(source))
         .digest("hex");
@@ -311,9 +322,12 @@ export const buildBenchmark = async (
           (sampleGw > gw || (sampleGw === gw && sampleFinal)),
         generatedAt: new Date().toISOString(),
         sourceRevision,
-        managers: eligible,
+        managers: source.managers,
         points: new Map(
-          players.map((p) => [pointKey(p.footballer_id, p.round), p.points]),
+          source.points.map((p) => [
+            pointKey(p.footballer_id, p.round),
+            p.points,
+          ]),
         ),
       });
       if (!result.exposures.length) {
@@ -334,7 +348,7 @@ export const buildBenchmark = async (
       }
       if (event.finished && event.data_checked) {
         const scores = new Map<number, number[]>();
-        for (const manager of eligible) {
+        for (const manager of source.managers) {
           const rank = manager.facts.find((f) => f.gw === gw)?.rank;
           if (!rank || rank <= 0) continue;
           const score = manager.facts.reduce((s, f) => s + f.points, 0);
