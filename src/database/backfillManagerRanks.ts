@@ -3,7 +3,7 @@ import { fileURLToPath } from "node:url";
 import { prisma } from "./client.js";
 import { fetchEntryHistory } from "../managers/fetchManager.js";
 import { delay } from "../utils.js";
-import { rebuildRankBandPlayerExposure } from "./populateManagers.js";
+import { rebuildRankBandPlayerExposure } from "./legacyManagerReadModels.js";
 
 const readEnvInt = (key: string, fallback: number, min = 1): number => {
   const raw = process.env[key];

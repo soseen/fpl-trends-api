@@ -1,4 +1,6 @@
-import { rankedPopulationSql } from "../managers/rankedPopulation.js";
+import { samplePages } from "../analytics/sampling.js";
+import axios from "axios";
+import { enqueue, seasonState } from "../analytics/store.js";
 import "dotenv/config";
 import fs from "fs";
 import path from "path";
@@ -16,7 +18,6 @@ import {
   summarizePicks,
 } from "../managers/fetchPicks.js";
 import { persistPickElements } from "../managers/persistPickElements.js";
-import { rankBandSqlCase } from "../managers/rankBands.js";
 import { refreshOverallRankCurveSnapshot } from "../managers/rankCurveSnapshot.js";
 import { fetchEntryTransfers } from "../managers/fetchTransfers.js";
 import {
@@ -45,82 +46,15 @@ const readEnvBool = (key: string, fallback: boolean): boolean => {
   return ["1", "true", "yes", "on"].includes(raw.toLowerCase());
 };
 
-const STRATUM_A_LAST_PAGE = 200;
-// Stratum B: pages 201–2000. Stride 1 = full census of the 10k–100k cohort
-// (~90k entries per pass). Critically, stride 1 also keeps stratum tags
-// fresh: any manager whose rank has crossed back into the top 100k (i.e.,
-// improved out of stratum 3) gets re-tagged on its next pass. Strides > 1
-// skipped half (or more) of S2 pages, leaving "improvement movers" stuck
-// in our DB tagged stratum=3 with high cumulative scores — that drove a
-// ~14% over-count on stratum-3 rank queries.
-const STRATUM_B_FIRST_PAGE = 201;
-const STRATUM_B_LAST_PAGE = 2000;
-// Stratum C: systematic 1-in-20 walk over the FPL standings tail. Each page
-// has 50 entries; stride 20 means we sample 50 of every 1000 ranked
-// managers, giving ~12,500 distinct page slots per pass over a 12.6M
-// ranked tail (≈ 625k unique probes once full).
-//
-// We deliberately moved away from random-entry-ID probing here: random IDs
-// over-sampled engaged returning users (low IDs 1..3M) and undersampled
-// recent joiners (high IDs 10M+), which biased the rank-rank estimate by
-// ~12% even with very large samples. The standings page is FPL's own
-// ranking, which is exactly the population we want to extrapolate from —
-// so a 1-in-N walk is unbiased *in the limit* of a complete cycle.
-//
-// IMPORTANT: a sequential cursor (page → page+stride → …) gives a heavily
-// front-loaded sample mid-cycle: pages 2001..N have all been visited, but
-// pages N+1..252000 haven't. Mid-cycle samples therefore over-represent
-// the upper end of stratum 3 (current rank 100k–N×50), which has higher
-// average GW totals than the deep tail. Observed effect on a fresh prod
-// cycle: rank-rank queries over-counted "managers above user" by ~3× in
-// stratum 3, blowing the GW-range rank estimate up by 100% on long ranges.
-//
-// Fix: interleave the slot order using a golden-ratio modular step.
-// `STRATUM_C_GOLDEN_STEP` is coprime to `STRATUM_C_NUM_SLOTS`, so the
-// sequence `(idx * STEP) mod NUM_SLOTS` for idx = 0,1,2,… is a permutation
-// of [0, NUM_SLOTS). After ~10 steps the visited slots are spread evenly
-// across the entire rank tail; partial cycles are no longer front-loaded.
-//
-// LAST_PAGE 252_000 covers ranks up to 12.6M, comfortably above the
-// largest observed `events.ranked_count`. Pages past the live tail return
-// an empty `standings.results` array, which `ingestFromStandings` handles
-// gracefully (page advances, nothing recorded).
-const STRATUM_C_FIRST_PAGE = 2001;
-const STRATUM_C_LAST_PAGE = 252_000;
-const STRATUM_C_PAGE_STRIDE = 20;
-const STRATUM_C_NUM_SLOTS = Math.floor(
-  (STRATUM_C_LAST_PAGE - STRATUM_C_FIRST_PAGE + 1) / STRATUM_C_PAGE_STRIDE,
-); // = 12_500
-const STRATUM_C_TARGET_MANAGERS = readEnvInt(
-  "MANAGER_STRATUM_C_TARGET_MANAGERS",
-  50_000,
-  1_000,
-);
-const STRATUM_C_TARGET_STEPS = Math.min(
-  STRATUM_C_NUM_SLOTS,
-  Math.ceil(STRATUM_C_TARGET_MANAGERS / 50),
-);
-// Coprime to 12_500 (gcd = 1), ratio ≈ 0.618 (golden). Any prime that is
-// neither 2 nor 5 (the prime factors of 12_500) works equally well; 7727
-// happens to be the closest prime to 12_500 × (√5 − 1)/2.
-const STRATUM_C_GOLDEN_STEP = 7727;
-const stratumCPageForIndex = (idx: number): number => {
-  const wrapped =
-    ((idx % STRATUM_C_NUM_SLOTS) + STRATUM_C_NUM_SLOTS) % STRATUM_C_NUM_SLOTS;
-  const slot = (wrapped * STRATUM_C_GOLDEN_STEP) % STRATUM_C_NUM_SLOTS;
-  return STRATUM_C_FIRST_PAGE + slot * STRATUM_C_PAGE_STRIDE;
-};
+const STRATUM_C_TARGET_MANAGERS = 20_000;
 
 // Per-run safety cap. Cron fires every 15 min; at ~25 req/s sustained this
 // is ~13 min of work per run, leaving slack for governor backoffs and
 // preventing overlap with the next cron.
 const MAX_MANAGERS_PER_RUN = readEnvInt("MANAGER_MAX_PER_RUN", 20_000, 1_000);
 
-// Budget split when stratum A is still in progress vs done. A is the top
-// 10k (fixed). B with stride 1 has 1800 pages = 90k entries to cover
-// per pass; at 5000/cron that's a full pass every ~4.5 hours, fast enough
-// to keep stratum tags reasonably fresh. C still gets the largest share
-// (extrapolation factor is biggest and new probes are most likely unseen).
+// Split each run across the bounded 10k / 10k / 20k source samples. Tail
+// sampling gets the remaining budget because its extrapolation is largest.
 const BUDGET_A_WHILE_RUNNING = readEnvInt("MANAGER_BUDGET_A", 2_000, 0);
 const BUDGET_B_WHILE_RUNNING = readEnvInt("MANAGER_BUDGET_B", 5_000, 0);
 
@@ -151,7 +85,7 @@ const SAMPLE_GW_CLEANED_KEY = "manager_sample_gw_cleaned";
 // v4 = same-GW repair for chips/current picks after the prod GW35 pass ran
 // with sample-pick ingestion disabled.
 const CURSOR_FORMAT_KEY = "manager_walk_cursor_version";
-const CURRENT_CURSOR_FORMAT_VERSION = 4;
+const CURRENT_CURSOR_FORMAT_VERSION = 5;
 const LOCKFILE_PATH = path.join(os.tmpdir(), "fpl-populate-managers.lock");
 // Conservative max age — a normal run is ~13 min, peak ~20 min on heavy
 // ticks. Anything past 30 min is stuck: a DB query that's spinning on
@@ -279,38 +213,9 @@ const writeIntCursor = async (key: string, value: number): Promise<void> => {
 };
 
 const clearCurrentGwSampleRows = async (gw: number): Promise<void> => {
-  console.info(
-    `[populateManagers] Clearing live-sampled GW${gw} manager rows before final pass.`,
-  );
-  await prisma.$transaction([
-    prisma.$executeRaw`
-      DELETE FROM manager_range_score_buckets WHERE end_gw = ${gw}
-    `,
-    prisma.$executeRaw`
-      DELETE FROM rank_band_player_exposure_gw WHERE gw = ${gw}
-    `,
-    prisma.$executeRaw`
-      DELETE FROM stratum_captain_picks_gw WHERE gw = ${gw}
-    `,
-    prisma.$executeRaw`
-      DELETE FROM stratum_gw_running_stats WHERE gw = ${gw}
-    `,
-    prisma.$executeRaw`
-      DELETE FROM stratum_range_xfer_avg WHERE end_gw = ${gw}
-    `,
-    prisma.$executeRaw`
-      DELETE FROM manager_pick_elements WHERE gw = ${gw}
-    `,
-    prisma.$executeRaw`
-      DELETE FROM manager_picks WHERE gw = ${gw}
-    `,
-    prisma.$executeRaw`
-      DELETE FROM manager_cumulative WHERE gw = ${gw}
-    `,
-    prisma.$executeRaw`
-      DELETE FROM manager_history WHERE gw = ${gw}
-    `,
-  ]);
+  // Preserve facts and the last immutable publication while recollecting.
+  // Only provenance is reset; the new sample explicitly opts back in.
+  await prisma.$executeRaw`UPDATE manager_picks SET sampled_at_gw=NULL,sample_stratum=NULL WHERE gw=${gw}`;
 };
 
 type SampleGameweek = {
@@ -434,6 +339,7 @@ const processEntry = async (
   isLiveCurrentGw: boolean,
   forceRefreshCurrentGw: boolean,
   governor: RateLimitGovernor,
+  sourcePage: number,
 ): Promise<ProcessOutcome> => {
   const existing = await prisma.manager_summary.findUnique({
     where: { entry_id: entryId },
@@ -465,35 +371,24 @@ const processEntry = async (
     currentGwPicksComplete &&
     !needsTransferHistory
   ) {
+    await prisma.manager_picks.updateMany({
+      where: { entry_id: entryId, gw: currentGw },
+      data: {
+        sample_stratum: stratum,
+        sampled_at_gw: currentGw,
+        sample_page: sourcePage,
+      },
+    });
     return "skipped";
   }
 
   let history;
   try {
     history = await withGovernor(governor, () => fetchEntryHistory(entryId));
-  } catch {
+  } catch (error) {
     if (governor.shouldAbort) throw new Error("governor_aborted");
-    // Record the visit even on fetch failure so we don't retry every cron
-    // tick — last_checked_gw=currentGw skips this entry until the next GW
-    // transition. Equivalent to the old "rejected_reason='fetch_failed'"
-    // marker but without the column: an entry with a manager_summary row
-    // but no manager_history rows is naturally absent from sample queries.
-    await prisma.manager_summary.upsert({
-      where: { entry_id: entryId },
-      update: {
-        overall_rank: overallRank,
-        total_points: totalPoints,
-        stratum,
-        last_checked_gw: currentGw,
-      },
-      create: {
-        entry_id: entryId,
-        overall_rank: overallRank,
-        total_points: totalPoints,
-        stratum,
-        last_checked_gw: currentGw,
-      },
-    });
+    if (axios.isAxiosError(error) && error.response?.status === 404)
+      return "skipped";
     return "fetch_failed";
   }
 
@@ -528,35 +423,32 @@ const processEntry = async (
   // Inactive / trolling / "abnormal" managers are valid sample data; the
   // old rejected_reason filter excluded them from rank-density math, but
   // we now treat the full sample as-is (lighter ingest, simpler reads).
-  for (const ev of history.current ?? []) {
-    await prisma.manager_history.upsert({
-      where: { entry_id_gw: { entry_id: entryId, gw: ev.event } },
-      update: {
-        points: netPointsForEvent(ev),
-        overall_rank: ev.overall_rank,
-        event_transfers: ev.event_transfers,
-        event_transfers_cost: ev.event_transfers_cost,
-        points_on_bench: ev.points_on_bench,
-        active_chip: chipByGw.get(ev.event) ?? null,
-      },
-      create: {
-        entry_id: entryId,
-        gw: ev.event,
-        points: netPointsForEvent(ev),
-        overall_rank: ev.overall_rank,
-        event_transfers: ev.event_transfers,
-        event_transfers_cost: ev.event_transfers_cost,
-        points_on_bench: ev.points_on_bench,
-        active_chip: chipByGw.get(ev.event) ?? null,
-      },
-    });
-  }
+  const facts = (history.current ?? []).map((ev) => ({
+    gw: ev.event,
+    points: netPointsForEvent(ev),
+    rank: ev.overall_rank,
+    transfers: ev.event_transfers,
+    hits: ev.event_transfers_cost,
+    bench: ev.points_on_bench,
+    chip: chipByGw.get(ev.event) ?? null,
+  }));
+  await prisma.$executeRaw`INSERT INTO manager_history(entry_id,gw,points,overall_rank,event_transfers,event_transfers_cost,points_on_bench,active_chip)
+    SELECT ${entryId},f.gw,f.points,f.rank,f.transfers,f.hits,f.bench,f.chip FROM jsonb_to_recordset(${JSON.stringify(facts)}::jsonb) AS f(gw int,points int,rank int,transfers int,hits int,bench int,chip text)
+    ON CONFLICT(entry_id,gw) DO UPDATE SET points=excluded.points,overall_rank=excluded.overall_rank,event_transfers=excluded.event_transfers,event_transfers_cost=excluded.event_transfers_cost,points_on_bench=excluded.points_on_bench,active_chip=excluded.active_chip
+    WHERE (manager_history.points,manager_history.overall_rank,manager_history.event_transfers,manager_history.event_transfers_cost,manager_history.points_on_bench,manager_history.active_chip) IS DISTINCT FROM (excluded.points,excluded.overall_rank,excluded.event_transfers,excluded.event_transfers_cost,excluded.points_on_bench,excluded.active_chip)`;
 
   // Fill in the latest sampled GW for captaincy and EO. During live GWs this
   // is the current GW, so My Trends can converge while matches are still
   // being played.
   if (INGEST_SAMPLE_PICKS) {
-    await ingestPicksForMissingGws(entryId, currentGw, stratum, governor);
+    await ingestPicksForMissingGws(
+      entryId,
+      currentGw,
+      stratum,
+      governor,
+      isLiveCurrentGw || forceRefreshCurrentGw,
+      sourcePage,
+    );
   }
 
   if (isLiveCurrentGw) {
@@ -575,7 +467,7 @@ const processEntry = async (
   // Rebuild manager_cumulative for this entry after optional picks are current
   // so captain-derived running fields are reflected immediately. Chip fields
   // come from manager_history.active_chip, stored from the history payload.
-  await rebuildCumulativeForEntry(entryId, stratum);
+  // Range benchmarks now read bounded facts; cumulative season rewrites are retired.
 
   // Keep sample transfer logs current without refetching every unchanged
   // manager on every GW pass. Fetch once for coverage, then again only when
@@ -597,98 +489,6 @@ const processEntry = async (
 // in [1..CHIP_HALVES_BOUNDARY] and once in (CHIP_HALVES_BOUNDARY..38]. The
 // h1/h2 cumulative flags rely on this split so any (start, end) range can
 // detect a chip play via XOR of c_end and c_start halves.
-const CHIP_HALVES_BOUNDARY = 19;
-
-// Per-entry cumulative rebuild: DELETE all this entry's manager_cumulative
-// rows then INSERT one fresh row per (entry_id, gw) where manager_history
-// has a row. Keeping cumulative as a strict mirror of history (no synthetic
-// anchor rows, no rows for non-participated GWs) is what lets the range
-// query use DISTINCT ON to find the latest in-range row per entry — see
-// getRangeRank.ts.
-//
-// Re-querying manager_history rather than computing from `history.current`
-// is intentional: if FPL ever returns a smaller payload than what we've
-// already persisted (we never delete history rows), the DB query is
-// canonical. Stratum is denormalised onto every row so the read path
-// needs no manager_summary join.
-//
-// Captain bonus joins manager_picks for the entry and the footballers'
-// `history` table for the captained player's GW points. For GWs where
-// picks haven't been ingested yet (the typical case before backfillPicks
-// has run for this entry's earlier GWs), the LEFT JOIN yields NULL and
-// the contribution is 0 — the comparison endpoint's sample average is
-// best-effort and converges as picks are filled in over subsequent
-// processEntry visits.
-export const rebuildCumulativeForEntry = async (
-  entryId: number,
-  stratum: 1 | 2 | 3,
-): Promise<void> => {
-  await prisma.$transaction(async (tx) => {
-    await tx.$executeRaw`DELETE FROM manager_cumulative WHERE entry_id = ${entryId}`;
-    await tx.$executeRawUnsafe(
-      `
-      INSERT INTO manager_cumulative
-        (entry_id, gw, cumulative_points, cumulative_transfers,
-         cumulative_hits_cost, cumulative_bench, cumulative_captain_bonus,
-         gws_played,
-         chip_wildcard_h1, chip_wildcard_h2,
-         chip_freehit_h1,  chip_freehit_h2,
-         chip_bboost_h1,   chip_bboost_h2,
-         has_transfers, has_hits, has_bench,
-         picks_count_cum,
-         stratum)
-      SELECT
-        base.entry_id, base.gw,
-        (SUM(base.points)                            OVER w)::int AS cumulative_points,
-        (SUM(COALESCE(base.event_transfers,      0)) OVER w)::int AS cumulative_transfers,
-        (SUM(COALESCE(base.event_transfers_cost, 0)) OVER w)::int AS cumulative_hits_cost,
-        (SUM(COALESCE(base.points_on_bench,      0)) OVER w)::int AS cumulative_bench,
-        (SUM(base.captain_bonus)                     OVER w)::int AS cumulative_captain_bonus,
-        (COUNT(*)                                    OVER w)::int AS gws_played,
-        -- active_chip comes from entry history. Null means no chip that GW.
-        BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw <= $3, false)) OVER w AS chip_wildcard_h1,
-        BOOL_OR(COALESCE(base.active_chip = 'wildcard' AND base.gw  > $3, false)) OVER w AS chip_wildcard_h2,
-        BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw <= $3, false)) OVER w AS chip_freehit_h1,
-        BOOL_OR(COALESCE(base.active_chip = 'freehit'  AND base.gw  > $3, false)) OVER w AS chip_freehit_h2,
-        BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw <= $3, false)) OVER w AS chip_bboost_h1,
-        BOOL_OR(COALESCE(base.active_chip = 'bboost'   AND base.gw  > $3, false)) OVER w AS chip_bboost_h2,
-        BOOL_OR(base.event_transfers      IS NOT NULL) OVER w AS has_transfers,
-        BOOL_OR(base.event_transfers_cost IS NOT NULL) OVER w AS has_hits,
-        BOOL_OR(base.points_on_bench      IS NOT NULL) OVER w AS has_bench,
-        (SUM(base.has_picks)                         OVER w)::int AS picks_count_cum,
-        $2
-      FROM (
-        SELECT
-          mh.entry_id, mh.gw, mh.points,
-          mh.event_transfers, mh.event_transfers_cost, mh.points_on_bench,
-          mh.active_chip,
-          CASE WHEN mp.gw IS NOT NULL THEN 1 ELSE 0 END AS has_picks,
-          COALESCE(
-            CASE
-              WHEN mp.captain_multiplier IS NOT NULL AND mp.captain_multiplier > 1 THEN
-                (SELECT SUM(h.total_points)::int
-                   FROM history h
-                   WHERE h.footballer_id = mp.captain_element AND h.round = mh.gw)
-                * (mp.captain_multiplier - 1)
-              ELSE 0
-            END,
-            0
-          ) AS captain_bonus
-        FROM manager_history mh
-        LEFT JOIN manager_picks mp
-          ON mp.entry_id = mh.entry_id AND mp.gw = mh.gw
-        WHERE mh.entry_id = $1
-      ) base
-      WINDOW w AS (PARTITION BY base.entry_id ORDER BY base.gw)
-      ORDER BY base.gw
-      `,
-      entryId,
-      stratum,
-      CHIP_HALVES_BOUNDARY,
-    );
-  });
-};
-
 // Inline picks ingestion: fetch picks for the latest sampled GW only,
 // and only if not already stored for this manager. Historical depth is
 // the job of `backfillPicks.ts` — keeping the cron path bounded to one
@@ -700,6 +500,8 @@ const ingestPicksForMissingGws = async (
   currentGw: number,
   sampleStratum: 1 | 2 | 3,
   governor: RateLimitGovernor,
+  refresh = false,
+  sourcePage?: number,
 ): Promise<void> => {
   if (currentGw < 1) return;
   if (governor.shouldAbort) return;
@@ -713,17 +515,27 @@ const ingestPicksForMissingGws = async (
       where: { entry_id: entryId, gw: currentGw },
     }),
   ]);
-  if (existing && elementRows >= 15) return;
+  if (existing && elementRows >= 15 && !refresh) {
+    await prisma.manager_picks.update({
+      where: { entry_id_gw: { entry_id: entryId, gw: currentGw } },
+      data: {
+        sample_stratum: sampleStratum,
+        sampled_at_gw: currentGw,
+        sample_page: sourcePage ?? null,
+      },
+    });
+    return;
+  }
 
   let payload;
   try {
     payload = await withGovernor(governor, () =>
       fetchEntryEventPicks(entryId, currentGw),
     );
-  } catch {
-    // Skip on persistent failure; next cron after the next GW transition
-    // (or backfillPicks) will retry.
-    return;
+  } catch (error) {
+    throw new Error(`Sample picks fetch failed for GW${currentGw}`, {
+      cause: error,
+    });
   }
   const { captain_element, vice_captain_element, captain_multiplier } =
     summarizePicks(payload.picks ?? []);
@@ -736,6 +548,7 @@ const ingestPicksForMissingGws = async (
       active_chip: payload.active_chip,
       sample_stratum: sampleStratum,
       sampled_at_gw: currentGw,
+      sample_page: sourcePage ?? null,
     },
     create: {
       entry_id: entryId,
@@ -746,6 +559,7 @@ const ingestPicksForMissingGws = async (
       active_chip: payload.active_chip,
       sample_stratum: sampleStratum,
       sampled_at_gw: currentGw,
+      sample_page: sourcePage ?? null,
     },
   });
   await persistPickElements(entryId, currentGw, payload.picks ?? []);
@@ -768,13 +582,22 @@ const ingestTransfersForEntry = async (
     transfers = await withGovernor(governor, () =>
       fetchEntryTransfers(entryId),
     );
-  } catch {
-    // Persistent failure — leave the flag false; next visit retries.
-    return;
+  } catch (error) {
+    await prisma.manager_summary.update({
+      where: { entry_id: entryId },
+      data: { has_transfer_history: false },
+    });
+    throw new Error("Sample transfer history fetch failed", { cause: error });
   }
 
   // Single multi-row insert with ON CONFLICT … DO NOTHING — append-only
   // semantics, matches the unique-by-construction (entry_id, gw, in, out)
+  const sourceSeason = await prisma.app_metadata.findUnique({
+    where: { key: "current_season" },
+  });
+  if (sourceSeason)
+    await prisma.$executeRaw`INSERT INTO analytics_manager_sources(season,entry_id,kind,payload) VALUES (${sourceSeason.value},${entryId},'transfers',${JSON.stringify(transfers)}::jsonb) ON CONFLICT(season,entry_id,kind) DO UPDATE SET payload=excluded.payload,fetched_at=now()`;
+
   // PK from manager_transfers.
   if (transfers.length > 0) {
     const values: unknown[] = [];
@@ -818,10 +641,8 @@ const ingestTransfersForEntry = async (
 // Each stratum has a "walk plan": how many distinct pages exist in one
 // cycle, and how to map an iteration index → standings page number.
 //
-// S1 and S2 are full-census strides (every page visited once), so the
-// mapping is trivial (idx → first_page + idx). S3 is a 1-in-N stride
-// over a much larger range; to keep partial cycles unbiased we visit
-// slots in golden-ratio interleaved order (see `stratumCPageForIndex`).
+// Each GW has a deterministic page permutation. A visits the top-10k frame;
+// B and C select bounded page clusters without replacement from their frames.
 //
 // The cursor stored in `app_metadata` is the *iteration index* (0-based
 // step count within the current cycle), not the raw page number. When a
@@ -831,27 +652,6 @@ type StratumWalk = {
   numSteps: number;
   pageOf: (idx: number) => number;
   stratum: 1 | 2 | 3;
-};
-
-const STRATUM_A_WALK: StratumWalk = {
-  cursorKey: CURSOR_KEY_A,
-  numSteps: STRATUM_A_LAST_PAGE,
-  pageOf: (idx) => idx + 1,
-  stratum: 1,
-};
-
-const STRATUM_B_WALK: StratumWalk = {
-  cursorKey: CURSOR_KEY_B,
-  numSteps: STRATUM_B_LAST_PAGE - STRATUM_B_FIRST_PAGE + 1,
-  pageOf: (idx) => STRATUM_B_FIRST_PAGE + idx,
-  stratum: 2,
-};
-
-const STRATUM_C_WALK: StratumWalk = {
-  cursorKey: CURSOR_KEY_C,
-  numSteps: STRATUM_C_TARGET_STEPS,
-  pageOf: stratumCPageForIndex,
-  stratum: 3,
 };
 
 const ingestFromStandings = async ({
@@ -895,19 +695,20 @@ const ingestFromStandings = async ({
       pageData = await withGovernor(governor, () =>
         fetchLeagueStandingsPage(OVERALL_LEAGUE_ID, page),
       );
-    } catch {
-      if (governor.shouldAbort) break;
-      console.warn(
-        `[populateManagers] Stratum ${walk.stratum}: skipping page ${page} after repeated failures.`,
+    } catch (error) {
+      // Leave the cursor on this page; a transient outage must not silently
+      // remove a cluster from the sample or mark an incomplete walk finalized.
+      throw new Error(
+        `Standings page ${page} in stratum ${walk.stratum} failed`,
+        { cause: error },
       );
-      idx += 1;
-      await writeIntCursor(walk.cursorKey, idx);
-      continue;
     }
 
     const entries = pageData.standings.results;
     stats.pagesProcessed += 1;
 
+    let pageComplete = true,
+      completedEntries = 0;
     for (let i = 0; i < entries.length; i += HISTORY_BATCH_SIZE) {
       if (governor.shouldAbort) break;
       if (stats.processed >= budget) break;
@@ -925,6 +726,7 @@ const ingestFromStandings = async ({
               isLiveCurrentGw,
               forceRefreshCurrentGw,
               governor,
+              page,
             );
           } catch {
             return "fetch_failed" as const;
@@ -932,9 +734,19 @@ const ingestFromStandings = async ({
         }),
       );
       for (const o of outcomes) recordOutcome(stats, o);
+      completedEntries += outcomes.length;
+      if (outcomes.some((o) => o === "fetch_failed")) pageComplete = false;
       await delay(governor.interBatchDelayMs);
     }
 
+    if (
+      !pageComplete ||
+      governor.shouldAbort ||
+      completedEntries !== entries.length
+    )
+      throw new Error(
+        `Sample page ${page} was not completely ingested; its cursor is retained for retry`,
+      );
     idx += 1;
     await writeIntCursor(walk.cursorKey, idx);
   }
@@ -947,717 +759,34 @@ const ingestFromStandings = async ({
   }
 };
 
-// Rebuild the (stratum, gw, captain_element, captain_multiplier) aggregate
-// table used by getTeamImpact.fetchCaptainRatesInStratum and
-// getManagerComparison.sampleMostCaptained. Single TRUNCATE+INSERT inside
-// a transaction so readers always see a consistent snapshot — no partial
-// state where some captains/GWs are missing.
-//
-// Exported so rebuildManagerReadModels can call this out-of-band (e.g.
-// immediately after deploying the schema, before the next populate cron
-// tick).
-export const rebuildStratumCaptainPicks = async (): Promise<void> => {
-  await prisma.$transaction([
-    prisma.$executeRawUnsafe(`TRUNCATE stratum_captain_picks_gw`),
-    prisma.$executeRawUnsafe(`
-      INSERT INTO stratum_captain_picks_gw
-        (stratum, gw, captain_element, captain_multiplier, picks, last_rebuilt)
-      SELECT
-        mp.sample_stratum,
-        mp.gw,
-        mp.captain_element,
-        mp.captain_multiplier,
-        COUNT(*)::int AS picks,
-        NOW()         AS last_rebuilt
-      FROM manager_picks mp
-      WHERE mp.captain_element IS NOT NULL
-        AND mp.captain_multiplier IS NOT NULL
-        AND mp.sampled_at_gw = mp.gw
-        AND mp.sample_stratum BETWEEN 1 AND 3
-      GROUP BY mp.sample_stratum, mp.gw, mp.captain_element, mp.captain_multiplier
-    `),
-  ]);
-};
-
-// Rebuild LiveFPL-style player exposure by causal pre-GW rank band. Managers
-// are selected from the post-GW standings with deliberately unequal sampling
-// rates, so raw counts would over-represent managers who moved into the top
-// 100k. Inverse-probability weights reconstruct the pre-GW band's population;
-// the stored sample_size is Kish effective N so request-time quality gates
-// still reflect statistical support rather than weighted population size.
-export const rebuildRankBandPlayerExposure = async ({
-  gwOnly,
-}: { gwOnly?: number } = {}): Promise<void> => {
-  const previousRankBand = rankBandSqlCase("mh_previous.overall_rank");
-  const pickGameweekFilter = gwOnly === undefined ? "" : " AND mpe.gw = $1";
-  const eventGameweekFilter = gwOnly === undefined ? "" : " AND e.id = $1";
-  const parameters = gwOnly === undefined ? [] : [gwOnly];
-  await prisma.$transaction([
-    // Readers retain the previous committed snapshot during this long rebuild.
-    // TRUNCATE would hold an exclusive table lock until the aggregate completes.
-    prisma.$executeRawUnsafe(
-      `DELETE FROM rank_band_player_exposure_gw${gwOnly === undefined ? "" : " WHERE gw = $1"}`,
-      ...parameters,
-    ),
-    prisma.$executeRawUnsafe(
-      `
-      INSERT INTO rank_band_player_exposure_gw
-        (rank_band, gw, element_id, sample_size, squad_picks, active_picks,
-         effective_multiplier_sum, last_rebuilt)
-      WITH same_gw_sampled_pick_rows AS (
-        SELECT
-          mpe.gw,
-          mpe.entry_id,
-          mpe.element_id,
-          mpe.multiplier,
-          mp.sample_stratum
-        FROM manager_pick_elements mpe
-        JOIN manager_picks mp
-          ON mp.entry_id = mpe.entry_id
-         AND mp.gw = mpe.gw
-         AND mp.sampled_at_gw = mpe.gw
-         AND mp.sample_stratum BETWEEN 1 AND 3
-        WHERE mpe.gw > 1${pickGameweekFilter}
-      ),
-      sample_stratum_sizes AS (
-        SELECT
-          gw,
-          sample_stratum,
-          COUNT(DISTINCT entry_id)::numeric AS sample_size
-        FROM same_gw_sampled_pick_rows
-        GROUP BY gw, sample_stratum
-      ),
-      sample_stratum_population_grid AS (
-        SELECT
-          e.id AS gw,
-          source.sample_stratum,
-          CASE source.sample_stratum
-            WHEN 1 THEN LEAST(${rankedPopulationSql("e")}, 10000)::numeric
-            WHEN 2 THEN GREATEST(LEAST(${rankedPopulationSql("e")}, 100000) - 10000, 0)::numeric
-            ELSE GREATEST(${rankedPopulationSql("e")} - 100000, 0)::numeric
-          END AS population
-        FROM events e
-        CROSS JOIN (VALUES (1), (2), (3)) AS source(sample_stratum)
-        WHERE e.id > 1${eventGameweekFilter}
-      ),
-      sample_coverage AS (
-        SELECT
-          p.gw,
-          BOOL_AND(
-            p.population = 0 OR COALESCE(s.sample_size, 0) > 0
-          ) AS complete
-        FROM sample_stratum_population_grid p
-        LEFT JOIN sample_stratum_sizes s
-          ON s.gw = p.gw
-         AND s.sample_stratum = p.sample_stratum
-        GROUP BY p.gw
-      ),
-      sample_weights AS (
-        SELECT
-          p.gw,
-          p.sample_stratum,
-          p.population / s.sample_size AS sample_weight
-        FROM sample_stratum_population_grid p
-        JOIN sample_stratum_sizes s
-          ON s.gw = p.gw
-         AND s.sample_stratum = p.sample_stratum
-        JOIN sample_coverage c ON c.gw = p.gw AND c.complete
-        WHERE p.population > 0
-      ),
-      causal_pick_rows AS (
-        SELECT
-          ${previousRankBand} AS rank_band,
-          sampled.gw,
-          sampled.entry_id,
-          sampled.element_id,
-          sampled.multiplier,
-          weight.sample_weight
-        FROM same_gw_sampled_pick_rows sampled
-        JOIN manager_history mh_previous
-          ON mh_previous.entry_id = sampled.entry_id
-         AND mh_previous.gw = sampled.gw - 1
-        JOIN sample_weights weight
-          ON weight.gw = sampled.gw
-         AND weight.sample_stratum = sampled.sample_stratum
-        WHERE mh_previous.overall_rank > 0
-      ),
-      weighted_manager_rows AS (
-        SELECT DISTINCT
-          rank_band,
-          gw,
-          entry_id,
-          sample_weight
-        FROM causal_pick_rows
-        WHERE rank_band BETWEEN 1 AND 9
-      ),
-      samples AS (
-        SELECT
-          rank_band,
-          gw,
-          GREATEST(
-            ROUND(
-              POWER(SUM(sample_weight), 2)
-                / NULLIF(SUM(sample_weight * sample_weight), 0)
-            )::int,
-            1
-          ) AS sample_size,
-          SUM(sample_weight)::numeric AS weighted_population
-        FROM weighted_manager_rows
-        GROUP BY rank_band, gw
-      ),
-      player_exposure AS (
-        SELECT
-          rank_band,
-          gw,
-          element_id,
-          SUM(sample_weight)::numeric AS weighted_squad_picks,
-          COALESCE(
-            SUM(sample_weight) FILTER (WHERE multiplier > 0),
-            0
-          )::numeric AS weighted_active_picks,
-          COALESCE(
-            SUM(multiplier * sample_weight),
-            0
-          )::numeric AS weighted_multiplier_sum
-        FROM causal_pick_rows
-        WHERE rank_band BETWEEN 1 AND 9
-        GROUP BY rank_band, gw, element_id
-      ),
-      gw1_pick_rows AS (
-        SELECT
-          mpe.entry_id,
-          mpe.element_id,
-          mpe.multiplier,
-          CASE
-            WHEN mh_end.overall_rank <= 10000 THEN 1
-            WHEN mh_end.overall_rank <= 100000 THEN 2
-            ELSE 3
-          END AS outcome_stratum
-        FROM manager_pick_elements mpe
-        JOIN manager_history mh_end
-          ON mh_end.entry_id = mpe.entry_id
-         AND mh_end.gw = mpe.gw
-        WHERE mpe.gw = 1${pickGameweekFilter}
-          AND mh_end.overall_rank > 0
-      ),
-      gw1_samples AS (
-        SELECT outcome_stratum, COUNT(DISTINCT entry_id)::int AS sample_size
-        FROM gw1_pick_rows
-        GROUP BY outcome_stratum
-      ),
-      gw1_population AS (
-        SELECT 1 AS outcome_stratum,
-               LEAST(ranked_count, 10000)::numeric AS population
-        FROM events WHERE id = 1
-        UNION ALL
-        SELECT 2,
-               GREATEST(LEAST(ranked_count, 100000) - 10000, 0)::numeric
-        FROM events WHERE id = 1
-        UNION ALL
-        SELECT 3,
-               GREATEST(ranked_count - 100000, 0)::numeric
-        FROM events WHERE id = 1
-      ),
-      gw1_covered_population AS (
-        SELECT SUM(p.population)::numeric AS population
-        FROM gw1_population p
-        JOIN gw1_samples s USING (outcome_stratum)
-        WHERE s.sample_size > 0 AND p.population > 0
-      ),
-      gw1_player_exposure AS (
-        SELECT
-          outcome_stratum,
-          element_id,
-          COUNT(*)::int AS squad_picks,
-          COUNT(*) FILTER (WHERE multiplier > 0)::int AS active_picks,
-          COALESCE(SUM(multiplier), 0)::int AS effective_multiplier_sum
-        FROM gw1_pick_rows
-        GROUP BY outcome_stratum, element_id
-      ),
-      gw1_weighted AS (
-        SELECT
-          0::int AS rank_band,
-          1::int AS gw,
-          pe.element_id,
-          1000000::int AS sample_size,
-          ROUND(
-            SUM(pe.squad_picks::numeric / s.sample_size * p.population)
-              / cp.population * 1000000
-          )::int AS squad_picks,
-          ROUND(
-            SUM(pe.active_picks::numeric / s.sample_size * p.population)
-              / cp.population * 1000000
-          )::int AS active_picks,
-          ROUND(
-            SUM(pe.effective_multiplier_sum::numeric / s.sample_size * p.population)
-              / cp.population * 1000000
-          )::int AS effective_multiplier_sum
-        FROM gw1_player_exposure pe
-        JOIN gw1_samples s USING (outcome_stratum)
-        JOIN gw1_population p USING (outcome_stratum)
-        CROSS JOIN gw1_covered_population cp
-        WHERE cp.population > 0
-        GROUP BY pe.element_id, cp.population
-      )
-      SELECT
-        pe.rank_band,
-        pe.gw,
-        pe.element_id,
-        s.sample_size,
-        ROUND(
-          pe.weighted_squad_picks / s.weighted_population * s.sample_size
-        )::int AS squad_picks,
-        ROUND(
-          pe.weighted_active_picks / s.weighted_population * s.sample_size
-        )::int AS active_picks,
-        ROUND(
-          pe.weighted_multiplier_sum / s.weighted_population * s.sample_size
-        )::int AS effective_multiplier_sum,
-        NOW() AS last_rebuilt
-      FROM player_exposure pe
-      JOIN samples s ON s.rank_band = pe.rank_band AND s.gw = pe.gw
-      UNION ALL
-      SELECT
-        rank_band,
-        gw,
-        element_id,
-        sample_size,
-        squad_picks,
-        active_picks,
-        effective_multiplier_sum,
-        NOW() AS last_rebuilt
-      FROM gw1_weighted
-    `,
-      ...parameters,
-    ),
-  ]);
-};
-
-// Rebuild the (stratum, gw) running-stats table used by
-// getManagerComparison.sampleStratumAggregates. Single TRUNCATE+INSERT
-// inside a transaction so readers always see a consistent snapshot — no
-// partial state where some (stratum, gw) buckets are missing.
-//
-// Tiny output: 3 strata × ≤38 GWs = ≤114 rows. The expensive part is the
-// GROUP BY over manager_cumulative (~75M rows on prod) — typically ~30–60s
-// on the prod CX23. This runs once per cron cycle (15 min cadence), not
-// per request, which is the entire point: the per-request DISTINCT ON
-// over the same partition is what was costing 15–25 s on cold cache.
-//
-// Population filter (stable_managers CTE): the read path subtracts
-// (sum at end_gw) − (sum at start_gw − 1). That subtraction is only
-// well-defined when the SAME set of managers contributes to both
-// endpoints. Without a filter, managers whose latest manager_cumulative
-// row is some past GW (ingested weeks ago, not yet re-walked) contribute
-// to the start anchor but not the end, producing negative deltas in
-// sampleStratumAggregates. The CTE restricts every (stratum, gw) row to
-// managers who have a row at the current max GW — i.e. the cohort that
-// is actually up-to-date — so the subtraction is well-defined.
-//
-// Exported so rebuildManagerReadModels can call this out-of-band (e.g.
-// immediately after applying the schema migration so the new read path
-// has a populated table to read from before the next 15-minute populate
-// tick).
-export const rebuildStratumGwRunningStats = async (): Promise<void> => {
-  await prisma.$transaction([
-    prisma.$executeRawUnsafe(`TRUNCATE stratum_gw_running_stats`),
-    prisma.$executeRawUnsafe(`
-      WITH current_max AS (
-        SELECT MAX(gw) AS gw FROM manager_cumulative
-      ),
-      stable_managers AS (
-        SELECT mc.entry_id
-        FROM manager_cumulative mc
-        JOIN current_max cm ON mc.gw = cm.gw
-      )
-      INSERT INTO stratum_gw_running_stats
-        (stratum, gw, sample_size,
-         sum_cum_points, sum_cum_transfers, sum_cum_hits_cost,
-         sum_cum_bench, sum_cum_captain_bonus, sum_gws_played,
-         count_with_transfers, count_with_hits, count_with_bench,
-         count_with_chips,
-         cum_wildcards_h1, cum_wildcards_h2,
-         cum_freehits_h1,  cum_freehits_h2,
-         cum_bboosts_h1,   cum_bboosts_h2,
-         last_rebuilt)
-      SELECT
-        mc.stratum,
-        mc.gw,
-        COUNT(*)::int                                              AS sample_size,
-        SUM(mc.cumulative_points)::bigint                          AS sum_cum_points,
-        SUM(mc.cumulative_transfers)::bigint                       AS sum_cum_transfers,
-        SUM(mc.cumulative_hits_cost)::bigint                       AS sum_cum_hits_cost,
-        SUM(mc.cumulative_bench)::bigint                           AS sum_cum_bench,
-        SUM(mc.cumulative_captain_bonus)::bigint                   AS sum_cum_captain_bonus,
-        SUM(mc.gws_played)::bigint                                 AS sum_gws_played,
-        COUNT(*) FILTER (WHERE mc.has_transfers)::int              AS count_with_transfers,
-        COUNT(*) FILTER (WHERE mc.has_hits)::int                   AS count_with_hits,
-        COUNT(*) FILTER (WHERE mc.has_bench)::int                  AS count_with_bench,
-        COUNT(*) FILTER (WHERE ms.has_chip_history)::int           AS count_with_chips,
-        COUNT(*) FILTER (WHERE mc.chip_wildcard_h1)::int           AS cum_wildcards_h1,
-        COUNT(*) FILTER (WHERE mc.chip_wildcard_h2)::int           AS cum_wildcards_h2,
-        COUNT(*) FILTER (WHERE mc.chip_freehit_h1)::int            AS cum_freehits_h1,
-        COUNT(*) FILTER (WHERE mc.chip_freehit_h2)::int            AS cum_freehits_h2,
-        COUNT(*) FILTER (WHERE mc.chip_bboost_h1)::int             AS cum_bboosts_h1,
-        COUNT(*) FILTER (WHERE mc.chip_bboost_h2)::int             AS cum_bboosts_h2,
-        NOW()                                                      AS last_rebuilt
-      FROM manager_cumulative mc
-      JOIN stable_managers sm ON sm.entry_id = mc.entry_id
-      JOIN manager_summary ms ON ms.entry_id = mc.entry_id
-      GROUP BY mc.stratum, mc.gw
-    `),
-  ]);
-};
-
-// Per-(comparison cohort, start_gw, end_gw) precomputed avg net points per
-// transfer. For start_gw > 1, stratum is determined by overall rank after
-// start_gw - 1, before any points in the selected range can affect it. Ranges
-// beginning at GW1 use end-GW rank so the UI can describe what managers who
-// finished the selected range in the Top 100k/10k did.
-// Replaces the per-request sampleAvgPtsPerTransfer query that dominated
-// comparison-endpoint latency. See stratum_range_xfer_avg in schema.prisma
-// for the model and read-path semantics.
-//
-// Two modes:
-//   - `endGwOnly` (cron): refresh only the rows for end_gw=currentGw.
-//     The aggregation cost scales with one end_gw column (~currentGw rows ×
-//     3 strata) instead of the full grid (~currentGw²/2 rows × 3). Older
-//     end_gws are left in place — they drift slightly as new managers
-//     ingest, but the drift is bounded (~few percent per cron) and a manual
-//     backfill resyncs.
-//   - no args (backfill): full rebuild of every (start_gw, end_gw) row.
-//     TRUNCATE then INSERT one (start_gw, end_gw) at a time so each query's
-//     working set stays bounded; total runtime is ~10-30 min on prod.
-//
-// Each per-(start_gw, end_gw) INSERT is structurally the same query that
-// sampleAvgPtsPerTransfer ran per request, just executed once per range
-// instead of once per request. The FULL stratum-3 ingested sample is used
-// (no entry_id % 32 sub-sample), which improves precision vs the previous
-// request-time path.
-export const rebuildStratumRangeXferAvg = async (options?: {
-  endGwOnly?: number;
-}): Promise<void> => {
-  const sampledGw = await prisma.manager_cumulative.aggregate({
-    _max: { gw: true },
-  });
-  const maxGw = sampledGw._max.gw ?? 0;
-  if (maxGw < 1) {
-    if (options?.endGwOnly === undefined) {
-      await prisma.$executeRawUnsafe(`TRUNCATE stratum_range_xfer_avg`);
-    }
-    return;
-  }
-
-  const endGws =
-    options?.endGwOnly !== undefined
-      ? options.endGwOnly >= 1 && options.endGwOnly <= maxGw
-        ? [options.endGwOnly]
-        : []
-      : Array.from({ length: maxGw }, (_, i) => i + 1);
-
-  if (options?.endGwOnly === undefined) {
-    await prisma.$executeRawUnsafe(`TRUNCATE stratum_range_xfer_avg`);
-  } else if (endGws.length > 0) {
-    // Brief inconsistency window (~1-3s per start_gw) where readers see
-    // missing rows for this end_gw column. Acceptable: read path returns
-    // null for missing rows, which the UI renders the same as
-    // not-enough-data. UPSERT would avoid the window but complicates the
-    // SQL; the gap is small enough not to bother.
-    await prisma.$executeRawUnsafe(
-      `DELETE FROM stratum_range_xfer_avg WHERE end_gw = $1`,
-      options.endGwOnly,
-    );
-  }
-
-  for (const endGw of endGws) {
-    for (let startGw = 1; startGw <= endGw; startGw++) {
-      await prisma.$executeRawUnsafe(
-        `
-        INSERT INTO stratum_range_xfer_avg
-          (stratum, start_gw, end_gw, sum_per_manager_avg, managers_with_xfers,
-           with_data, stratum_size, last_rebuilt)
-        WITH point_windows AS (
-          SELECT h.footballer_id, gw_series.gw,
-                 SUM(h.total_points)::float AS pts
-          FROM generate_series($1::int, $2::int) AS gw_series(gw)
-          JOIN history h ON h.round BETWEEN gw_series.gw AND $2::int
-          GROUP BY h.footballer_id, gw_series.gw
-        ),
-        per_manager AS (
-          SELECT
-                 mt.entry_id,
-                 CASE
-                   WHEN cohort_rank.overall_rank BETWEEN 1 AND 10000 THEN 1
-                   WHEN cohort_rank.overall_rank BETWEEN 10001 AND 100000 THEN 2
-                   WHEN cohort_rank.overall_rank > 100000 THEN 3
-                   ELSE NULL
-                 END::int AS stratum,
-                 SUM(COALESCE(in_pts.pts, 0) - COALESCE(out_pts.pts, 0))::float AS net,
-                 COUNT(*)::int AS xfers
-          FROM manager_transfers mt
-          JOIN manager_history cohort_rank
-            ON cohort_rank.entry_id = mt.entry_id
-           AND cohort_rank.gw = CASE WHEN $1::int = 1 THEN $2::int ELSE $1::int - 1 END
-          LEFT JOIN point_windows in_pts
-            ON in_pts.footballer_id = mt.in_element AND in_pts.gw = mt.gw
-          LEFT JOIN point_windows out_pts
-            ON out_pts.footballer_id = mt.out_element AND out_pts.gw = mt.gw
-          WHERE mt.gw BETWEEN $1::int AND $2::int
-            AND cohort_rank.overall_rank > 0
-          GROUP BY mt.entry_id, cohort_rank.overall_rank
-        ),
-        agg AS (
-          SELECT stratum,
-                 SUM(net / NULLIF(xfers, 0))::float AS sum_per_manager_avg,
-                 COUNT(*)::int AS managers_with_xfers
-          FROM per_manager
-          WHERE xfers > 0
-          GROUP BY 1
-        ),
-        sizes AS (
-          SELECT
-                 CASE
-                   WHEN mh.overall_rank BETWEEN 1 AND 10000 THEN 1
-                   WHEN mh.overall_rank BETWEEN 10001 AND 100000 THEN 2
-                   WHEN mh.overall_rank > 100000 THEN 3
-                   ELSE NULL
-                 END::int AS stratum,
-                 COUNT(*) FILTER (WHERE ms.has_transfer_history)::int AS with_data,
-                 COUNT(*)::int AS stratum_size
-          FROM manager_summary ms
-          JOIN manager_history mh
-            ON mh.entry_id = ms.entry_id
-           AND mh.gw = CASE WHEN $1::int = 1 THEN $2::int ELSE $1::int - 1 END
-          WHERE mh.overall_rank > 0
-          GROUP BY 1
-        ),
-        strata AS (SELECT unnest(ARRAY[1, 2, 3]::int[]) AS stratum)
-        SELECT
-          st.stratum,
-          $1::int,
-          $2::int,
-          COALESCE(a.sum_per_manager_avg, 0)::float,
-          COALESCE(a.managers_with_xfers, 0)::int,
-          COALESCE(sz.with_data, 0)::int,
-          COALESCE(sz.stratum_size, 0)::int,
-          NOW()
-        FROM strata st
-        LEFT JOIN sizes sz ON sz.stratum = st.stratum
-        LEFT JOIN agg a ON a.stratum = st.stratum
-        `,
-        startGw,
-        endGw,
-      );
-    }
-  }
-};
-
-type RangeScoreBucketRebuildOptions = {
-  endGwOnly?: number;
-};
-
-const rebuildManagerRangeScoreBucketsForEndGw = async (
-  endGw: number,
-): Promise<void> => {
-  await prisma.$transaction([
-    prisma.$executeRawUnsafe(
-      `DROP TABLE IF EXISTS tmp_manager_range_bucket_end`,
-    ),
-    prisma.$executeRawUnsafe(
-      `DROP TABLE IF EXISTS tmp_manager_range_bucket_start`,
-    ),
-    prisma.$executeRaw`
-      CREATE TEMP TABLE tmp_manager_range_bucket_end
-      ON COMMIT DROP
-      AS
-      SELECT
-        mc.entry_id,
-        COALESCE(
-          CASE
-            WHEN mh.overall_rank > 0 AND mh.overall_rank <= 10000 THEN 1
-            WHEN mh.overall_rank > 10000 AND mh.overall_rank <= 100000 THEN 2
-            WHEN mh.overall_rank > 100000 THEN 3
-            ELSE NULL
-          END,
-          mc.stratum
-        )::int AS stratum,
-        mc.cumulative_points
-      FROM manager_cumulative mc
-      LEFT JOIN manager_history mh
-        ON mh.entry_id = mc.entry_id AND mh.gw = mc.gw
-      WHERE mc.gw = ${endGw}
-    `,
-    prisma.$executeRaw`
-      CREATE TEMP TABLE tmp_manager_range_bucket_start
-      ON COMMIT DROP
-      AS
-      SELECT c.entry_id, c.gw, c.cumulative_points
-      FROM manager_cumulative c
-      JOIN tmp_manager_range_bucket_end e ON e.entry_id = c.entry_id
-      WHERE c.gw >= 1 AND c.gw < ${endGw}
-    `,
-    prisma.$executeRawUnsafe(
-      `CREATE INDEX tmp_manager_range_bucket_start_idx
-       ON tmp_manager_range_bucket_start (entry_id, gw)`,
-    ),
-    prisma.$executeRawUnsafe(`ANALYZE tmp_manager_range_bucket_end`),
-    prisma.$executeRawUnsafe(`ANALYZE tmp_manager_range_bucket_start`),
-    prisma.$executeRaw`
-      DELETE FROM manager_range_score_buckets
-      WHERE end_gw = ${endGw}
-    `,
-    prisma.$executeRaw`
-      INSERT INTO manager_range_score_buckets
-        (stratum, start_gw, end_gw, range_total, managers, last_rebuilt)
-      WITH starts AS (
-        SELECT generate_series(1, ${endGw})::int AS start_gw
-      )
-      SELECT
-        c_end.stratum,
-        starts.start_gw,
-        ${endGw}::int AS end_gw,
-        (c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0))::int
-          AS range_total,
-        COUNT(*)::int AS managers,
-        NOW() AS last_rebuilt
-      FROM tmp_manager_range_bucket_end c_end
-      CROSS JOIN starts
-      LEFT JOIN tmp_manager_range_bucket_start c_start
-        ON c_start.entry_id = c_end.entry_id
-       AND c_start.gw = starts.start_gw - 1
-      GROUP BY
-        c_end.stratum,
-        starts.start_gw,
-        c_end.cumulative_points - COALESCE(c_start.cumulative_points, 0)
-    `,
-  ]);
-};
-
-export const rebuildManagerRangeScoreBuckets = async ({
-  endGwOnly,
-}: RangeScoreBucketRebuildOptions = {}): Promise<void> => {
-  const sampledGw = await prisma.manager_cumulative.aggregate({
-    _max: { gw: true },
-  });
-  const currentGw = sampledGw._max.gw ?? (await getCurrentSampleGameweek()).gw;
-  if (currentGw < 1) {
-    await prisma.$executeRawUnsafe(`TRUNCATE manager_range_score_buckets`);
-    return;
-  }
-
-  if (endGwOnly !== undefined) {
-    const endGw = Math.min(Math.max(endGwOnly, 1), currentGw);
-    await rebuildManagerRangeScoreBucketsForEndGw(endGw);
-    return;
-  }
-
-  await prisma.$executeRaw`
-    DELETE FROM manager_range_score_buckets
-    WHERE end_gw > ${currentGw}
-  `;
-  for (let endGw = 1; endGw <= currentGw; endGw += 1) {
-    await rebuildManagerRangeScoreBucketsForEndGw(endGw);
-  }
-};
-
-export const rangeScoreBucketsNeedRefresh = async (
-  endGw: number,
-): Promise<boolean> => {
-  const rows = await prisma.$queryRaw<
-    Array<{
-      cumulative_sample: number;
-      bucket_sample: number;
-    }>
-  >`
-    WITH cumulative AS (
-      SELECT
-        COALESCE(
-          CASE
-            WHEN mh.overall_rank > 0 AND mh.overall_rank <= 10000 THEN 1
-            WHEN mh.overall_rank > 10000 AND mh.overall_rank <= 100000 THEN 2
-            WHEN mh.overall_rank > 100000 THEN 3
-            ELSE NULL
-          END,
-          mc.stratum
-        )::int AS stratum,
-        COUNT(*)::int AS sample_size
-      FROM manager_cumulative mc
-      LEFT JOIN manager_history mh
-        ON mh.entry_id = mc.entry_id AND mh.gw = mc.gw
-      WHERE mc.gw = ${endGw}
-      GROUP BY 1
-    ),
-    buckets AS (
-      SELECT stratum, SUM(managers)::int AS sample_size
-      FROM manager_range_score_buckets
-      WHERE start_gw = 1 AND end_gw = ${endGw}
-      GROUP BY stratum
-    )
-    SELECT
-      COALESCE(c.sample_size, 0)::int AS cumulative_sample,
-      COALESCE(b.sample_size, 0)::int AS bucket_sample
-    FROM cumulative c
-    FULL OUTER JOIN buckets b ON b.stratum = c.stratum
-  `;
-
-  return rows.some((row) => row.cumulative_sample !== row.bucket_sample);
-};
-
 type ManagerReadModelRebuildOptions = {
   rangeBuckets?: "all" | "latest";
-  transferAverages?: "latest" | "skip";
   exposureGw?: number;
 };
 
 export const rebuildManagerReadModels = async ({
   rangeBuckets = "all",
-  transferAverages = "latest",
   exposureGw,
 }: ManagerReadModelRebuildOptions = {}): Promise<void> => {
-  const captainStarted = Date.now();
-  await rebuildStratumCaptainPicks();
+  const { season } = await seasonState();
+  const latest = await prisma.events.aggregate({ _max: { id: true } });
+  const end = exposureGw ?? latest._max.id ?? 0;
+  for (let gw = rangeBuckets === "all" ? 1 : end; gw <= end; gw++)
+    await enqueue({
+      key: `benchmark:${season}:${gw}`,
+      kind: "benchmark",
+      season,
+      start: gw,
+      end: gw,
+    });
   console.info(
-    `[populateManagers] stratum_captain_picks_gw rebuilt in ${Math.round((Date.now() - captainStarted) / 1000)}s`,
+    JSON.stringify({
+      event: "benchmark_jobs_enqueued",
+      season,
+      end,
+      mode: rangeBuckets,
+    }),
   );
-
-  const exposureStarted = Date.now();
-  await rebuildRankBandPlayerExposure({ gwOnly: exposureGw });
-  console.info(
-    `[populateManagers] rank_band_player_exposure_gw rebuilt${exposureGw === undefined ? "" : ` (gw=${exposureGw})`} in ${Math.round((Date.now() - exposureStarted) / 1000)}s`,
-  );
-
-  const runningStarted = Date.now();
-  await rebuildStratumGwRunningStats();
-  console.info(
-    `[populateManagers] stratum_gw_running_stats rebuilt in ${Math.round((Date.now() - runningStarted) / 1000)}s`,
-  );
-
-  const bucketStarted = Date.now();
-  const sampledGw = await prisma.manager_cumulative.aggregate({
-    _max: { gw: true },
-  });
-  const currentGw = sampledGw._max.gw ?? 0;
-  await rebuildManagerRangeScoreBuckets(
-    rangeBuckets === "latest" && currentGw >= 1
-      ? { endGwOnly: currentGw }
-      : undefined,
-  );
-  console.info(
-    `[populateManagers] manager_range_score_buckets rebuilt${rangeBuckets === "latest" && currentGw >= 1 ? ` (end_gw=${currentGw})` : ""} in ${Math.round((Date.now() - bucketStarted) / 1000)}s`,
-  );
-
-  // Refresh only the latest end_gw column of stratum_range_xfer_avg. This
-  // includes every possible start GW for the current endpoint and keeps the
-  // comparison cohort rows current as new manager transfer histories arrive.
-  const xferStarted = Date.now();
-  if (transferAverages === "latest" && currentGw >= 1) {
-    await rebuildStratumRangeXferAvg({ endGwOnly: currentGw });
-    console.info(
-      `[populateManagers] stratum_range_xfer_avg (end_gw=${currentGw}) rebuilt in ${Math.round((Date.now() - xferStarted) / 1000)}s`,
-    );
-  } else if (transferAverages === "skip") {
-    console.info("[populateManagers] stratum_range_xfer_avg rebuild skipped");
-  }
 };
 
 export const populateManagers = async (
@@ -1699,6 +828,59 @@ export const populateManagers = async (
       );
       return;
     }
+
+    const { season } = await seasonState();
+    const populationKey = `analytics_sample_population:${season}:${currentGw}`;
+    const storedPopulation = await prisma.app_metadata.findUnique({
+      where: { key: populationKey },
+    });
+    const population = storedPopulation
+      ? Number(storedPopulation.value)
+      : ((
+          await prisma.events.findUnique({
+            where: { id: currentGw },
+            select: { ranked_count: true },
+          })
+        )?.ranked_count ?? 0);
+    if (population <= 0)
+      throw new Error("Cannot sample an unknown ranked population");
+    if (!storedPopulation)
+      await prisma.app_metadata.create({
+        data: { key: populationKey, value: String(population) },
+      });
+    const plans = [
+      samplePages(
+        1,
+        Math.min(200, Math.ceil(population / 50)),
+        200,
+        `${season}:${currentGw}:1`,
+      ),
+      samplePages(
+        201,
+        Math.min(2000, Math.ceil(population / 50)),
+        200,
+        `${season}:${currentGw}:2`,
+      ),
+      samplePages(
+        2001,
+        Math.ceil(population / 50),
+        400,
+        `${season}:${currentGw}:3`,
+      ),
+    ];
+    const makeWalk = (
+      pages: number[],
+      stratum: 1 | 2 | 3,
+      cursorKey: string,
+    ): StratumWalk => ({
+      numSteps: pages.length,
+      stratum,
+      cursorKey,
+      pageOf: (index) => pages[index] ?? 0,
+    });
+    const walkA = makeWalk(plans[0]!, 1, CURSOR_KEY_A),
+      walkB = makeWalk(plans[1]!, 2, CURSOR_KEY_B),
+      walkC = makeWalk(plans[2]!, 3, CURSOR_KEY_C);
 
     // Rank-impact endpoints need a score-to-overall-rank curve that remains
     // coherent while matches are live. Refresh it independently from the
@@ -1782,9 +964,9 @@ export const populateManagers = async (
     // end of the iteration range. C never goes "done" on the same
     // condition because we want to keep refilling its sample (cycle wraps
     // each time A and B finish a pass).
-    const aDone = !isLiveCurrentGw && aIdx >= STRATUM_A_WALK.numSteps;
-    const bDone = !isLiveCurrentGw && bIdx >= STRATUM_B_WALK.numSteps;
-    const cDone = !isLiveCurrentGw && cIdx >= STRATUM_C_WALK.numSteps;
+    const aDone = !isLiveCurrentGw && aIdx >= walkA.numSteps;
+    const bDone = !isLiveCurrentGw && bIdx >= walkB.numSteps;
+    const cDone = !isLiveCurrentGw && cIdx >= walkC.numSteps;
 
     // Budget allocation: keep A moving while it has work, but always reserve
     // the bulk of the budget for C so the deep tail fills as quickly as
@@ -1806,13 +988,13 @@ export const populateManagers = async (
     const budgetC = cDone ? 0 : MAX_MANAGERS_PER_RUN - budgetA - budgetB;
 
     console.info(
-      `[populateManagers] Starting: currentGw ${currentGw}${isLiveCurrentGw ? " live" : ""}, A idx ${aIdx}/${STRATUM_A_WALK.numSteps} (budget ${budgetA}), B idx ${bIdx}/${STRATUM_B_WALK.numSteps} (budget ${budgetB}), C idx ${cIdx}/${STRATUM_C_WALK.numSteps} (target ${STRATUM_C_TARGET_MANAGERS}, budget ${budgetC}), samplePicks ${INGEST_SAMPLE_PICKS}, sampleTransfers ${INGEST_SAMPLE_TRANSFERS}`,
+      `[populateManagers] Starting: currentGw ${currentGw}${isLiveCurrentGw ? " live" : ""}, A idx ${aIdx}/${walkA.numSteps} (budget ${budgetA}), B idx ${bIdx}/${walkB.numSteps} (budget ${budgetB}), C idx ${cIdx}/${walkC.numSteps} (target ${STRATUM_C_TARGET_MANAGERS}, budget ${budgetC}), samplePicks ${INGEST_SAMPLE_PICKS}, sampleTransfers ${INGEST_SAMPLE_TRANSFERS}`,
     );
 
     if (budgetA > 0) {
       const target = stats.processed + budgetA;
       await ingestFromStandings({
-        walk: STRATUM_A_WALK,
+        walk: walkA,
         budget: target,
         currentGw,
         isLiveCurrentGw,
@@ -1825,7 +1007,7 @@ export const populateManagers = async (
     if (!governor.shouldAbort && budgetB > 0) {
       const target = stats.processed + budgetB;
       await ingestFromStandings({
-        walk: STRATUM_B_WALK,
+        walk: walkB,
         budget: target,
         currentGw,
         isLiveCurrentGw,
@@ -1838,7 +1020,7 @@ export const populateManagers = async (
     if (!governor.shouldAbort && budgetC > 0) {
       const target = stats.processed + budgetC;
       await ingestFromStandings({
-        walk: STRATUM_C_WALK,
+        walk: walkC,
         budget: target,
         currentGw,
         isLiveCurrentGw,
@@ -1848,6 +1030,10 @@ export const populateManagers = async (
       });
     }
 
+    if (governor.shouldAbort)
+      throw new Error(
+        "Manager collection stopped after repeated upstream failures",
+      );
     if (!isLiveCurrentGw) {
       const [finalAIdx, finalBIdx, finalCIdx] = await Promise.all([
         readIntCursor(CURSOR_KEY_A, 0),
@@ -1855,9 +1041,9 @@ export const populateManagers = async (
         readIntCursor(CURSOR_KEY_C, 0),
       ]);
       if (
-        finalAIdx >= STRATUM_A_WALK.numSteps &&
-        finalBIdx >= STRATUM_B_WALK.numSteps &&
-        finalCIdx >= STRATUM_C_WALK.numSteps
+        finalAIdx >= walkA.numSteps &&
+        finalBIdx >= walkB.numSteps &&
+        finalCIdx >= walkC.numSteps
       ) {
         await writeIntCursor(SAMPLE_GW_FINALIZED_KEY, 1);
       }
@@ -1875,7 +1061,6 @@ export const populateManagers = async (
       try {
         await rebuildManagerReadModels({
           rangeBuckets: "latest",
-          transferAverages: "latest",
           // Finished historical exposure snapshots are already published.
           // Rebuilding every GW here spills gigabytes from old sample picks
           // and can exhaust the API/database's shared production filesystem.
@@ -1889,24 +1074,13 @@ export const populateManagers = async (
           "[populateManagers] manager read model rebuild failed:",
           (err as Error).message,
         );
+        throw err;
       }
     } else if (!governor.shouldAbort) {
-      const bucketStale =
-        currentGw >= 1 && (await rangeScoreBucketsNeedRefresh(currentGw));
-      if (bucketStale) {
-        const bucketStarted = Date.now();
-        try {
-          await rebuildManagerRangeScoreBuckets({ endGwOnly: currentGw });
-          console.info(
-            `[populateManagers] manager_range_score_buckets repaired (end_gw=${currentGw}) in ${Math.round((Date.now() - bucketStarted) / 1000)}s`,
-          );
-        } catch (err) {
-          console.error(
-            "[populateManagers] manager range bucket repair failed:",
-            (err as Error).message,
-          );
-        }
-      }
+      await rebuildManagerReadModels({
+        rangeBuckets: "latest",
+        exposureGw: currentGw,
+      });
     }
 
     if (
@@ -1929,11 +1103,20 @@ export const populateManagers = async (
       }
     }
 
+    await prisma.app_metadata.upsert({
+      where: { key: "analytics_last_collector_success" },
+      create: {
+        key: "analytics_last_collector_success",
+        value: new Date().toISOString(),
+      },
+      update: { value: new Date().toISOString() },
+    });
     console.info(
       `[populateManagers] Run finished: ${JSON.stringify({ ...stats, aborted: governor.shouldAbort, finalDelayMs: governor.interBatchDelayMs })}`,
     );
   } catch (err) {
     console.error("[populateManagers] Run failed:", (err as Error).message);
+    throw err;
   } finally {
     releaseLock();
     await prisma.$disconnect();
@@ -1948,5 +1131,9 @@ if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   // wider error budget guards against transient FPL hiccups during
   // multi-hour buildup runs without masking real 429/503 problems
   // (those still trip the dedicated 5-minute pause path).
-  await populateManagers({ abortAfterConsecutiveErrors: 20 });
+  try {
+    await populateManagers({ abortAfterConsecutiveErrors: 20 });
+  } catch {
+    process.exitCode = 1;
+  }
 }

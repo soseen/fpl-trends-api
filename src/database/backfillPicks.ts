@@ -14,7 +14,7 @@ import {
 import {
   rebuildRankBandPlayerExposure,
   rebuildStratumCaptainPicks,
-} from "./populateManagers.js";
+} from "./legacyManagerReadModels.js";
 import { delay } from "../utils.js";
 
 // Long-running backfill of `manager_picks` for every (sampled manager, finished GW)

@@ -652,7 +652,7 @@ export const getManagerTransfers = async (
 
   const [resolved, history, resolvedRequiredPicks, historicalPicks] =
     await Promise.all([
-      resolveTransfers(entryId, true),
+      resolveTransfers(entryId),
       fetchLiveManagerHistory(entryId),
       resolvePicks(entryId, requiredPicksRange),
       startGw > 1

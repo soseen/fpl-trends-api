@@ -9,7 +9,7 @@
     "dev": "tsx src/server.ts",
     "build": "prisma generate && tsc",
     "bootstrap": "prisma generate && tsc && npm run migrate && npm run populate",
-    "deploy": "git pull && npm install && npm run build && npm run migrate && pm2 restart fpl-trends-api && (npm run kill-populate || true)",
+    "deploy": "git pull && npm install && npm run build && npm run migrate && pm2 startOrReload ops/ecosystem.config.cjs --update-env && (npm run kill-populate || true)",
     "typecheck": "tsc --noEmit",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
@@ -34,7 +34,15 @@
     "reset-manager-analytics": "tsx src/database/resetManagerAnalytics.ts",
     "check-local-state": "tsx src/database/checkLocalState.ts",
     "reset-season": "tsx src/database/resetSeason.ts",
-    "migrate": "npx prisma migrate deploy"
+    "migrate": "npx prisma migrate deploy",
+    "analytics:worker": "tsx src/analytics/worker.ts",
+    "analytics:benchmarks": "tsx src/database/rebuildManagerReadModels.ts",
+    "contracts:generate": "node scripts/generate-analytics-contracts.mjs",
+    "analytics:benchmark": "tsx src/analytics/benchmark.ts",
+    "analytics:replay": "tsx src/analytics/replay.ts",
+    "analytics:calibrate": "tsx src/analytics/calibrate.ts",
+    "analytics:prune": "tsx src/analytics/retention.ts",
+    "contracts:check": "node scripts/generate-analytics-contracts.mjs --check"
   },
   "keywords": [],
   "author": "",
@@ -49,7 +57,8 @@
     "express-rate-limit": "^8.5.0",
     "helmet": "^8.0.0",
     "pg": "^8.13.1",
-    "tsx": "^4.19.3"
+    "tsx": "^4.19.3",
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@eslint/js": "^9.17.0",

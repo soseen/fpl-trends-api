@@ -93,18 +93,21 @@ Bulk endpoints are cached globally until `populate` invalidates them:
 - `GET /api/populate`: runs season-aware populate and clears response
   cache
 
-Manager endpoints use FPL entry IDs, validate IDs/ranges, and cache
-range responses for five minutes:
+My Trends uses one prepared-analysis endpoint:
 
-- `GET /api/manager/:id/summary`
-- `GET /api/manager/:id/trajectory`
-- `GET /api/manager/:id/range-rank?start=N&end=M`
-- `GET /api/manager/:id/comparison?start=N&end=M`
-- `GET /api/manager/:id/team-impact?start=N&end=M`
-- `GET /api/manager/:id/transfers?start=N&end=M`
+- GET /api/manager/:id/analysis?start=N&end=M
+- 200: validated saved bundle, possibly stale while refreshing
+- 202: background preparation queued/running
+- 404/503: explicit typed failure
 
-Use `cachedJson` for shared bulk responses and `cachedManagerJson` for
-manager range responses. `invalidateCache()` is called after populate.
+The former seven manager routes are retired. All seven calculations remain in
+worker-prepared sections. See docs/analytics-rollout.md for release sequencing,
+math definitions, bounded retention, calibration and recovery.
+
+Use cachedJson for bulk responses. Manager HTTP handlers must only read prepared
+results/publication IDs and enqueue jobs; never call FPL or population calculators.
+The worker entry point is src/analytics/worker.ts (analytics:worker); production
+PM2 config runs fpl-trends-api and fpl-trends-analytics separately.
 
 ## Data And Season Model
 
@@ -155,8 +158,9 @@ Manager analytics:
 - `stratum_captain_picks_gw`: pre-aggregated captain rates
 - `stratum_gw_running_stats`: per-stratum running aggregate snapshots
 
-Hot manager reads should prefer cumulative/pre-aggregated tables rather
-than scanning `manager_history` or `manager_picks` on every request.
+Legacy cumulative/stratum builders are offline recovery tools. Recurring ingest
+enqueues immutable benchmarks instead. The new analytics\_\* tables hold published
+benchmarks, compressed replay input, durable jobs and prepared manager results.
 
 ## Production Notes
 

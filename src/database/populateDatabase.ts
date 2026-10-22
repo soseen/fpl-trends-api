@@ -39,6 +39,11 @@ const markBulkDataRefreshComplete = async (): Promise<void> => {
     VALUES (${DATA_REFRESH_VERSION_KEY}, ${value})
     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
   `;
+  await prisma.app_metadata.upsert({
+    where: { key: "analytics_bulk_refresh_in_progress" },
+    create: { key: "analytics_bulk_refresh_in_progress", value: "0" },
+    update: { value: "0" },
+  });
 };
 
 const latestPublishableEventId = (events: BootstrapStaticData["events"]) =>
@@ -198,6 +203,11 @@ export const populateDatabase = async () => {
     }
 
     // 4. Populate database tables (order matters: teams → events → footballers → fixtures → history)
+    await prisma.app_metadata.upsert({
+      where: { key: "analytics_bulk_refresh_in_progress" },
+      create: { key: "analytics_bulk_refresh_in_progress", value: "1" },
+      update: { value: "1" },
+    });
     console.info("Populating teams...");
     await insertTeams();
 
@@ -233,13 +243,15 @@ export const populateDatabase = async () => {
     console.info("✅ Database populated successfully!");
   } catch (error) {
     console.error("❌ Failed to populate the database:", error);
-    process.exit(1);
+    throw error;
   }
 };
 
 if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
   try {
     await populateDatabase();
+  } catch {
+    process.exitCode = 1;
   } finally {
     await prisma.$disconnect();
   }

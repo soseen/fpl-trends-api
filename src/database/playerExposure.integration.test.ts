@@ -31,7 +31,7 @@ void test(
     process.env["DATABASE_URL"] = scopedUrl.toString();
     const { prisma } = await import("./client.js");
     const { rebuildRankBandPlayerExposure } = await import(
-      "./populateManagers.js"
+      "./legacyManagerReadModels.js"
     );
 
     const read = (): Promise<ExposureRow[]> =>

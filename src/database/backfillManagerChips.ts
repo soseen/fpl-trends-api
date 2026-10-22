@@ -5,7 +5,7 @@ import { fetchEntryHistory } from "../managers/fetchManager.js";
 import {
   rebuildCumulativeForEntry,
   rebuildStratumGwRunningStats,
-} from "./populateManagers.js";
+} from "./legacyManagerReadModels.js";
 import { delay } from "../utils.js";
 
 const readEnvInt = (key: string, fallback: number, min = 1): number => {

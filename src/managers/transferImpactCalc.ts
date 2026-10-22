@@ -1,6 +1,5 @@
 import { prisma } from "../database/client.js";
-import { comparisonCohortGw } from "./comparisonCohorts.js";
-import { trueStratumSizes, type Stratum } from "./rangeStats.js";
+import { publishedRange } from "../analytics/store.js";
 
 // Shared helpers for computing the "transfer net points" metric over a
 // gameweek range. Used by:
@@ -66,43 +65,9 @@ export const sumPointsInWindow = (
   return total;
 };
 
-// `computeUserTransferNet` lives in getManagerTransfers.ts now (it shares
-// the full ghost-filter / multiplier-aware / hits-subtracted logic with
-// the public endpoint, so the comparison-table user value matches the
-// My Trends Transfer Impact section's headline byte-for-byte).
-
-// Sample-side aggregate: average net-points-per-transfer across managers
-// in the given stratum partition. Reads from `stratum_range_xfer_avg`,
-// the per-(stratum, start_gw, end_gw) precomputed table rebuilt by
-// populateManagers (cron) and backfillStratumRangeXferAvg (OOB).
-//
-// Range queries collapse to one indexed lookup per stratum, summed across
-// the requested strata. Replaces the per-request CTE that joined
-// manager_transfers ⨝ history with a generate_series — that path was the
-// dominant cost of /api/manager/:id/comparison (three calls in parallel,
-// ~18 s combined on cold cache).
-//
-// `stratumFilter`:
-//   "active"   → strata 1, 2, 3 summed
-//   "stratum12"→ strata 1, 2 summed (top-100k comparator)
-//   "stratum1" → stratum 1 only (top-10k comparator)
-//
-// Combined-stratum mean is computed as
-//   avg = SUM(sum_per_manager_avg) / SUM(managers_with_xfers)
-// — a weighted mean of per-stratum means, weighted by manager count. This
-// matches the previous request-time semantics where the per-request query
-// computed AVG(per-manager average) over all matching managers in one go.
-//
-// Unlike the previous path, the precompute uses the FULL ingested
-// stratum-3 sample (no entry_id % 32 sub-sample). Sample mean is unbiased
-// either way; the larger N tightens the confidence interval.
-//
-// `with_data`: count of stratum managers with has_transfer_history=true.
-// `stratum_size`: total stratum population. Both are stored redundantly
-// per row in the precomputed table (don't depend on the range), so a
-// single SUM across the matching strata gives the combined values.
-// `gateOnMinimumSample` in getManagerComparison uses these to gate the
-// displayed value when coverage is too thin.
+// Raw IN-minus-OUT comparison means are prepared in immutable benchmarks.
+// Both user and cohort sides exclude chip transfers, lineups and hit costs;
+// the detailed Transfer Impact section remains a counterfactual model.
 export type SampleTransferNet = {
   avg: number | null;
   with_data: number;
@@ -115,67 +80,12 @@ export const sampleAvgPtsPerTransfer = async (
   endGw: number,
   stratumFilter: "active" | "stratum1" | "stratum12",
 ): Promise<SampleTransferNet> => {
-  const strata =
+  const { range } = await publishedRange(startGw, endGw);
+  const side =
     stratumFilter === "stratum1"
-      ? [1]
+      ? "top10k"
       : stratumFilter === "stratum12"
-        ? [1, 2]
-        : [1, 2, 3];
-
-  const rows = await prisma.$queryRawUnsafe<
-    Array<{
-      stratum: number;
-      sum_per_manager_avg: number | null;
-      managers_with_xfers: number | null;
-      with_data: number | null;
-      stratum_size: number | null;
-    }>
-  >(
-    `
-    SELECT
-      stratum,
-      sum_per_manager_avg,
-      managers_with_xfers,
-      with_data,
-      stratum_size
-    FROM stratum_range_xfer_avg
-    WHERE start_gw = $1 AND end_gw = $2 AND stratum = ANY($3::int[])
-    `,
-    startGw,
-    endGw,
-    strata,
-  );
-
-  const cohortGw = comparisonCohortGw(startGw, endGw);
-  const trueSizes = await trueStratumSizes(cohortGw);
-  let weightedAverage = 0;
-  let totalWeight = 0;
-  let managers = 0;
-  let withData = 0;
-  let stratumSize = 0;
-  for (const row of rows) {
-    const managersInRow = row.managers_with_xfers ?? 0;
-    managers += managersInRow;
-    withData += row.with_data ?? 0;
-    stratumSize += row.stratum_size ?? 0;
-    if (managersInRow <= 0 || row.sum_per_manager_avg === null) continue;
-    const stratum = row.stratum as Stratum;
-    const sampledStratumSize = row.stratum_size ?? 0;
-    const weight =
-      sampledStratumSize > 0
-        ? (trueSizes[stratum] ?? 0) * (managersInRow / sampledStratumSize)
-        : 0;
-    if (weight <= 0) continue;
-    weightedAverage += (row.sum_per_manager_avg / managersInRow) * weight;
-    totalWeight += weight;
-  }
-  return {
-    // Null when no managers in the requested strata had transfers in range
-    // (or when the row is missing — e.g. mid-rebuild, or end_gw beyond what
-    // the cron has refreshed). UI renders as "—" rather than zero.
-    avg: managers > 0 && totalWeight > 0 ? weightedAverage / totalWeight : null,
-    with_data: withData,
-    with_transfers: managers,
-    stratum_size: stratumSize,
-  };
+        ? "top100k"
+        : "average";
+  return { avg: range.transferMeans[side], ...range.transferCoverage[side] };
 };

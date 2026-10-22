@@ -1,5 +1,6 @@
 import { prisma } from "../database/client.js";
 import { resolvePicks } from "./resolvePicks.js";
+import { conditionalCaptainMultiplier } from "./captainMultiplier.js";
 import {
   captainExpectedBonus,
   fetchCaptainRatesInRankBand,
@@ -272,35 +273,7 @@ const fetchCaptainGwDetails = async (
 // Pick the intended captain most often selected by managers who were top 10k
 // before that GW. GW1 deliberately has no result: everyone entered the season
 // without a rank, so a "top 10k" benchmark would be selected by the outcome.
-const fetchTop10kCaptainByGw = async (
-  startGw: number,
-  endGw: number,
-): Promise<Map<number, number>> => {
-  const rows = await prisma.$queryRawUnsafe<
-    Array<{ gw: number; captain_element: number; picks: number }>
-  >(
-    `
-    SELECT mp.gw, mp.captain_element, COUNT(*)::int AS picks
-    FROM manager_picks mp
-    JOIN manager_history mh_previous
-      ON mh_previous.entry_id = mp.entry_id
-     AND mh_previous.gw = mp.gw - 1
-    WHERE mp.gw BETWEEN $1 AND $2
-      AND mp.gw > 1
-      AND mh_previous.overall_rank BETWEEN 1 AND 10000
-      AND mp.captain_element IS NOT NULL
-    GROUP BY mp.gw, mp.captain_element
-    ORDER BY mp.gw, picks DESC
-    `,
-    startGw,
-    endGw,
-  );
-  const result = new Map<number, number>();
-  for (const r of rows) {
-    if (!result.has(r.gw)) result.set(r.gw, r.captain_element);
-  }
-  return result;
-};
+const fetchTop10kCaptainByGw = readTop10kCaptain;
 
 export const getCaptainImpact = async (
   entryId: number,
@@ -482,7 +455,7 @@ export const getCaptainImpact = async (
         gw,
         2,
         overallCaptainInfo,
-        2 + (rates?.tc_rate ?? 0),
+        conditionalCaptainMultiplier(rates),
       );
     }
 
@@ -495,7 +468,7 @@ export const getCaptainImpact = async (
         gw,
         2,
         top10kCaptainInfo,
-        2 + (rates?.tc_rate ?? 0),
+        conditionalCaptainMultiplier(rates),
       );
     }
 
@@ -629,3 +602,4 @@ export const getCaptainImpact = async (
     notes,
   };
 };
+import { readTop10kCaptain } from "../analytics/readers.js";

@@ -16,7 +16,7 @@ const replaceMethod = (
   });
 };
 
-void it("rejects a top-100k-only live snapshot and uses a coherent recent sample", async (t) => {
+void it("rejects a top-100k-only live snapshot without scanning the manager population", async (t) => {
   replaceMethod(t, prisma.events, "findUnique", () => ({
     finished: false,
     is_current: true,
@@ -43,11 +43,11 @@ void it("rejects a top-100k-only live snapshot and uses a coherent recent sample
         })),
   );
 
+  replaceMethod(t, prisma, "$queryRaw", () => []);
   const curve = await overallRankMovementCurve(4);
-  assert.equal(curve.source, "recent_manager_sample");
-  assert.equal(curve.status, "provisional");
-  assert.ok(curve.estimator);
-  assert.ok(curve.estimator.impactForExcess(242, 1) > 0);
+  assert.equal(curve.source, null);
+  assert.equal(curve.status, "unavailable");
+  assert.equal(curve.estimator, null);
 });
 
 void it("reports unavailable when neither a complete curve nor a recent sample exists", async (t) => {

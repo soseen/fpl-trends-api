@@ -4,8 +4,8 @@ import { netPointsForEvent } from "./activityFilter.js";
 
 export type ManagerTrajectoryPoint = {
   gw: number;
-  overall_rank: number;
-  gw_rank: number;
+  overall_rank: number | null;
+  gw_rank: number | null;
   points: number;
   total_points: number;
   // Number of transfers the user made entering this GW. The free first
@@ -32,8 +32,8 @@ export const getManagerTrajectory = async (
     entry_id: entryId,
     gws: events.map((ev) => ({
       gw: ev.event,
-      overall_rank: ev.overall_rank,
-      gw_rank: ev.rank,
+      overall_rank: ev.overall_rank > 0 ? ev.overall_rank : null,
+      gw_rank: ev.rank > 0 ? ev.rank : null,
       points: netPointsForEvent(ev),
       total_points: ev.total_points,
       event_transfers: ev.event_transfers,

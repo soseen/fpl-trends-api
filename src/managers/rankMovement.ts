@@ -54,14 +54,15 @@ export const createRankMovementEstimator = (
       lower = curve[curve.length - 2];
       upper = curve[curve.length - 1];
     } else if (score > (curve[0]?.score ?? score)) {
-      for (let index = 1; index < curve.length; index += 1) {
-        const candidate = curve[index];
-        if (candidate && score <= candidate.score) {
-          lower = curve[index - 1];
-          upper = candidate;
-          break;
-        }
+      let lo = 1,
+        hi = curve.length - 1;
+      while (lo < hi) {
+        const mid = (lo + hi) >>> 1;
+        if ((curve[mid]?.score ?? Infinity) < score) lo = mid + 1;
+        else hi = mid;
       }
+      lower = curve[lo - 1];
+      upper = curve[lo];
     }
 
     if (!lower || !upper || upper.score === lower.score) return Number.NaN;

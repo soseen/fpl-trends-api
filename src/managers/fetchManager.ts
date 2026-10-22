@@ -1,8 +1,12 @@
+import { currentBenchmarks } from "../analytics/store.js";
+import { observeFplBackoff } from "./fplBackoff.js";
+import { summarySchema, historySchema } from "./sourceValidation.js";
 import axios, { type AxiosInstance } from "axios";
 import type { PlayerHistory } from "../types.js";
 import type { EntrySummary, LeagueStandingsResponse } from "./types.js";
 
-const BASE = "https://fantasy.premierleague.com/api";
+const BASE =
+  process.env["FPL_API_BASE_URL"] ?? "https://fantasy.premierleague.com/api";
 const USER_AGENT = "fpl-trends/1.0 (+https://fpltrends.live)";
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -10,6 +14,7 @@ const client: AxiosInstance = axios.create({
   timeout: REQUEST_TIMEOUT_MS,
   headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
 });
+observeFplBackoff(client);
 
 type CachedValue<T> = {
   value: T;
@@ -18,14 +23,14 @@ type CachedValue<T> = {
 
 const MANAGER_FETCH_TTL_MS = 60 * 1000;
 
-const summaryCache = new Map<number, CachedValue<EntrySummary>>();
-const historyCache = new Map<number, CachedValue<PlayerHistory>>();
-const summaryInflight = new Map<number, Promise<EntrySummary>>();
-const historyInflight = new Map<number, Promise<PlayerHistory>>();
+const summaryCache = new Map<string, CachedValue<EntrySummary>>();
+const historyCache = new Map<string, CachedValue<PlayerHistory>>();
+const summaryInflight = new Map<string, Promise<EntrySummary>>();
+const historyInflight = new Map<string, Promise<PlayerHistory>>();
 
 const getFresh = <T>(
-  cache: Map<number, CachedValue<T>>,
-  entryId: number,
+  cache: Map<string, CachedValue<T>>,
+  entryId: string,
 ): T | null => {
   const cached = cache.get(entryId);
   if (!cached) return null;
@@ -38,28 +43,33 @@ const getFresh = <T>(
 
 const loadCached = async <T>(
   entryId: number,
-  cache: Map<number, CachedValue<T>>,
-  inflight: Map<number, Promise<T>>,
+  cache: Map<string, CachedValue<T>>,
+  inflight: Map<string, Promise<T>>,
   loader: () => Promise<T>,
 ): Promise<T> => {
-  const cached = getFresh(cache, entryId);
+  const key = `${currentBenchmarks()?.season ?? "collector"}:${entryId}`;
+  const cached = getFresh(cache, key);
   if (cached !== null) return cached;
 
-  const existing = inflight.get(entryId);
+  const existing = inflight.get(key);
   if (existing) return existing;
 
   const promise = loader()
     .then((value) => {
-      cache.set(entryId, {
+      if (cache.size >= 1000) {
+        const oldest = cache.keys().next().value;
+        if (oldest !== undefined) cache.delete(oldest);
+      }
+      cache.set(key, {
         value,
         expiresAt: Date.now() + MANAGER_FETCH_TTL_MS,
       });
       return value;
     })
     .finally(() => {
-      inflight.delete(entryId);
+      inflight.delete(key);
     });
-  inflight.set(entryId, promise);
+  inflight.set(key, promise);
   return promise;
 };
 
@@ -70,7 +80,7 @@ export const fetchEntrySummary = async (
     const { data } = await client.get<EntrySummary>(
       `${BASE}/entry/${entryId}/`,
     );
-    return data;
+    return summarySchema.parse(data);
   });
 };
 
@@ -81,7 +91,7 @@ export const fetchEntryHistory = async (
     const { data } = await client.get<PlayerHistory>(
       `${BASE}/entry/${entryId}/history/`,
     );
-    return data;
+    return historySchema.parse(data);
   });
 };
 

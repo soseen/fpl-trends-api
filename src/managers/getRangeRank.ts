@@ -62,12 +62,17 @@ export const getRangeRank = async (
   );
   const rangeTotal = events.reduce((acc, ev) => acc + netPointsForEvent(ev), 0);
 
+  const knownRank = (rank: number | null | undefined): number | null =>
+    rank !== null && rank !== undefined && rank > 0 ? rank : null;
   const overallRankBefore =
     startGw > 1
-      ? (allEvents.find((ev) => ev.event === startGw - 1)?.overall_rank ?? null)
+      ? knownRank(
+          allEvents.find((ev) => ev.event === startGw - 1)?.overall_rank,
+        )
       : null;
-  const overallRankAfter =
-    allEvents.find((ev) => ev.event === endGw)?.overall_rank ?? null;
+  const overallRankAfter = knownRank(
+    allEvents.find((ev) => ev.event === endGw)?.overall_rank,
+  );
 
   const [cMax, rankedCountAtEnd] = await Promise.all([
     currentStratumCMax(),
@@ -107,11 +112,15 @@ export const getRangeRank = async (
     stratum === null || !canUseSampleEstimate
       ? 0
       : estimate.sampleSizeByStratum[stratum];
-  const rangeRank = canUseSampleEstimate
-    ? (estimate.rangeRank ?? rangeRankOfficial)
-    : rangeRankOfficial;
+  const rangeRank =
+    rangeRankOfficial ??
+    (overallRankAfter === null
+      ? null
+      : canUseSampleEstimate
+        ? (estimate.rangeRank ?? rangeRankOfficial)
+        : rangeRankOfficial);
   const confidence: "exact" | "estimated" | "approximate" =
-    rangeRankOfficial !== null && !canUseSampleEstimate
+    rangeRankOfficial !== null
       ? "exact"
       : estimate.rangeRank !== null && sampleFreshness.status === "final"
         ? "estimated"

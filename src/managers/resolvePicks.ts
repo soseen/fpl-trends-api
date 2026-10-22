@@ -1,3 +1,7 @@
+import { validSquad } from "../analytics/model.js";
+import { ZodError } from "zod";
+import { fetchEntryHistory } from "./fetchManager.js";
+import { errorInfo } from "../analytics/errors.js";
 import { prisma } from "../database/client.js";
 import { fetchEntryEventPicks } from "./fetchPicks.js";
 import { persistPickElements } from "./persistPickElements.js";
@@ -79,7 +83,40 @@ const resolvePicksImpl = async (
   const endGw = Math.max(...finishedGws);
   const persisted = await readPersistedPicks(entryId, startGw, endGw);
 
-  const cachedGws = new Set(persisted.map((r) => r.gw));
+  const events = await prisma.events.findMany({
+    where: { id: { in: finishedGws } },
+    select: { id: true, data_checked: true },
+  });
+  const finalized = new Map(events.map((e) => [e.id, e.data_checked]));
+  const season = await prisma.app_metadata.findUnique({
+    where: { key: "current_season" },
+  });
+  const markers = season
+    ? await prisma.$queryRaw<
+        Array<{ kind: string; finalized: boolean; fetched_at: Date }>
+      >`SELECT kind,finalized,fetched_at FROM analytics_manager_sources WHERE season=${season.value} AND entry_id=${entryId} AND kind LIKE 'picks:%'`
+    : [];
+  const cachedGws = new Set(
+    finishedGws.filter((gw) => {
+      const marker = markers.find((m) => m.kind === `picks:${gw}`);
+      const rows = persisted.filter((p) => p.gw === gw);
+      return (
+        marker &&
+        (finalized.get(gw)
+          ? marker.finalized
+          : Date.now() - marker.fetched_at.getTime() < 60_000) &&
+        validSquad(
+          rows.map((p) => ({
+            element: p.element_id,
+            position: p.position,
+            multiplier: p.multiplier,
+            captain: p.is_captain,
+            vice: p.is_vice,
+          })),
+        )
+      );
+    }),
+  );
   const missingGws = finishedGws.filter((g) => !cachedGws.has(g));
 
   let incomplete = false;
@@ -92,7 +129,15 @@ const resolvePicksImpl = async (
         try {
           const payload = await fetchEntryEventPicks(entryId, gw);
           return { gw, picks: payload.picks ?? [] };
-        } catch {
+        } catch (error) {
+          console.error(
+            JSON.stringify({
+              event: "analytics_pick_fetch_failed",
+              gw,
+              ...errorInfo(error),
+            }),
+          );
+          if (error instanceof ZodError) throw error;
           return null;
         }
       }),
@@ -119,7 +164,10 @@ const resolvePicksImpl = async (
       await delay(INTER_BATCH_DELAY_MS);
   }
 
-  return { picks: [...persisted, ...fetched], incomplete };
+  return {
+    picks: [...persisted.filter((p) => cachedGws.has(p.gw)), ...fetched],
+    incomplete,
+  };
 };
 
 // Resolve the user's full XV per GW for every finished GW in the range,
@@ -131,6 +179,10 @@ export const resolvePicks = async (
   entryId: number,
   finishedGws: number[],
 ): Promise<ResolvedPicks> => {
+  if (finishedGws.length === 0) return { picks: [], incomplete: false };
+  const history = await fetchEntryHistory(entryId);
+  const participated = new Set(history.current.map((f) => f.event));
+  finishedGws = finishedGws.filter((gw) => participated.has(gw));
   if (finishedGws.length === 0) return { picks: [], incomplete: false };
   const key = inflightKey(
     entryId,
@@ -167,11 +219,16 @@ export const captainPicksFromResolved = (
     byGw.set(gw, { gw, captain_element: null, captain_multiplier: null });
   }
   for (const pick of resolved.picks) {
-    if (!pick.is_captain) continue;
+    if (pick.multiplier < 2 && !pick.is_captain) continue;
     const entry = byGw.get(pick.gw);
     if (!entry) continue;
-    entry.captain_element = pick.element_id;
-    entry.captain_multiplier = pick.multiplier;
+    if (
+      entry.captain_element === null ||
+      pick.multiplier > (entry.captain_multiplier ?? 0)
+    ) {
+      entry.captain_element = pick.element_id;
+      entry.captain_multiplier = pick.multiplier;
+    }
   }
   return Array.from(byGw.values()).sort((a, b) => a.gw - b.gw);
 };

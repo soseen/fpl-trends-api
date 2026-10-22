@@ -3,23 +3,15 @@ import express, { type Request, type Response } from "express";
 import cors from "cors";
 import compression from "compression";
 import helmet from "helmet";
+import { analyticsRouter, analyticsErrorHandler } from "./analytics/http.js";
+import { requestMetrics } from "./middleware/requestMetrics.js";
+import { analyticsReadiness } from "./analytics/health.js";
 import { getFootballersWithHistoryAndFixtures } from "./footballers/getAllFootballersData.js";
 import { getTeamsData } from "./teams/getTeamsData.js";
 import { getBasicInfo } from "./fetch.js";
 import { getEvents } from "./events/getEvents.js";
 import { populateDatabase } from "./database/populateDatabase.js";
-import {
-  cachedJson,
-  cachedManagerJson,
-  invalidateCache,
-} from "./cache/responseCache.js";
-import { getManagerSummary } from "./managers/getManagerSummary.js";
-import { getRangeRank } from "./managers/getRangeRank.js";
-import { getManagerTrajectory } from "./managers/getManagerTrajectory.js";
-import { getManagerComparison } from "./managers/getManagerComparison.js";
-import { getTeamImpact } from "./managers/getTeamImpact.js";
-import { getManagerTransfers } from "./managers/getManagerTransfers.js";
-import { getCaptainImpact } from "./managers/getCaptainImpact.js";
+import { cachedJson, invalidateCache } from "./cache/responseCache.js";
 import { requireAdminToken } from "./middleware/requireAdminToken.js";
 import { apiRateLimit } from "./middleware/rateLimit.js";
 import { getHealth } from "./health/getHealth.js";
@@ -42,6 +34,7 @@ const PORT = parseInt(process.env["PORT"] as string) || 3000;
 // spoof their source IP to bypass per-IP rate limits.
 app.set("trust proxy", "loopback");
 
+app.use(requestMetrics);
 app.use(helmet());
 app.use(compression());
 app.use(express.json());
@@ -77,6 +70,10 @@ app.get("/api/player-image/:size/:code", getPlayerImage);
 app.use("/api", apiRateLimit);
 
 app.get("/api/health", getHealth);
+app.get("/api/health/live", (_req: Request, res: Response) => {
+  res.json({ status: "ok" });
+});
+app.get("/api/health/ready", analyticsReadiness);
 
 app.get("/api/seasons", async (_req: Request, res: Response) => {
   try {
@@ -213,226 +210,8 @@ app.get(
   },
 );
 
-const parseEntryId = (raw: string): number | null => {
-  const id = Number(raw);
-  if (!Number.isInteger(id) || id < 1 || id > 20_000_000) return null;
-  return id;
-};
-
-app.get("/api/manager/:id/summary", async (req: Request, res: Response) => {
-  const id = parseEntryId(req.params["id"] ?? "");
-  if (id === null) {
-    res.status(400).json({ error: "Invalid FPL ID." });
-    return;
-  }
-  try {
-    const data = await getManagerSummary(id);
-    res.status(200).json(data);
-  } catch (error: unknown) {
-    const status = (error as { response?: { status?: number } }).response
-      ?.status;
-    if (status === 404) {
-      res.status(404).json({ error: "Manager not found." });
-      return;
-    }
-    console.error(`Error fetching manager ${id} summary:`, error);
-    res.status(502).json({ error: "Failed to fetch manager from FPL." });
-  }
-});
-
-app.get("/api/manager/:id/trajectory", async (req: Request, res: Response) => {
-  const id = parseEntryId(req.params["id"] ?? "");
-  if (id === null) {
-    res.status(400).json({ error: "Invalid FPL ID." });
-    return;
-  }
-  try {
-    const data = await getManagerTrajectory(id);
-    res.status(200).json(data);
-  } catch (error: unknown) {
-    const status = (error as { response?: { status?: number } }).response
-      ?.status;
-    if (status === 404) {
-      res.status(404).json({ error: "Manager not found." });
-      return;
-    }
-    console.error(`Error fetching trajectory for ${id}:`, error);
-    res.status(502).json({ error: "Failed to fetch manager from FPL." });
-  }
-});
-
-app.get("/api/manager/:id/range-rank", async (req: Request, res: Response) => {
-  const id = parseEntryId(req.params["id"] ?? "");
-  if (id === null) {
-    res.status(400).json({ error: "Invalid FPL ID." });
-    return;
-  }
-  const start = Number(req.query["start"]);
-  const end = Number(req.query["end"]);
-  if (
-    !Number.isInteger(start) ||
-    !Number.isInteger(end) ||
-    start < 1 ||
-    end < start ||
-    end > 38
-  ) {
-    res.status(400).json({ error: "Invalid gameweek range." });
-    return;
-  }
-  try {
-    await cachedManagerJson(req, res, "range-rank", id, start, end, () =>
-      getRangeRank(id, start, end),
-    );
-  } catch (error: unknown) {
-    const status = (error as { response?: { status?: number } }).response
-      ?.status;
-    if (status === 404) {
-      res.status(404).json({ error: "Manager not found." });
-      return;
-    }
-    console.error(`Error computing range rank for ${id}:`, error);
-    res.status(500).json({ error: "Failed to compute range rank." });
-  }
-});
-
-app.get("/api/manager/:id/team-impact", async (req: Request, res: Response) => {
-  const id = parseEntryId(req.params["id"] ?? "");
-  if (id === null) {
-    res.status(400).json({ error: "Invalid FPL ID." });
-    return;
-  }
-  const start = Number(req.query["start"]);
-  const end = Number(req.query["end"]);
-  if (
-    !Number.isInteger(start) ||
-    !Number.isInteger(end) ||
-    start < 1 ||
-    end < start ||
-    end > 38
-  ) {
-    res.status(400).json({ error: "Invalid gameweek range." });
-    return;
-  }
-  try {
-    await cachedManagerJson(req, res, "team-impact", id, start, end, () =>
-      getTeamImpact(id, start, end),
-    );
-  } catch (error: unknown) {
-    const status = (error as { response?: { status?: number } }).response
-      ?.status;
-    if (status === 404) {
-      res.status(404).json({ error: "Manager not found." });
-      return;
-    }
-    console.error(`Error computing team impact for ${id}:`, error);
-    res.status(500).json({ error: "Failed to compute team impact." });
-  }
-});
-
-app.get("/api/manager/:id/transfers", async (req: Request, res: Response) => {
-  const id = parseEntryId(req.params["id"] ?? "");
-  if (id === null) {
-    res.status(400).json({ error: "Invalid FPL ID." });
-    return;
-  }
-  const start = Number(req.query["start"]);
-  const end = Number(req.query["end"]);
-  if (
-    !Number.isInteger(start) ||
-    !Number.isInteger(end) ||
-    start < 1 ||
-    end < start ||
-    end > 38
-  ) {
-    res.status(400).json({ error: "Invalid gameweek range." });
-    return;
-  }
-  try {
-    await cachedManagerJson(req, res, "transfers", id, start, end, () =>
-      getManagerTransfers(id, start, end),
-    );
-  } catch (error: unknown) {
-    const status = (error as { response?: { status?: number } }).response
-      ?.status;
-    if (status === 404) {
-      res.status(404).json({ error: "Manager not found." });
-      return;
-    }
-    console.error(`Error computing transfers for ${id}:`, error);
-    res.status(500).json({ error: "Failed to compute transfers." });
-  }
-});
-
-app.get(
-  "/api/manager/:id/captain-impact",
-  async (req: Request, res: Response) => {
-    const id = parseEntryId(req.params["id"] ?? "");
-    if (id === null) {
-      res.status(400).json({ error: "Invalid FPL ID." });
-      return;
-    }
-    const start = Number(req.query["start"]);
-    const end = Number(req.query["end"]);
-    if (
-      !Number.isInteger(start) ||
-      !Number.isInteger(end) ||
-      start < 1 ||
-      end < start ||
-      end > 38
-    ) {
-      res.status(400).json({ error: "Invalid gameweek range." });
-      return;
-    }
-    try {
-      await cachedManagerJson(req, res, "captain-impact", id, start, end, () =>
-        getCaptainImpact(id, start, end),
-      );
-    } catch (error: unknown) {
-      const status = (error as { response?: { status?: number } }).response
-        ?.status;
-      if (status === 404) {
-        res.status(404).json({ error: "Manager not found." });
-        return;
-      }
-      console.error(`Error computing captain impact for ${id}:`, error);
-      res.status(500).json({ error: "Failed to compute captain impact." });
-    }
-  },
-);
-
-app.get("/api/manager/:id/comparison", async (req: Request, res: Response) => {
-  const id = parseEntryId(req.params["id"] ?? "");
-  if (id === null) {
-    res.status(400).json({ error: "Invalid FPL ID." });
-    return;
-  }
-  const start = Number(req.query["start"]);
-  const end = Number(req.query["end"]);
-  if (
-    !Number.isInteger(start) ||
-    !Number.isInteger(end) ||
-    start < 1 ||
-    end < start ||
-    end > 38
-  ) {
-    res.status(400).json({ error: "Invalid gameweek range." });
-    return;
-  }
-  try {
-    await cachedManagerJson(req, res, "comparison", id, start, end, () =>
-      getManagerComparison(id, start, end),
-    );
-  } catch (error: unknown) {
-    const status = (error as { response?: { status?: number } }).response
-      ?.status;
-    if (status === 404) {
-      res.status(404).json({ error: "Manager not found." });
-      return;
-    }
-    console.error(`Error computing comparison for ${id}:`, error);
-    res.status(500).json({ error: "Failed to compute comparison." });
-  }
-});
+app.use("/api/manager", analyticsRouter);
+app.use(analyticsErrorHandler);
 
 const server = app.listen(PORT, () => {
   console.info(`Server is running on port ${PORT}`);

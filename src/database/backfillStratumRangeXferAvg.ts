@@ -1,7 +1,7 @@
 import "dotenv/config";
 import { fileURLToPath } from "node:url";
 import { prisma } from "./client.js";
-import { rebuildStratumRangeXferAvg } from "./populateManagers.js";
+import { rebuildStratumRangeXferAvg } from "./legacyManagerReadModels.js";
 
 // One-shot rebuild of stratum_range_xfer_avg for every (start_gw, end_gw)
 // pair. Use after deploying the migration to populate older ranges that

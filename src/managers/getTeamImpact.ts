@@ -1,4 +1,5 @@
 import { fetchLiveManagerHistory } from "./liveManagerHistory.js";
+import { readExposure, readCaptainRates } from "../analytics/readers.js";
 import { rankedPopulationSql } from "./rankedPopulation.js";
 import { prisma } from "../database/client.js";
 import { fetchEntrySummary } from "./fetchManager.js";
@@ -510,83 +511,20 @@ export const populationWeightedCaptainInfo = (
 // the end of every populateManagers run via `rebuildStratumCaptainPicks`).
 // Passing null returns population-weighted rates across all three strata.
 const fetchCaptainRatesInStratum = async (
-  stratum: number | null,
-  startGw: number,
-  endGw: number,
-): Promise<CaptainRateInfo> => {
-  if (stratum === null) {
-    const rows = await prisma.$queryRawUnsafe<StratumCaptainAggregate[]>(
-      `
-      SELECT
-        sc.gw,
-        sc.stratum,
-        sc.captain_element,
-        sc.captain_multiplier,
-        sc.picks AS n,
-        ${rankedPopulationSql("e")} AS ranked_count
-      FROM stratum_captain_picks_gw sc
-      JOIN events e ON e.id = sc.gw
-      WHERE sc.gw BETWEEN $1 AND $2
-      `,
-      startGw,
-      endGw,
-    );
-    return populationWeightedCaptainInfo(rows);
-  }
-
-  const rates = new Map<string, { cap_rate: number; tc_rate: number }>();
-  const perGwSampleSize = new Map<number, number>();
-
-  // Sample size per GW = sum of picks across all captain/multiplier combos.
-  // The full sample is used now; there is no longer a separate active subset.
-  const sampleRows = await prisma.$queryRawUnsafe<
-    Array<{ gw: number; sample_size: number }>
-  >(
-    `
-    SELECT gw, SUM(picks)::int AS sample_size
-    FROM stratum_captain_picks_gw
-    WHERE gw BETWEEN $1 AND $2
-      AND stratum = $3
-    GROUP BY gw
-    `,
-    startGw,
-    endGw,
-    stratum,
+  _stratum: number | null,
+  start: number,
+  end: number,
+): Promise<CaptainRateInfo> =>
+  readCaptainRates(
+    new Map(
+      Array.from(
+        { length: end - start + 1 },
+        (_, i) => [start + i, 0] as const,
+      ),
+    ),
+    start,
+    end,
   );
-  for (const r of sampleRows) perGwSampleSize.set(r.gw, r.sample_size);
-
-  const captainRows = await prisma.$queryRawUnsafe<
-    Array<{
-      gw: number;
-      captain_element: number;
-      captain_multiplier: number;
-      n: number;
-    }>
-  >(
-    `
-    SELECT gw, captain_element, captain_multiplier, picks AS n
-    FROM stratum_captain_picks_gw
-    WHERE gw BETWEEN $1 AND $2
-      AND stratum = $3
-    `,
-    startGw,
-    endGw,
-    stratum,
-  );
-  for (const r of captainRows) {
-    const sample = perGwSampleSize.get(r.gw) ?? 0;
-    if (sample === 0) continue;
-    const key = `${r.captain_element}:${r.gw}`;
-    const existing = rates.get(key) ?? { cap_rate: 0, tc_rate: 0 };
-    if (r.captain_multiplier === 3) {
-      existing.tc_rate += r.n / sample;
-    } else if (r.captain_multiplier === 2) {
-      existing.cap_rate += r.n / sample;
-    }
-    rates.set(key, existing);
-  }
-  return { rates, perGwSampleSize };
-};
 
 type ComparisonRankBand = RankBand | 0;
 
@@ -596,89 +534,7 @@ type PlayerExposure = {
   sample_size: number;
 };
 
-const fetchPlayerExposureInRankBand = async (
-  comparisonBandByGw: ReadonlyMap<number, ComparisonRankBand | null>,
-  playerIds: number[],
-  startGw: number,
-  endGw: number,
-): Promise<{
-  exposures: Map<string, PlayerExposure>;
-  perGwSampleSize: Map<number, number>;
-}> => {
-  const exposures = new Map<string, PlayerExposure>();
-  const perGwSampleSize = new Map<number, number>();
-  const bands = Array.from(
-    new Set(
-      Array.from(comparisonBandByGw.values()).filter(
-        (band): band is ComparisonRankBand => band !== null,
-      ),
-    ),
-  );
-  if (bands.length === 0 || playerIds.length === 0) {
-    return { exposures, perGwSampleSize };
-  }
-
-  const sampleRows = await prisma.$queryRawUnsafe<
-    Array<{ rank_band: number; gw: number; sample_size: number }>
-  >(
-    `
-    SELECT rank_band, gw, MAX(sample_size)::int AS sample_size
-    FROM rank_band_player_exposure_gw
-    WHERE rank_band = ANY($1::int[])
-      AND gw BETWEEN $2 AND $3
-    GROUP BY rank_band, gw
-    `,
-    bands,
-    startGw,
-    endGw,
-  );
-  for (const row of sampleRows) {
-    if (comparisonBandByGw.get(row.gw) !== row.rank_band) continue;
-    perGwSampleSize.set(row.gw, row.sample_size);
-  }
-
-  const rows = await prisma.$queryRawUnsafe<
-    Array<{
-      rank_band: number;
-      element_id: number;
-      gw: number;
-      sample_size: number;
-      squad_picks: number;
-      effective_multiplier_sum: number;
-    }>
-  >(
-    `
-    SELECT
-      rank_band,
-      element_id,
-      gw,
-      sample_size,
-      squad_picks,
-      effective_multiplier_sum
-    FROM rank_band_player_exposure_gw
-    WHERE rank_band = ANY($1::int[])
-      AND gw BETWEEN $2 AND $3
-      AND element_id = ANY($4::int[])
-    `,
-    bands,
-    startGw,
-    endGw,
-    playerIds,
-  );
-
-  for (const row of rows) {
-    if (comparisonBandByGw.get(row.gw) !== row.rank_band) continue;
-    const sample = row.sample_size || 0;
-    if (sample <= 0) continue;
-    exposures.set(`${row.element_id}:${row.gw}`, {
-      ownership_pct: row.squad_picks / sample,
-      eo: row.effective_multiplier_sum / sample,
-      sample_size: sample,
-    });
-  }
-
-  return { exposures, perGwSampleSize };
-};
+const fetchPlayerExposureInRankBand = readExposure;
 
 // Build the non-linear overall-rank curve plus the display-only stratum
 // average. `rank_per_point` remains in the response for compatibility and is
@@ -917,7 +773,7 @@ const buildMostPlayedXi = (
 };
 
 const pickStratum = (overallRank: number | null): 1 | 2 | 3 | null => {
-  if (overallRank === null) return null;
+  if (overallRank === null || overallRank <= 0) return null;
   if (overallRank <= STRATUM_A_MAX) return 1;
   if (overallRank <= STRATUM_B_MAX) return 2;
   return 3;

@@ -376,6 +376,7 @@ model manager_picks {
   active_chip          String?         @db.VarChar(20) // wildcard | freehit | bboost | 3xc | manager
   sample_stratum       Int? // standings-page stratum that selected this manager (1/2/3)
   sampled_at_gw        Int? // GW whose standings selected this row; causal EO requires sampled_at_gw = gw
+  sample_page          Int? // Retain source page clusters for held-out calibration.
   manager              manager_summary @relation(fields: [entry_id], references: [entry_id], onDelete: Cascade)
 
   @@id([entry_id, gw])
@@ -673,4 +674,77 @@ model overall_rank_curve_points {
 
   @@id([gw, score])
   @@index([gw, rank])
+}
+
+model analytics_benchmarks {
+  id                  String   @id @db.Uuid
+  season              String   @db.VarChar(10)
+  gw                  Int
+  calculation_version Int
+  source_revision     String
+  source_payload      Bytes?
+  payload             Json
+  created_at          DateTime @default(now()) @db.Timestamptz
+  publications        analytics_publications[]
+
+  @@index([season, gw, created_at(sort: Desc)], map: "analytics_benchmarks_scope_idx")
+}
+
+model analytics_publications {
+  season       String   @db.VarChar(10)
+  gw           Int
+  benchmark_id String   @db.Uuid
+  published_at DateTime @default(now()) @db.Timestamptz
+  benchmark    analytics_benchmarks @relation(fields: [benchmark_id], references: [id])
+
+  @@id([season, gw])
+}
+
+model analytics_jobs {
+  id            String    @id @db.Uuid
+  key           String    @unique
+  kind          String    @db.VarChar(20)
+  season        String    @db.VarChar(10)
+  entry_id      Int?
+  start_gw      Int
+  end_gw        Int
+  status        String    @default("queued") @db.VarChar(20)
+  attempts      Int       @default(0)
+  available_at  DateTime  @default(now()) @db.Timestamptz
+  lease_token   String?   @db.Uuid
+  lease_until   DateTime? @db.Timestamptz
+  heartbeat_at  DateTime? @db.Timestamptz
+  error_code    String?
+  error_message String?
+  created_at    DateTime  @default(now()) @db.Timestamptz
+  updated_at    DateTime  @default(now()) @db.Timestamptz
+
+  @@index([status, kind, available_at], map: "analytics_jobs_queue_idx")
+  @@index([season,entry_id,status],map:"analytics_jobs_entry_idx")
+}
+
+model analytics_manager_results {
+  season     String   @db.VarChar(10)
+  entry_id   Int
+  start_gw   Int
+  end_gw     Int
+  revision   String
+  payload    Json
+  created_at DateTime @default(now()) @db.Timestamptz
+  expires_at DateTime @db.Timestamptz
+
+  @@id([season, entry_id, start_gw, end_gw])
+  @@index([expires_at], map: "analytics_manager_results_expiry_idx")
+}
+
+model analytics_manager_sources {
+  season     String   @db.VarChar(10)
+  entry_id   Int
+  kind       String
+  payload    Json
+  finalized  Boolean  @default(false)
+  fetched_at DateTime @default(now()) @db.Timestamptz
+
+  @@id([season, entry_id, kind])
+  @@index([fetched_at],map:"analytics_manager_sources_fetched_idx")
 }

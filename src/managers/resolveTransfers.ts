@@ -1,3 +1,6 @@
+import { transfersSchema } from "./sourceValidation.js";
+import { ZodError } from "zod";
+import { AnalyticsError, errorInfo } from "../analytics/errors.js";
 import { prisma } from "../database/client.js";
 import { fetchEntryTransfers, type FplTransfer } from "./fetchTransfers.js";
 
@@ -88,59 +91,86 @@ const setHasTransferHistory = async (
 
 const inflight = new Map<number, Promise<ResolvedTransfers>>();
 
-const resolveImpl = async (
-  entryId: number,
-  forceRefetch: boolean,
-): Promise<ResolvedTransfers> => {
-  const persisted = await readPersisted(entryId);
-
-  // Fast path: if we already have rows AND the user isn't asking us to
-  // refetch, trust what's stored. The transfer log only grows over time
-  // (FPL never deletes past transfers), so the persisted view is
-  // monotonically a prefix of the live one — only stale by at most the
-  // populate cron cadence for sampled managers, or the user's most
-  // recent transfer for arbitrary IDs.
-  if (persisted.length > 0 && !forceRefetch) {
+const resolveImpl = async (entryId: number): Promise<ResolvedTransfers> => {
+  const season = await prisma.app_metadata.findUnique({
+    where: { key: "current_season" },
+  });
+  const sources = season
+    ? await prisma.$queryRaw<
+        Array<{ payload: unknown; fetched_at: Date }>
+      >`SELECT payload,fetched_at FROM analytics_manager_sources WHERE season=${season.value} AND entry_id=${entryId} AND kind='transfers'`
+    : [];
+  const source = sources[0];
+  const normalized = (value: unknown): TransferRow[] =>
+    transfersSchema
+      .parse(value)
+      .sort(
+        (a, b) =>
+          a.event - b.event || (a.time ?? " ").localeCompare(b.time ?? " "),
+      )
+      .map((t) => ({
+        entry_id: entryId,
+        gw: t.event,
+        in_element: t.element_in,
+        out_element: t.element_out,
+        in_cost: t.element_in_cost,
+        out_cost: t.element_out_cost,
+      }));
+  const persisted = source
+    ? normalized(source.payload)
+    : await readPersisted(entryId);
+  if (source && Date.now() - source.fetched_at.getTime() < 60_000)
     return { rows: persisted, incomplete: false };
-  }
 
   let fetched: FplTransfer[];
   try {
     fetched = await fetchEntryTransfers(entryId);
-  } catch {
+    if (fetched.some((t) => t.entry !== entryId))
+      throw new AnalyticsError(
+        "identity_mismatch",
+        "FPL returned transfers for a different manager.",
+        false,
+      );
+    // FPL returns newest first. Preserve repeated same-GW operations in the
+    // authoritative source snapshot; the old relational key can merge them.
+    fetched = [...fetched]
+      .reverse()
+      .sort(
+        (a, b) =>
+          a.event - b.event || (a.time ?? "").localeCompare(b.time ?? ""),
+      );
+  } catch (error) {
+    console.error(
+      JSON.stringify({
+        event: "analytics_transfer_fetch_failed",
+        ...errorInfo(error),
+      }),
+    );
+    if (error instanceof ZodError || error instanceof AnalyticsError)
+      throw error;
     // FPL fetch failed; serve whatever we have on disk and flag the
     // response as incomplete. Don't mark has_transfer_history so the
     // next visit retries.
     return { rows: persisted, incomplete: true };
   }
 
+  if (season)
+    await prisma.$executeRaw`INSERT INTO analytics_manager_sources(season,entry_id,kind,payload) VALUES (${season.value},${entryId},'transfers',${JSON.stringify(fetched)}::jsonb) ON CONFLICT(season,entry_id,kind) DO UPDATE SET payload=excluded.payload,fetched_at=now()`;
   await persist(entryId, fetched);
   await setHasTransferHistory(entryId, true);
 
-  // Re-read so the response order matches the on-disk view (gw asc) and
-  // includes any rows persisted by a parallel resolver while we were
-  // awaiting the FPL call.
-  const rows = await readPersisted(entryId);
-  return { rows, incomplete: false };
+  return { rows: normalized(fetched), incomplete: false };
 };
 
-// Resolve the manager's full transfer history. Concurrent callers asking
-// for the same entryId share one in-flight promise — the /transfers and
-// /comparison endpoints firing from My Trends in parallel never double
-// the FPL load.
-//
-// `forceRefetch=true` skips the persisted-row fast path. Used by the
-// per-user /transfers endpoint to ensure the user always sees their
-// latest transfer reflected on the page (fresh user IDs that aren't in
-// the sample yet wouldn't otherwise get a refetch).
+// Worker sections share one in-flight fetch and a validated 60-second source
+// snapshot. Repeated transfer operations are preserved in chronological order.
 export const resolveTransfers = async (
   entryId: number,
-  forceRefetch = false,
 ): Promise<ResolvedTransfers> => {
   const existing = inflight.get(entryId);
   if (existing) return existing;
 
-  const promise = resolveImpl(entryId, forceRefetch).finally(() => {
+  const promise = resolveImpl(entryId).finally(() => {
     inflight.delete(entryId);
   });
   inflight.set(entryId, promise);

@@ -1,6 +1,9 @@
+import { picksSchema } from "./sourceValidation.js";
+import { observeFplBackoff } from "./fplBackoff.js";
 import axios, { type AxiosInstance } from "axios";
 
-const BASE = "https://fantasy.premierleague.com/api";
+const BASE =
+  process.env["FPL_API_BASE_URL"] ?? "https://fantasy.premierleague.com/api";
 const USER_AGENT = "fpl-trends/1.0 (+https://fpltrends.live)";
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -8,6 +11,7 @@ const client: AxiosInstance = axios.create({
   timeout: REQUEST_TIMEOUT_MS,
   headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
 });
+observeFplBackoff(client);
 
 export type EntryEventPick = {
   element: number;
@@ -38,7 +42,7 @@ export const fetchEntryEventPicks = async (
   const { data } = await client.get<EntryEventPicksResponse>(
     `${BASE}/entry/${entryId}/event/${gw}/picks/`,
   );
-  return data;
+  return picksSchema.parse(data);
 };
 
 // Helper: extract the captain/vice/multiplier from a picks payload. Returns

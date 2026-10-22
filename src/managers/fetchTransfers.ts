@@ -1,6 +1,9 @@
+import { transfersSchema } from "./sourceValidation.js";
+import { observeFplBackoff } from "./fplBackoff.js";
 import axios, { type AxiosInstance } from "axios";
 
-const BASE = "https://fantasy.premierleague.com/api";
+const BASE =
+  process.env["FPL_API_BASE_URL"] ?? "https://fantasy.premierleague.com/api";
 const USER_AGENT = "fpl-trends/1.0 (+https://fpltrends.live)";
 const REQUEST_TIMEOUT_MS = 15_000;
 
@@ -8,6 +11,7 @@ const client: AxiosInstance = axios.create({
   timeout: REQUEST_TIMEOUT_MS,
   headers: { "User-Agent": USER_AGENT, Accept: "application/json" },
 });
+observeFplBackoff(client);
 
 // Subset of the /entry/{id}/transfers/ payload we actually persist.
 // FPL returns more fields (`time`, `time_diff_in_days`) which we drop —
@@ -20,6 +24,7 @@ export type FplTransfer = {
   element_out_cost: number;
   entry: number;
   event: number;
+  time?: string;
 };
 
 export const fetchEntryTransfers = async (
@@ -28,5 +33,5 @@ export const fetchEntryTransfers = async (
   const { data } = await client.get<FplTransfer[]>(
     `${BASE}/entry/${entryId}/transfers/`,
   );
-  return data;
+  return transfersSchema.parse(data);
 };
