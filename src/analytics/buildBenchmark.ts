@@ -10,6 +10,7 @@ import {
   benchmarkSourceSchema,
   benchmarkSchema,
   CALCULATION_VERSION,
+  validSquad,
   type SampleManager,
   type Stratum,
 } from "./model.js";
@@ -214,6 +215,38 @@ export const buildBenchmark = async (
       const eligible = [...managers.values()]
         .filter((m) => m.facts.some((f) => f.gw === gw))
         .sort((a, b) => a.entry - b.entry);
+      if (event.finished && event.data_checked) {
+        const currentPoints = new Map(
+          players
+            .filter((p) => p.round === gw)
+            .map((p) => [p.footballer_id, p.points]),
+        );
+        const mismatches = eligible.filter((manager) => {
+          if (!validSquad(manager.picks)) return false;
+          const fact = manager.facts.find((f) => f.gw === gw);
+          if (!fact || fact.hits === null) return false;
+          const gross = manager.picks.reduce(
+            (total, pick) =>
+              total + pick.multiplier * (currentPoints.get(pick.element) ?? 0),
+            0,
+          );
+          return gross - fact.hits !== fact.points;
+        }).length;
+        if (mismatches > 0) {
+          console.error(
+            JSON.stringify({
+              event: "analytics_source_score_mismatch",
+              gw,
+              mismatches,
+              sourceManagers: eligible.length,
+            }),
+          );
+          throw new AnalyticsError(
+            "sample_reconciliation_failed",
+            "Finalized sampled squad scores do not reconcile with official manager history. The last publication is retained.",
+          );
+        }
+      }
       for (const manager of eligible) {
         manager.picks.sort((a, b) => a.position - b.position);
         manager.transfers.sort(

@@ -1,429 +1,109 @@
 import "dotenv/config";
-import { fileURLToPath } from "node:url";
 import { prisma } from "./client.js";
+import { benchmarkSchema, CALCULATION_VERSION } from "../analytics/model.js";
 
-// One-off local-DB readiness check. Prints row counts for every table the
-// My Trends endpoints depend on, so it's obvious which backfill (if any)
-// still needs to run. Read-only.
-
-const MANAGER_METADATA_KEYS = [
-  "current_season",
-  "season_end_observed_at",
-  "season_end_season",
-  "season_end_event_id",
-  "season_end_bulk_closed_for_season",
-  "season_end_manager_ingest_closed_for_season",
-  "manager_ingest_cursor_a",
-  "manager_ingest_cursor_b",
-  "manager_ingest_cursor_c",
-  "manager_sample_gw",
-  "manager_sample_gw_cleaned",
-  "manager_sample_gw_finalized",
-  "manager_walk_cursor_version",
-] as const;
-
-const finalizedLabel = (value: string | undefined): string => {
-  if (value === "1") return "complete";
-  if (value === "2") return "in progress";
-  if (value === "0") return "not finalized";
-  return "missing";
-};
-
-const main = async (): Promise<void> => {
-  const summary = await prisma.$queryRaw<
-    Array<{ stratum: number; rows: bigint; chip_history: bigint }>
+// Inspect serving state without scanning retired facts or recommending
+// rebuilds of the obsolete cumulative/stratum tables.
+try {
+  const metadata = await prisma.app_metadata.findMany({
+    where: {
+      key: {
+        in: [
+          "current_season",
+          "bulk_data_refresh_version",
+          "analytics_bulk_refresh_in_progress",
+          "analytics_worker_heartbeat",
+          "analytics_last_collector_success",
+          "manager_sample_gw",
+          "manager_sample_gw_finalized",
+          "manager_walk_cursor_version",
+          "analytics_last_verified_export",
+        ],
+      },
+    },
+  });
+  const state = Object.fromEntries(metadata.map((r) => [r.key, r.value]));
+  const season = state["current_season"];
+  const latest =
+    (await prisma.events.aggregate({ _max: { id: true } }))._max.id ?? 0;
+  const rows = await prisma.$queryRaw<
+    Array<{ gw: number; payload: unknown; source_bytes: number }>
   >`
-    SELECT stratum,
-           COUNT(*)::bigint AS rows,
-           COUNT(*) FILTER (WHERE has_chip_history)::bigint AS chip_history
-    FROM manager_summary
-    GROUP BY stratum ORDER BY stratum
-  `;
-
-  const history = await prisma.$queryRaw<
-    Array<{ rows: bigint; managers: bigint; gws: bigint }>
-  >`
-    SELECT COUNT(*)::bigint AS rows,
-           COUNT(DISTINCT entry_id)::bigint AS managers,
-           COUNT(DISTINCT gw)::bigint AS gws
-    FROM manager_history
-  `;
-
-  const historyRankCoverage = await prisma.$queryRaw<
+    SELECT p.gw,b.payload,COALESCE(octet_length(b.source_payload),0)::int AS source_bytes
+    FROM analytics_publications p JOIN analytics_benchmarks b ON b.id=p.benchmark_id
+    WHERE p.season=${season ?? ""} AND b.calculation_version=${CALCULATION_VERSION} ORDER BY p.gw`;
+  const publications = rows.map((r) => {
+    const b = benchmarkSchema.parse(r.payload);
+    return {
+      gw: r.gw,
+      finalized: b.finalized,
+      sourceManagers: b.sampleCounts,
+      ranges: b.ranges.length,
+      exposures: b.exposures.length,
+      replayBytes: r.source_bytes,
+      sparseTop10kRanges: b.ranges
+        .filter((range) => range.cohorts.top10k.avg_total_points === null)
+        .map((range) => range.startGw),
+    };
+  });
+  const jobs = await prisma.$queryRaw<
     Array<{
-      with_rank: bigint;
-      managers_pending_rank_backfill: bigint;
+      kind: string;
+      status: string;
+      count: number;
+      oldest_seconds: number;
     }>
   >`
-    SELECT COUNT(overall_rank)::bigint AS with_rank,
-           COUNT(DISTINCT mh.entry_id) FILTER (
-             WHERE mh.overall_rank IS NULL
-               AND EXISTS (
-                 SELECT 1
-                 FROM manager_pick_elements mpe
-                 WHERE mpe.entry_id = mh.entry_id
-               )
-           )::bigint AS managers_pending_rank_backfill
-    FROM manager_history mh
-  `;
-
-  const picks = await prisma.$queryRaw<
+    SELECT kind,status,COUNT(*)::int count,EXTRACT(epoch FROM now()-MIN(updated_at))::int oldest_seconds
+    FROM analytics_jobs WHERE season=${season ?? ""} GROUP BY kind,status ORDER BY kind,status`;
+  const sizes = await prisma.$queryRaw<
     Array<{
-      rows: bigint;
-      managers: bigint;
-      gws: bigint;
-      with_captain: bigint;
-      with_sampling_provenance: bigint;
+      database_size: string;
+      publications_size: string;
+      results_size: string;
     }>
   >`
-    SELECT COUNT(*)::bigint AS rows,
-           COUNT(DISTINCT entry_id)::bigint AS managers,
-           COUNT(DISTINCT gw)::bigint AS gws,
-           COUNT(*) FILTER (WHERE captain_element IS NOT NULL)::bigint AS with_captain,
-           COUNT(*) FILTER (
-             WHERE sampled_at_gw = gw AND sample_stratum BETWEEN 1 AND 3
-           )::bigint AS with_sampling_provenance
-    FROM manager_picks
-  `;
-
-  const pickElements = await prisma.$queryRaw<
-    Array<{
-      rows: bigint;
-      managers: bigint;
-      gws: bigint;
-      stale_future_rows: bigint;
-    }>
+    SELECT pg_size_pretty(pg_database_size(current_database())) database_size,
+      pg_size_pretty(pg_total_relation_size('analytics_benchmarks')) publications_size,
+      pg_size_pretty(pg_total_relation_size('analytics_manager_results')) results_size`;
+  const settings = await prisma.$queryRaw<
+    Array<{ name: string; setting: string; unit: string | null }>
   >`
-    SELECT COUNT(*)::bigint AS rows,
-           COUNT(DISTINCT entry_id)::bigint AS managers,
-           COUNT(DISTINCT gw)::bigint AS gws,
-           COUNT(*) FILTER (
-             WHERE gw > COALESCE((SELECT MAX(id) FROM events), 0)
-           )::bigint AS stale_future_rows
-    FROM manager_pick_elements
-  `;
-
-  const cumulative = await prisma.$queryRaw<
-    Array<{ rows: bigint; managers: bigint; gws: bigint }>
-  >`
-    SELECT COUNT(*)::bigint AS rows,
-           COUNT(DISTINCT entry_id)::bigint AS managers,
-           COUNT(DISTINCT gw)::bigint AS gws
-    FROM manager_cumulative
-  `;
-
-  const captainPicks = await prisma.$queryRaw<
-    Array<{ stratum: number; rows: bigint; total_picks: bigint }>
-  >`
-    SELECT stratum, COUNT(*)::bigint AS rows, SUM(picks)::bigint AS total_picks
-    FROM stratum_captain_picks_gw
-    GROUP BY stratum ORDER BY stratum
-  `;
-
-  const playerExposure = await prisma.$queryRaw<
-    Array<{ rank_band: number; rows: bigint; total_sample: bigint | null }>
-  >`
-    SELECT rank_band, COUNT(*)::bigint AS rows, SUM(sample_size)::bigint AS total_sample
-    FROM rank_band_player_exposure_gw
-    GROUP BY rank_band ORDER BY rank_band
-  `;
-
-  const runningStats = await prisma.$queryRaw<
-    Array<{ stratum: number; rows: bigint; total_sample: bigint | null }>
-  >`
-    SELECT stratum, COUNT(*)::bigint AS rows, SUM(sample_size)::bigint AS total_sample
-    FROM stratum_gw_running_stats
-    GROUP BY stratum ORDER BY stratum
-  `;
-
-  const events = await prisma.$queryRaw<
-    Array<{
-      finished: bigint;
-      max_gw: number | null;
-      current_gw: number | null;
-      current_finished: boolean | null;
-    }>
-  >`
-    SELECT COUNT(*) FILTER (WHERE finished)::bigint AS finished,
-           MAX(id) FILTER (WHERE finished) AS max_gw,
-           MAX(id) FILTER (WHERE is_current) AS current_gw,
-           BOOL_OR(finished) FILTER (WHERE is_current) AS current_finished
-    FROM events
-  `;
-
-  const rankCurves = await prisma.$queryRaw<
-    Array<{
-      gw: number;
-      captured_at: Date;
-      is_final: boolean;
-      milestones: bigint;
-      min_rank: number;
-      max_rank: number;
-    }>
-  >`
-    SELECT s.gw,
-           s.captured_at,
-           s.is_final,
-           COUNT(p.score)::bigint AS milestones,
-           s.min_rank,
-           s.max_rank
-    FROM overall_rank_curve_snapshots s
-    LEFT JOIN overall_rank_curve_points p ON p.gw = s.gw
-    GROUP BY s.gw, s.captured_at, s.is_final, s.min_rank, s.max_rank
-    ORDER BY s.gw DESC
-  `;
-
-  const managerMetadata = await prisma.$queryRaw<
-    Array<{ key: string; value: string }>
-  >`
-    SELECT key, value
-    FROM app_metadata
-    WHERE key IN (
-      'manager_ingest_cursor_a',
-      'manager_ingest_cursor_b',
-      'manager_ingest_cursor_c',
-      'manager_sample_gw',
-      'manager_sample_gw_cleaned',
-      'manager_sample_gw_finalized',
-      'manager_walk_cursor_version',
-      'current_season',
-      'season_end_observed_at',
-      'season_end_season',
-      'season_end_event_id',
-      'season_end_bulk_closed_for_season',
-      'season_end_manager_ingest_closed_for_season'
-    )
-    ORDER BY key
-  `;
-  const managerMetadataByKey = new Map(
-    managerMetadata.map((row) => [row.key, row.value]),
-  );
-
-  console.info("\n=== Local DB readiness ===\n");
-
-  console.info("Events:");
+    SELECT name,setting,unit FROM pg_settings WHERE name IN ('statement_timeout','lock_timeout','work_mem','temp_file_limit') ORDER BY name`;
   console.info(
-    `  finished GWs: ${events[0]?.finished ?? 0n} (latest: ${events[0]?.max_gw ?? "?"})`,
+    JSON.stringify(
+      {
+        state,
+        latestGameweek: latest,
+        calculationVersion: CALCULATION_VERSION,
+        publications,
+        jobs,
+        sizes: sizes[0],
+        settings,
+      },
+      null,
+      2,
+    ),
   );
-  console.info(
-    `  current GW: ${events[0]?.current_gw ?? "?"} (${events[0]?.current_finished ? "finished" : "live/not finished"})`,
-  );
-
-  console.info("\noverall rank curves (rank-impact read path):");
-  if (rankCurves.length === 0) {
-    console.info("  EMPTY - run `npm run refresh-rank-curve`.");
-  } else {
-    for (const curve of rankCurves) {
-      console.info(
-        `  GW${curve.gw}: ${curve.milestones} milestones, ranks ${curve.min_rank}-${curve.max_rank}, ${curve.is_final ? "final" : "live"}, captured ${curve.captured_at.toISOString()}`,
-      );
-    }
-  }
-
-  console.info("\ningest metadata:");
-  for (const key of MANAGER_METADATA_KEYS) {
-    console.info(`  ${key}: ${managerMetadataByKey.get(key) ?? "missing"}`);
-  }
-  console.info(
-    `  sample finalization: ${finalizedLabel(managerMetadataByKey.get("manager_sample_gw_finalized"))}`,
-  );
-
-  console.info("\nmanager_summary (sample membership):");
-  for (const r of summary) {
-    console.info(
-      `  stratum ${r.stratum}: ${r.rows} managers (${r.chip_history} with chip history)`,
+  if (
+    !season ||
+    rows.length !== latest ||
+    rows.some((r) => r.source_bytes === 0)
+  ) {
+    console.error(
+      "Published gameweek/replay coverage is incomplete. Run analytics:benchmarks and inspect the worker logs.",
     );
-  }
-
-  console.info("\nmanager_history (per-GW points for the sample):");
-  console.info(
-    `  ${history[0]?.rows ?? 0n} rows across ${history[0]?.managers ?? 0n} managers, ${history[0]?.gws ?? 0n} distinct GWs`,
-  );
-  console.info(
-    `  with overall_rank: ${historyRankCoverage[0]?.with_rank ?? 0n}`,
-  );
-
-  console.info("\nmanager_picks (captain / chip per GW for the sample):");
-  console.info(
-    `  ${picks[0]?.rows ?? 0n} rows across ${picks[0]?.managers ?? 0n} managers, ${picks[0]?.gws ?? 0n} distinct GWs`,
-  );
-  console.info(
-    `  with captain_element NOT NULL: ${picks[0]?.with_captain ?? 0n}`,
-  );
-  console.info(
-    `  with same-GW sampling provenance: ${picks[0]?.with_sampling_provenance ?? 0n}`,
-  );
-
-  console.info("\nmanager_pick_elements (full XV cache, user + sample EO):");
-  console.info(
-    `  ${pickElements[0]?.rows ?? 0n} rows across ${pickElements[0]?.managers ?? 0n} managers, ${pickElements[0]?.gws ?? 0n} distinct GWs`,
-  );
-  console.info(
-    `  rows beyond current season GW: ${pickElements[0]?.stale_future_rows ?? 0n}`,
-  );
-
-  console.info(
-    "\nmanager_cumulative (running totals — the comparison hot path):",
-  );
-  console.info(
-    `  ${cumulative[0]?.rows ?? 0n} rows across ${cumulative[0]?.managers ?? 0n} managers, ${cumulative[0]?.gws ?? 0n} distinct GWs`,
-  );
-
-  console.info("\nstratum_captain_picks_gw (captain-rate read path):");
-  if (captainPicks.length === 0) {
-    console.info(
-      "  EMPTY — derived from manager_picks; sparse picks ⇒ empty here.",
-    );
-  } else {
-    for (const r of captainPicks) {
-      console.info(
-        `  stratum ${r.stratum}: ${r.rows} buckets, ${r.total_picks} picks total`,
-      );
-    }
-  }
-
-  console.info("\nrank_band_player_exposure_gw (team-impact EO read path):");
-  if (playerExposure.length === 0) {
-    console.info(
-      "  EMPTY - derived from manager_pick_elements; EO falls back to global ownership/captain data.",
-    );
-  } else {
-    for (const r of playerExposure) {
-      console.info(
-        `  band ${r.rank_band}: ${r.rows} buckets, ${r.total_sample ?? 0n} sample-manager-GW pairs`,
-      );
-    }
-  }
-
-  console.info(
-    "\nstratum_gw_running_stats (comparison endpoint pre-aggregate):",
-  );
-  if (runningStats.length === 0) {
-    console.info(
-      "  EMPTY — run `npm run rebuild-manager-read-models` after schema migration.",
-    );
-  } else {
-    for (const r of runningStats) {
-      console.info(
-        `  stratum ${r.stratum}: ${r.rows} GW buckets, ${r.total_sample ?? 0n} sample-manager-GW pairs`,
-      );
-    }
-  }
-
-  console.info("\n=== Diagnosis ===");
-  const picksRows = Number(picks[0]?.rows ?? 0n);
-  const picksWithSamplingProvenance = Number(
-    picks[0]?.with_sampling_provenance ?? 0n,
-  );
-  const cumRows = Number(cumulative[0]?.rows ?? 0n);
-  const captainBuckets = captainPicks.reduce(
-    (acc, r) => acc + Number(r.rows),
-    0,
-  );
-  const exposureBuckets = playerExposure.reduce(
-    (acc, r) => acc + Number(r.rows),
-    0,
-  );
-  const pendingRankBackfill = Number(
-    historyRankCoverage[0]?.managers_pending_rank_backfill ?? 0n,
-  );
-  const staleFuturePickRows = Number(pickElements[0]?.stale_future_rows ?? 0n);
-
-  if (cumRows === 0) {
-    console.info(
-      "  ❌ manager_cumulative empty — run `npm run backfill-cumulative`.",
-    );
-  } else {
-    console.info("  ✅ manager_cumulative populated.");
-  }
-
-  const currentGw = events[0]?.current_gw ?? null;
-  const currentFinished = events[0]?.current_finished ?? false;
-  const sampleGw = Number(managerMetadataByKey.get("manager_sample_gw") ?? 0);
-  const finalized = managerMetadataByKey.get("manager_sample_gw_finalized");
-  if (currentFinished && (currentGw !== sampleGw || finalized !== "1")) {
-    console.info(
-      "  WARNING current GW sample is stale or not finalized - keep running `populate-managers` until manager_sample_gw matches the current GW and manager_sample_gw_finalized=1.",
-    );
-  }
-
-  if (picksRows === 0) {
-    console.info(
-      "  ❌ manager_picks empty — run `npm run populate-managers` (or `backfill-picks` for historic depth).",
-    );
-  } else if (picksRows < Number(history[0]?.rows ?? 0n) / 2) {
-    console.info(
-      "  ⚠️  manager_picks sparse vs. manager_history — run `npm run backfill-picks` to fill historic GWs (or accept empty captain stats).",
-    );
-  } else {
-    console.info("  ✅ manager_picks reasonably covered.");
-  }
-
-  if (staleFuturePickRows > 0) {
-    console.info(
-      `  WARNING manager_pick_elements contains ${staleFuturePickRows} rows beyond the current season GW; remove them before they can affect live EO.`,
-    );
-  }
-
-  if (picksRows > 0 && picksWithSamplingProvenance < picksRows * 0.5) {
-    console.info(
-      "  WARNING manager_picks sampling provenance is sparse; causal EO will use its population-weighted fallback until current-GW sampling catches up.",
-    );
-  }
-
-  const sparseChipStrata = summary.filter(
-    (r) => Number(r.chip_history) < Number(r.rows) * 0.5,
-  );
-  if (sparseChipStrata.length > 0) {
-    console.info(
-      "  WARNING chip-history coverage is sparse - re-run `populate-managers` after a cursor-version repair or run `backfill-manager-chips` followed by cumulative/read-model rebuilds.",
-    );
-  } else {
-    console.info("  OK chip-history coverage looks healthy.");
-  }
-
-  if (captainBuckets === 0) {
-    console.info(
-      "  ❌ stratum_captain_picks_gw empty — derived from manager_picks; populate that first then re-run `npm run rebuild-manager-read-models`.",
-    );
-  } else {
-    console.info("  ✅ stratum_captain_picks_gw populated.");
-  }
-
-  if (exposureBuckets === 0) {
-    if (pendingRankBackfill > 0) {
-      console.info(
-        `  rank_band_player_exposure_gw empty - ${pendingRankBackfill} managers with full-XV rows need per-GW rank backfill; run ` +
-          "`npm run backfill-manager-ranks`, then `npm run rebuild-manager-read-models`.",
-      );
-    } else {
-      console.info(
-        "  rank_band_player_exposure_gw empty - run `npm run backfill-comparison-picks` or `npm run rebuild-manager-read-models` after sample full-XV picks exist.",
-      );
-    }
-  } else {
-    console.info("  rank_band_player_exposure_gw populated.");
-  }
-
-  const runningRows = runningStats.reduce((acc, r) => acc + Number(r.rows), 0);
-  if (runningRows === 0) {
-    console.info(
-      "  ❌ stratum_gw_running_stats empty — run `npm run rebuild-manager-read-models` after manager_cumulative is populated.",
-    );
-  } else {
-    console.info("  ✅ stratum_gw_running_stats populated.");
-  }
-
-  console.info("");
-};
-
-if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
-  try {
-    await main();
-  } catch (err) {
-    console.error("[checkLocalState] Failed:", (err as Error).message);
     process.exitCode = 1;
-  } finally {
-    await prisma.$disconnect();
   }
+  console.info(
+    "Legacy cumulative/stratum aggregates are retired. Use analytics:replay, analytics:calibrate and /api/health/ready for release verification.",
+  );
+} catch (error) {
+  console.error(
+    "Analytics state inspection failed:",
+    error instanceof Error ? error.message : String(error),
+  );
+  process.exitCode = 1;
+} finally {
+  await prisma.$disconnect();
 }

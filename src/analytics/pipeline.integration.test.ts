@@ -460,6 +460,27 @@ void test(
             "Corrected facts must invalidate the generation",
           );
           const good = (await loadBenchmarks(1, 3)).revision;
+          await admin.query(
+            `INSERT INTO manager_summary(entry_id,stratum,last_updated,has_chip_history,has_transfer_history) VALUES (4,1,now(),true,true)`,
+          );
+          await admin.query(
+            `INSERT INTO manager_history(entry_id,gw,points,overall_rank,event_transfers,event_transfers_cost,points_on_bench) VALUES (4,3,999,6000,0,0,0)`,
+          );
+          await admin.query(
+            `INSERT INTO manager_picks(entry_id,gw,captain_element,captain_multiplier,sample_stratum,sampled_at_gw) VALUES (4,3,1,2,1,3)`,
+          );
+          await admin.query(
+            `INSERT INTO manager_pick_elements(entry_id,gw,element_id,position,multiplier,is_captain,is_vice) SELECT 4,gw,element_id,position,multiplier,is_captain,is_vice FROM manager_pick_elements WHERE entry_id=1 AND gw=3`,
+          );
+          await assert.rejects(
+            buildBenchmark("2026-27", 3),
+            /do not reconcile/,
+            "One corrupt score must not enter rank buckets even when enough other squads support EO",
+          );
+          assert.equal((await loadBenchmarks(1, 3)).revision, good);
+          await admin.query(
+            "DELETE FROM manager_pick_elements WHERE entry_id=4; DELETE FROM manager_summary WHERE entry_id=4",
+          );
           await admin.query("UPDATE manager_history SET points=999 WHERE gw=3");
           await assert.rejects(
             buildBenchmark("2026-27", 3),
