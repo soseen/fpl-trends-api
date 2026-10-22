@@ -985,13 +985,22 @@ export const rebuildStratumCaptainPicks = async (): Promise<void> => {
 // 100k. Inverse-probability weights reconstruct the pre-GW band's population;
 // the stored sample_size is Kish effective N so request-time quality gates
 // still reflect statistical support rather than weighted population size.
-export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
+export const rebuildRankBandPlayerExposure = async ({
+  gwOnly,
+}: { gwOnly?: number } = {}): Promise<void> => {
   const previousRankBand = rankBandSqlCase("mh_previous.overall_rank");
+  const pickGameweekFilter = gwOnly === undefined ? "" : " AND mpe.gw = $1";
+  const eventGameweekFilter = gwOnly === undefined ? "" : " AND e.id = $1";
+  const parameters = gwOnly === undefined ? [] : [gwOnly];
   await prisma.$transaction([
     // Readers retain the previous committed snapshot during this long rebuild.
     // TRUNCATE would hold an exclusive table lock until the aggregate completes.
-    prisma.$executeRawUnsafe(`DELETE FROM rank_band_player_exposure_gw`),
-    prisma.$executeRawUnsafe(`
+    prisma.$executeRawUnsafe(
+      `DELETE FROM rank_band_player_exposure_gw${gwOnly === undefined ? "" : " WHERE gw = $1"}`,
+      ...parameters,
+    ),
+    prisma.$executeRawUnsafe(
+      `
       INSERT INTO rank_band_player_exposure_gw
         (rank_band, gw, element_id, sample_size, squad_picks, active_picks,
          effective_multiplier_sum, last_rebuilt)
@@ -1008,7 +1017,7 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
          AND mp.gw = mpe.gw
          AND mp.sampled_at_gw = mpe.gw
          AND mp.sample_stratum BETWEEN 1 AND 3
-        WHERE mpe.gw > 1
+        WHERE mpe.gw > 1${pickGameweekFilter}
       ),
       sample_stratum_sizes AS (
         SELECT
@@ -1029,7 +1038,7 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
           END AS population
         FROM events e
         CROSS JOIN (VALUES (1), (2), (3)) AS source(sample_stratum)
-        WHERE e.id > 1
+        WHERE e.id > 1${eventGameweekFilter}
       ),
       sample_coverage AS (
         SELECT
@@ -1128,7 +1137,7 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
         JOIN manager_history mh_end
           ON mh_end.entry_id = mpe.entry_id
          AND mh_end.gw = mpe.gw
-        WHERE mpe.gw = 1
+        WHERE mpe.gw = 1${pickGameweekFilter}
           AND mh_end.overall_rank > 0
       ),
       gw1_samples AS (
@@ -1218,7 +1227,9 @@ export const rebuildRankBandPlayerExposure = async (): Promise<void> => {
         effective_multiplier_sum,
         NOW() AS last_rebuilt
       FROM gw1_weighted
-    `),
+    `,
+      ...parameters,
+    ),
   ]);
 };
 
@@ -1595,11 +1606,13 @@ export const rangeScoreBucketsNeedRefresh = async (
 type ManagerReadModelRebuildOptions = {
   rangeBuckets?: "all" | "latest";
   transferAverages?: "latest" | "skip";
+  exposureGw?: number;
 };
 
 export const rebuildManagerReadModels = async ({
   rangeBuckets = "all",
   transferAverages = "latest",
+  exposureGw,
 }: ManagerReadModelRebuildOptions = {}): Promise<void> => {
   const captainStarted = Date.now();
   await rebuildStratumCaptainPicks();
@@ -1608,9 +1621,9 @@ export const rebuildManagerReadModels = async ({
   );
 
   const exposureStarted = Date.now();
-  await rebuildRankBandPlayerExposure();
+  await rebuildRankBandPlayerExposure({ gwOnly: exposureGw });
   console.info(
-    `[populateManagers] rank_band_player_exposure_gw rebuilt in ${Math.round((Date.now() - exposureStarted) / 1000)}s`,
+    `[populateManagers] rank_band_player_exposure_gw rebuilt${exposureGw === undefined ? "" : ` (gw=${exposureGw})`} in ${Math.round((Date.now() - exposureStarted) / 1000)}s`,
   );
 
   const runningStarted = Date.now();
@@ -1863,6 +1876,10 @@ export const populateManagers = async (
         await rebuildManagerReadModels({
           rangeBuckets: "latest",
           transferAverages: "latest",
+          // Finished historical exposure snapshots are already published.
+          // Rebuilding every GW here spills gigabytes from old sample picks
+          // and can exhaust the API/database's shared production filesystem.
+          exposureGw: currentGw,
         });
         console.info(
           `[populateManagers] manager read models rebuilt in ${Math.round((Date.now() - readModelsStarted) / 1000)}s`,
