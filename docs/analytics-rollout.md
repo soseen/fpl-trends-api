@@ -43,6 +43,9 @@ the same release window: the former seven manager routes are replaced by
   no fetch failures. Its replacement GW7 draw continues through the resumed
   15-minute cron. Until that draw is complete, the previous usable GW7 publication
   is retained. `sample_finalized=false` is expected during that transition.
+  Production runs are tuned to 10,000 managers (2,500 / 2,500 / 5,000 budgets)
+  so the three upstream fetches per manager fit the 30-minute cron watchdog.
+  Lock cleanup checks the owning PID before removing a replacement run's lock.
 - `ANALYTICS_PRUNE_WORKING_FACTS=true` is configured after the archive/export
   audit. Its guard defers cleanup until the latest replacement sample and all
   finalized replay archives are complete, then removes at most 500 obsolete

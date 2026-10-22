@@ -96,6 +96,8 @@ const LOCK_MAX_AGE_MS = 30 * 60 * 1000;
 
 const releaseLock = (): void => {
   try {
+    if (fs.readFileSync(LOCKFILE_PATH, "utf8").trim() !== String(process.pid))
+      return;
     fs.unlinkSync(LOCKFILE_PATH);
   } catch {
     /* ignore */
