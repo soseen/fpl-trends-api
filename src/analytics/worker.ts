@@ -68,7 +68,11 @@ export const runOneJob = async (): Promise<boolean> => {
   }
   return true;
 };
-if (process.argv[1] === fileURLToPath(import.meta.url)) {
+const entryPath = fileURLToPath(import.meta.url);
+if (
+  process.argv[1] === entryPath ||
+  process.env["pm_exec_path"] === entryPath
+) {
   let stopping = false;
   process.once("SIGTERM", () => {
     stopping = true;
