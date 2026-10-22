@@ -164,7 +164,7 @@ benchmarks, compressed replay input, durable jobs and prepared manager results.
 
 ## Production Notes
 
-- pm2 process: `fpl-trends-api`
+- pm2 processes: `fpl-trends-api` and `fpl-trends-analytics` (fork mode)
 - Port: `3000`
 - CORS comes from `ALLOWED_ORIGINS`, with production defaults
   `https://fpltrends.live` and `https://www.fpltrends.live`
@@ -172,13 +172,21 @@ benchmarks, compressed replay input, durable jobs and prepared manager results.
 - `npm run deploy` on production runs pull, install, build, migrate, and
   pm2 restart
 - Cron, not the server process, triggers recurring populate jobs
+- Published analytics deployed on 22 October 2026. See the production acceptance
+  record in `docs/analytics-rollout.md` before any recovery or source cleanup.
+- Minute readiness/disk probes log to `/home/deploy/analytics-monitor.log`;
+  hourly unprivileged log rotation covers PM2 and collector logs.
+- Legacy aggregate tables have been retired and emptied. `check-local-state`
+  inspects publication/job state; do not rebuild cumulative tables for serving.
+- Working-fact pruning is enabled with strict final-sample/archive guards.
 
 ## Known Risks
 
-- No authentication; all endpoints are public
-- No endpoint-level rate limiting beyond manager fetch governance and
-  response cache behavior
-- Plaintext `.env` on server
-- No production backups
+- Analytics endpoints are public; the population admin endpoint requires a token
+- Public API limit is 60 requests/minute/IP, alongside FPL fetch governance
+- Server `.env` is private (0600); keep it out of frontend builds and logs
+- A one-time off-server export passed a full restore drill; recurring off-server
+  backups and external alert delivery are not configured
+- Restricted read-role creation and a role-level temp_file_limit need DBA access
 - Schema and manager analytics are evolving; prefer clear invariants in
   comments when touching cumulative/range logic

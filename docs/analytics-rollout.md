@@ -1,8 +1,71 @@
 # Published My Trends analytics
 
-Implementation is local and not deployed. The API and SPA must be deployed in
+Deployed to production on 22 October 2026. The API and SPA must be deployed in
 the same release window: the former seven manager routes are replaced by
 `GET /api/manager/:id/analysis?start=N&end=M`. There is no compatibility layer.
+
+## Production acceptance record
+
+- Architecture cutover: API `313d582`, SPA `eb89422`; both PM2 processes are
+  running in fork mode and saved. Both additive migrations are applied.
+- All seven GW publications have compressed replay input and reproduce their
+  published calculations. An independent full source audit reconciled every
+  selected squad with its GW score: 276,958 squads across GW1–7.
+- GW6 initially had 12,743 mismatches among 40,000 sources. The entire bounded
+  roster was refreshed from official history and picks using
+  `node dist/database/repairBenchmarkSources.js --gw=6 --apply`, then rebuilt
+  once with `ANALYTICS_REBUILD_HISTORICAL_FROM_FACTS=true`. The repaired
+  generation is `3a2217a2-8ac8-4114-969e-d3b8f9feba3b`, with zero mismatches.
+  Rebuilds now reject even a minority of known finalized score mismatches.
+- Public HTTPS, fresh GW3–7 bundle, two waves of 20 concurrent requests:
+  40 requests, median 269.84 ms, p95 359.76 ms, max 366.56 ms. All seven sections
+  passed runtime validation. This is a prepared response check, not a cold-job
+  or browser-render SLO. A separate canary read check during repair measured
+  244 ms p95. Observed cold preparation jobs took about 0.7–1.1 seconds in the
+  checked examples; upstream delays can be much longer.
+- Production browser verification rendered My Trends and its comparison table
+  without runtime exceptions, failed responses or horizontal overflow. Actual
+  manager checks included a late entrant and all four chips. Full-season ranks
+  matched official history in the checked examples.
+- The 1,241,414,366-byte predeployment export was streamed off the server to
+  the deployment workstation. SHA-256:
+  `dfbd26c99d7f0bf1619f6c0d8c5f8647bb9261934eeb339ef4f7c82ff795d910`.
+  PostgreSQL restored it successfully into `codex_fpl_production_restore_test`;
+  verification found 5,210,282 managers, GW1–7 and no unvalidated foreign keys.
+  This is a verified **one-time** export. Recurring off-server backups and
+  backups of private deployment configuration remain unconfigured.
+- After cutover and the restore drill, `ops/retire-legacy-aggregates.sql`
+  reclaimed roughly 3.1 GiB by truncating only retired derived tables. Disk
+  headroom increased from about 5.7 to 8.8 GiB. Original facts and the verified
+  predeployment export remain available; legacy rollback requires restoring
+  or rebuilding its aggregates.
+- The v5 seeded sampler successfully collected its initial 1,000 managers with
+  no fetch failures. Its replacement GW7 draw continues through the resumed
+  15-minute cron. Until that draw is complete, the previous usable GW7 publication
+  is retained. `sample_finalized=false` is expected during that transition.
+- `ANALYTICS_PRUNE_WORKING_FACTS=true` is configured after the archive/export
+  audit. Its guard defers cleanup until the latest replacement sample and all
+  finalized replay archives are complete, then removes at most 500 obsolete
+  managers per maintenance pass. Do not bypass that guard.
+- Bulk and rank-curve cron are restored. Readiness/disk probes run every minute;
+  unprivileged log rotation runs hourly for PM2 and collector logs. Probe results
+  are in `/home/deploy/analytics-monitor.log`. External alert delivery is still
+  unconfigured. Readiness returned HTTP 200 after cutover.
+- The owner role has 60-second statements, two-second locks and 8 MiB work_mem
+  defaults. Read-pool deadlines remain stricter. The Prisma pool is capped at
+  four connections. Creating a restricted read role and setting temp_file_limit
+  still require a database administrator; the deploy account has no sudo or
+  PostgreSQL superuser access.
+- Latest release validation passed 82 tests with no skips, backend lint and
+  contract drift checks, both type checks and production builds. Source-buffer
+  copies are released before calculation to reduce late-season worker memory.
+  The full 38-GW SQL path still needs capacity testing beyond the synthetic
+  CPU/heap check; do not interpret the current rollout as that load test.
+
+`check-local-state` now inspects publications, replay sizes, jobs, sampling state
+and PostgreSQL limits without scanning the legacy population or asking operators
+to rebuild retired cumulative tables. Manager resets retire current-season jobs,
+publication pointers and caches atomically, preserving immutable replay archives.
 
 ## Serving and preparation
 
@@ -112,15 +175,15 @@ retain calibration reports on representative production snapshots before rollout
 ## Validation and release sequence
 
 1. Review both repository diffs together. Run `npm ci`, backend `build`, `lint`,
-   `contracts:check`, `test`, and frontend `typecheck`, `lint`, `build`. Local validation passed all 81 tests with no skips, both builds and type
+   `contracts:check`, `test`, and frontend `typecheck`, `lint`, `build`. Release validation passed all 82 tests with no skips, both builds and type
    checks, backend lint and frontend lint (which retains pre-existing warnings).
    The new CI
    job provisions PostgreSQL 16 and executes the migration/integration tests.
    Locally, integration tests require `ANALYTICS_TEST_DATABASE_URL` naming a
    dedicated database ending in `_test`, with the existing schema migrated.
-2. Acquire a restorable database export before destructive cleanup. No external
-   storage is currently available, so **off-server backups are not active**.
-   Production protection against complete disk/host loss is still pending.
+2. Acquire a restorable database export before destructive cleanup. The release
+   export passed a workstation restore drill; **recurring off-server backups are
+   not active**. Ongoing protection against complete disk/host loss is pending.
 3. Pause manager cron for the initial publication window. Apply the two new
    migrations (`npm run migrate`); neither rewrites or deletes existing facts.
    Build the backend, then run `npm run analytics:benchmarks` to enqueue every
@@ -140,16 +203,16 @@ retain calibration reports on representative production snapshots before rollout
    saved with `pm2 save`. The worker has a separate heap/restart limit; tune only
    after measuring the full SQL-to-publication path on the 4 GiB host.
 7. Roll back both application releases together if needed. New tables are
-   additive. Before source pruning, original facts and offline legacy builders
-   remain available. After pruning, rollback needs replay/FPL hydration or a
+   additive. After retiring legacy aggregates, rebuild or restore them before any
+   legacy rollback. After source pruning, rollback needs replay/FPL hydration or a
    restored export; do not switch back to the old population-scanning endpoints.
 
 `analytics:benchmark` is an isolated CPU/memory smoke test for 40k managers × 38
 GWs; it includes all 38 start-range keys. It is not a production SQL load test.
-Local integration prepared reads measured 83–168 ms p95 with 20 concurrent
+Local integration prepared reads measured roughly 90–180 ms p95 with 20 concurrent
 requests; the budget asserted by the test is 2 seconds. These figures do not
-predict Hetzner latency. Original population scans took tens of seconds, but the
-production before/after comparison remains part of rollout.
+predict Hetzner latency. The production acceptance record above distinguishes
+prepared public HTTPS timings from cold jobs and the original endpoint trace.
 
 ## Retention, failures and recovery
 
@@ -171,8 +234,8 @@ retained source input. Enable recurring batches with
 recoverable archive. Initial legacy cleanup can take many batches; monitor WAL
 and autovacuum. DELETE does not shrink files immediately. Do not run VACUUM FULL
 on the nearly full production disk; arrange headroom for any rewrite separately.
-Offline legacy aggregates are retained for parity/recovery and are no longer
-rebuilt by cron or read by the new manager API.
+Offline legacy builders remain in source for recovery; their derived tables
+were emptied after cutover. Cron and the manager API no longer use those tables.
 
 Structured logs include request IDs, normalized routes, status, duration, job
 kind, retries and section failures. `/api/health/live` checks the process;
@@ -180,7 +243,8 @@ kind, retries and section failures. `/api/health/live` checks the process;
 unexpected job failures. Collector success age is included for monitoring.
 Install `ops/pm2-logrotate.conf` with the appropriate production log path. Run
 `bash ops/monitor.sh` from an OS monitor and configure an **external uptime monitor**
-for host-down alerts; recent partial results also degrade readiness. Neither has been activated by this code change.
+for host-down alerts; recent partial results also degrade readiness. Local probes
+and rotation are installed; external alert delivery is not configured.
 
 Once an SSH-accessible off-server destination exists, configure
 `ops/backup-offsite.sh` with libpq credentials, a restricted SSH user and an
