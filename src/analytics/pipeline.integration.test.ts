@@ -482,6 +482,18 @@ void test(
             "DELETE FROM manager_pick_elements WHERE entry_id=4; DELETE FROM manager_summary WHERE entry_id=4",
           );
           await admin.query("UPDATE manager_history SET points=999 WHERE gw=3");
+          await admin.query(
+            "UPDATE app_metadata SET value='2' WHERE key='manager_sample_gw_finalized'",
+          );
+          await buildBenchmark("2026-27", 3);
+          assert.equal(
+            (await loadBenchmarks(1, 3)).revision,
+            good,
+            "An incomplete replacement draw must retain the previous usable generation",
+          );
+          await admin.query(
+            "UPDATE app_metadata SET value='1' WHERE key='manager_sample_gw_finalized'",
+          );
           await assert.rejects(
             buildBenchmark("2026-27", 3),
             /do not reconcile/,

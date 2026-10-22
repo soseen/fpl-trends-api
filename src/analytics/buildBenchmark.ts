@@ -74,6 +74,17 @@ export const buildBenchmark = async (
     snapshot.curve = benchmarkSchema.shape.curve.parse(archived.curve);
     return publishBenchmark(snapshot, source, job);
   }
+  // A sampler upgrade replaces provenance incrementally. Keep a usable
+  // generation while the finalized-GW replacement draw is still incomplete;
+  // otherwise a small prefix could erase healthy comparison/EO coverage.
+  const [collecting] = await prisma.$queryRaw<Array<{ id: string }>>`
+    SELECT b.id FROM analytics_publications p JOIN analytics_benchmarks b ON b.id=p.benchmark_id
+    JOIN events e ON e.id=p.gw
+    WHERE p.season=${season} AND p.gw=${gw} AND b.calculation_version=${CALCULATION_VERSION}
+      AND e.finished AND e.data_checked
+      AND (SELECT value::int FROM app_metadata WHERE key='manager_sample_gw')=${gw}
+      AND (SELECT value FROM app_metadata WHERE key='manager_sample_gw_finalized')='2'`;
+  if (collecting) return collecting.id;
   const { snapshot, source } = await prisma.$transaction(
     async (tx) => {
       await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '60s'");
