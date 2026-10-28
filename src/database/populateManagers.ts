@@ -1,5 +1,6 @@
 import { samplePages } from "../analytics/sampling.js";
 import { followOneMissingTop10k } from "../analytics/followTop10k.js";
+import { CALCULATION_VERSION } from "../analytics/model.js";
 import axios from "axios";
 import { enqueue, seasonState } from "../analytics/store.js";
 import "dotenv/config";
@@ -848,6 +849,18 @@ export const waitForFollowupCapacity = async (
   return false;
 };
 
+export const finalizedBenchmarkAvailable = async (
+  season: string,
+  gw: number,
+): Promise<boolean> => {
+  const [published] = await prisma.$queryRaw<Array<{ ready: boolean }>>`
+    SELECT EXISTS(SELECT 1 FROM analytics_publications p JOIN analytics_benchmarks b ON b.id=p.benchmark_id
+      WHERE p.season=${season} AND p.gw=${gw} AND b.calculation_version=${CALCULATION_VERSION}
+        AND (b.payload->>'finalized')::boolean)
+      AND NOT EXISTS(SELECT 1 FROM analytics_jobs j WHERE j.key=${`benchmark:${season}:${gw}`} AND j.status='failed') AS ready`;
+  return published?.ready ?? false;
+};
+
 export const populateManagers = async (
   governorConfig?: Partial<GovernorConfig>,
 ): Promise<void> => {
@@ -1139,10 +1152,23 @@ export const populateManagers = async (
         throw err;
       }
     } else if (!governor.shouldAbort) {
-      await rebuildManagerReadModels({
-        rangeBuckets: "latest",
-        exposureGw: currentGw,
-      });
+      const sampleFinal =
+        !isLiveCurrentGw &&
+        (await readIntCursor(SAMPLE_GW_FINALIZED_KEY, 0)) === 1;
+      const { season } = await seasonState({ allowBulkRefresh: true });
+      if (
+        !sampleFinal ||
+        !(await finalizedBenchmarkAvailable(season, currentGw))
+      ) {
+        await rebuildManagerReadModels({
+          rangeBuckets: "latest",
+          exposureGw: currentGw,
+        });
+      } else {
+        console.info(
+          "[populateManagers] Finalized benchmark is current; idle rebuild skipped",
+        );
+      }
     }
 
     // Follow-up collection runs only during idle, finalized-sample passes and

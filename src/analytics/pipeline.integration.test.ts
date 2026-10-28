@@ -921,6 +921,18 @@ void test(
           };
           await save(1, [...elite, manager(2, 2), manager(3, 3)]);
           await save(3, [manager(1, 1), manager(2, 2), manager(3, 3)]);
+          const { finalizedBenchmarkAvailable } = await import(
+            "../database/populateManagers.js"
+          );
+          assert.equal(await finalizedBenchmarkAvailable("2026-27", 3), true);
+          assert.equal(await finalizedBenchmarkAvailable("2026-27", 4), false);
+          await admin.query(
+            "INSERT INTO analytics_jobs(id,key,kind,season,start_gw,end_gw,status) VALUES ('00000000-0000-4000-8000-000000000099','benchmark:2026-27:3','benchmark','2026-27',3,3,'failed') ON CONFLICT(key) DO UPDATE SET status='failed'",
+          );
+          assert.equal(await finalizedBenchmarkAvailable("2026-27", 3), false);
+          await admin.query(
+            "DELETE FROM analytics_jobs WHERE key='benchmark:2026-27:3'",
+          );
           followupFailureEntry = selectFollowup(sourceFor(1, elite)).at(
             -1,
           )!.entry;
