@@ -807,6 +807,47 @@ export const rebuildManagerReadModels = async ({
   );
 };
 
+// The latest benchmark is queued just before this check. Wait for the shared
+// worker to finish instead of loading replay archives alongside its rebuild.
+export const waitForFollowupCapacity = async (
+  options: {
+    pending?: () => Promise<number>;
+    availableMemory?: () => number;
+    now?: () => number;
+    pause?: (ms: number) => Promise<unknown>;
+    timeoutMs?: number;
+  } = {},
+): Promise<boolean> => {
+  const pending =
+    options.pending ??
+    (async () => {
+      const [jobs] = await prisma.$queryRaw<Array<{ n: number }>>`
+      SELECT COUNT(*)::int AS n FROM analytics_jobs WHERE status IN ('queued','running')`;
+      return jobs?.n ?? 1;
+    });
+  const availableMemory =
+    options.availableMemory ??
+    (() => {
+      try {
+        const meminfo = fs.readFileSync("/proc/meminfo", "utf8");
+        return (
+          Number(meminfo.match(/^MemAvailable:\s+(\d+)\s+kB/m)?.[1] ?? 0) * 1024
+        );
+      } catch {
+        return 0;
+      }
+    });
+  const now = options.now ?? Date.now,
+    pause = options.pause ?? delay;
+  const deadline = now() + (options.timeoutMs ?? 180_000);
+  while (now() < deadline) {
+    if ((await pending()) === 0 && availableMemory() >= 1.2 * 1024 ** 3)
+      return true;
+    await pause(5000);
+  }
+  return false;
+};
+
 export const populateManagers = async (
   governorConfig?: Partial<GovernorConfig>,
 ): Promise<void> => {
@@ -1114,7 +1155,11 @@ export const populateManagers = async (
       readEnvBool("MANAGER_TOP10K_FOLLOWUP", true)
     ) {
       try {
-        await followOneMissingTop10k();
+        if (await waitForFollowupCapacity()) await followOneMissingTop10k();
+        else
+          console.info(
+            "[populateManagers] Top 10k follow-up deferred: worker or memory busy",
+          );
       } catch (error) {
         console.warn(
           "[populateManagers] Top 10k follow-up deferred:",

@@ -154,7 +154,9 @@ Each benchmark also stores a small materialized copy of the follow-up input,
 so refreshing the current GW does not decompress its complete replay archive.
 
 One missing range is prepared per idle collector pass, prioritizing the latest
-finalized end GW. `MANAGER_TOP10K_FOLLOWUP=false` disables automatic collection.
+finalized end GW. The collector waits up to three minutes for queued work to
+finish and requires at least 1.2 GiB of available memory before starting.
+`MANAGER_TOP10K_FOLLOWUP=false` disables automatic collection.
 An operator can also run `npm run analytics:follow-top10k -- --start=4 --end=8`
 for a specific finalized range; coordinate this manual command with manager
 ingestion to avoid extra upstream load. Collection makes two FPL requests per
