@@ -41,6 +41,8 @@
     "analytics:benchmark": "tsx src/analytics/benchmark.ts",
     "analytics:replay": "tsx src/analytics/replay.ts",
     "analytics:calibrate": "tsx src/analytics/calibrate.ts",
+    "analytics:audit-top10k": "tsx src/analytics/auditTop10k.ts",
+    "analytics:follow-top10k": "tsx src/analytics/followTop10k.ts",
     "analytics:prune": "tsx src/analytics/retention.ts",
     "contracts:check": "node scripts/generate-analytics-contracts.mjs --check"
   },

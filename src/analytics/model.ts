@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-export const CALCULATION_VERSION = 1;
+export const CALCULATION_VERSION = 2;
 export const strata = [1, 2, 3] as const;
 export type Stratum = (typeof strata)[number];
 const number = z.number().finite();
@@ -183,6 +183,16 @@ export const benchmarkSourceSchema = z.object({
   gw: z.number().int().min(1).max(38),
   population: z.number().int().positive(),
   managers: z.array(sampleManagerSchema),
+  followedTop10k: z
+    .array(
+      z.object({
+        startGw: z.number().int().min(2).max(38),
+        anchorRevision: z.string(),
+        selectedEntries: z.array(z.number().int().positive()).length(300),
+        managers: z.array(sampleManagerSchema),
+      }),
+    )
+    .optional(),
   points: z.array(
     z.object({
       footballer_id: z.number().int().positive(),

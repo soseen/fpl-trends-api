@@ -134,6 +134,43 @@ then republish all GWs and regenerate manager results.
 
 ## Definitions and accuracy
 
+### Fixed Top 10k follow-up cohorts
+
+When the end-of-range sample is too thin, an idle finalized manager-ingest
+pass can follow a deterministic sample of 300 managers from the archived
+Top 10k at the start of a range. It only selects from an archive containing
+10,000 distinct stratum-1 managers with valid Top 10k ranks. This is a strict
+availability gate, not proof that legacy collection had no selection bias;
+ties at the cutoff and historical source provenance remain limitations.
+The selection is fixed before looking at subsequent results. At least 297 of
+the 300 selected entries must be available; only FPL 404s count as permanent
+nonresponse. Other upstream errors defer the job. History must cover the range
+and ordinary transfers must reconcile. Successful source fetches are cached for
+seven days so interrupted work can resume. The selected IDs and observations
+are saved in the immutable compressed benchmark replay input.
+
+One missing range is prepared per idle collector pass, prioritizing the latest
+finalized end GW. `MANAGER_TOP10K_FOLLOWUP=false` disables automatic collection.
+An operator can also run `npm run analytics:follow-top10k -- --start=4 --end=8`
+for a specific finalized range; coordinate this manual command with manager
+ingestion to avoid extra upstream load. Collection makes two FPL requests per
+uncached entry and uses a 100 ms pause after each. Benchmark calculation and
+publication happen in the background; the public handler still reads prepared
+results. Compare prepared-read and cold-job latency under production load
+before claiming there is no operational impact.
+
+Calculation version 2 must be rebuilt for every published GW using
+`npm run analytics:benchmarks`; the existing worker processes the queue. Set
+`MANAGER_TOP10K_FOLLOWUP=false` before rollout and restore it after the checks
+below. During
+the version transition older saved analyses can be served stale while missing
+benchmarks are rebuilt. Verify the queue, every GW publication, replay, source
+coverage and API latency before enabling the follow-up collector. Historical
+ranges whose anchor archive does not pass the census gate remain unavailable;
+the system does not fabricate a sample for them. The new path does not capture
+future standings independently, so incomplete future anchor archives will also
+remain unavailable until a separately verified capture mechanism is added.
+
 - Stored manager GW points are **net of transfer hits**. All comparison score
   means use that definition. The old rounded official gross GW average is no
   longer mixed with a manager's net total.

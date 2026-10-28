@@ -4,6 +4,7 @@ import {
   CALCULATION_VERSION,
   populationSizes,
   pointKey,
+  rawTransferAverage,
   strata,
   validSquad,
   type Benchmark,
@@ -140,6 +141,44 @@ const aggregate = (
   };
 };
 
+// Calculate only the replacement range. The collector uses this to avoid
+// recalculating every 40k-manager benchmark while the worker is running.
+export const calculateFollowedTop10k = (
+  managers: readonly SampleManager[],
+  start: number,
+  end: number,
+  points: PlayerPoints,
+) => {
+  const rows: Weighted[] = managers.map((manager) => ({
+    manager,
+    weight: 1,
+    facts: [],
+  }));
+  const values = new Map(
+    managers.map((manager) => [
+      manager,
+      rawTransferAverage(manager, points, start, end),
+    ]),
+  );
+  const observed = rows.filter((row) => row.manager.transfersComplete);
+  const eligible = observed.filter((row) => values.get(row.manager) != null);
+  const transferMean =
+    sum(observed, (row) => row.weight) >=
+      sum(rows, (row) => row.weight) * 0.5 &&
+    effectiveSampleSize(eligible) >= 50
+      ? mean(rows, (manager) => values.get(manager) ?? null, 0)
+      : null;
+  return {
+    cohort: aggregate(rows, start, end, 50),
+    transferMean,
+    transferCoverage: {
+      with_data: observed.length,
+      with_transfers: eligible.length,
+      stratum_size: rows.length,
+    },
+  };
+};
+
 type BenchmarkInput = {
   season: string;
   gw: number;
@@ -148,6 +187,12 @@ type BenchmarkInput = {
   sourceRevision: string;
   finalized: boolean;
   managers: readonly SampleManager[];
+  followedTop10k?: readonly {
+    startGw: number;
+    anchorRevision: string;
+    selectedEntries: number[];
+    managers: SampleManager[];
+  }[];
   points: PlayerPoints;
   minimumCohort?: number;
   checkSquadScores?: boolean;
@@ -178,6 +223,42 @@ function* calculateSteps(
     };
   });
   const minimum = input.minimumCohort ?? 50;
+  const followed = new Map<number, Weighted[]>();
+  for (const sample of input.followedTop10k ?? []) {
+    if (
+      sample.startGw < 2 ||
+      sample.startGw > gw ||
+      followed.has(sample.startGw) ||
+      sample.selectedEntries.length !== 300 ||
+      new Set(sample.selectedEntries).size !== 300 ||
+      sample.managers.length < 297 ||
+      sample.managers.length > 300 ||
+      new Set(sample.managers.map((m) => m.entry)).size !==
+        sample.managers.length ||
+      sample.managers.some((m) => !sample.selectedEntries.includes(m.entry)) ||
+      sample.managers.some((m) => {
+        const rank = m.facts.find((f) => f.gw === sample.startGw - 1)?.rank;
+        return (
+          !rank ||
+          rank < 0 ||
+          rank > 10_000 ||
+          Array.from(
+            { length: gw - sample.startGw + 1 },
+            (_, i) => sample.startGw + i,
+          ).some((g) => !m.facts.some((f) => f.gw === g))
+        );
+      })
+    )
+      throw new Error("Invalid followed Top 10k sample");
+    followed.set(
+      sample.startGw,
+      sample.managers.map((manager) => ({
+        manager,
+        weight: 1,
+        facts: [],
+      })),
+    );
+  }
   const complete = weighted.filter((r) => {
     if (!validSquad(r.manager.picks)) return false;
     if (!input.checkSquadScores || !input.finalized) return true;
@@ -311,7 +392,10 @@ function* calculateSteps(
     return values[start] ?? 0;
   };
   const transferWindows = new Map<SampleManager, (number | null)[]>();
-  for (const manager of managers) {
+  for (const manager of [
+    ...managers,
+    ...[...followed.values()].flatMap((rows) => rows.map((r) => r.manager)),
+  ]) {
     const values = Array<number>(gw + 1).fill(0),
       counts = Array<number>(gw + 1).fill(0);
     const chips = new Set(
@@ -347,7 +431,7 @@ function* calculateSteps(
       });
     const all = weighted; // Includes late entrants in the population at range end.
     const top100k = members(100_000),
-      top10k = members(10_000);
+      top10k = followed.get(start) ?? members(10_000);
     const buckets = new Map<
       string,
       { stratum: 1 | 2 | 3; score: number; managers: number }

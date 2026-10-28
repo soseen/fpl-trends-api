@@ -4,6 +4,7 @@ import { test } from "node:test";
 import { once } from "node:events";
 import http from "node:http";
 import fs from "node:fs/promises";
+import { createHash } from "node:crypto";
 import pg from "pg";
 import express from "express";
 import { manager, squad } from "./testing/fixtures.js";
@@ -79,9 +80,21 @@ void test(
     process.env["DATABASE_URL"] = url.toString();
     process.env["ANALYTICS_READ_DATABASE_URL"] = url.toString();
     let transferUnavailable = false;
+    let followupFailureEntry = 0;
+    let followupRequests = 0;
     const fpl = http.createServer((req, res) => {
       res.setHeader("Content-Type", "application/json");
       const entry = Number(req.url?.match(/entry\/(\d+)/)?.[1] ?? 1);
+      if (
+        entry >= 10000 &&
+        (req.url?.includes("/history/") || req.url?.includes("/transfers/"))
+      )
+        followupRequests++;
+      if (entry === followupFailureEntry) {
+        res.statusCode = 503;
+        res.end("{}");
+        return;
+      }
       if (entry === 404) {
         res.statusCode = 404;
         res.end("{}");
@@ -852,6 +865,92 @@ void test(
               "UPDATE app_metadata SET value='0' WHERE key='analytics_bulk_refresh_in_progress'",
             );
           }
+        },
+      );
+      await t.test(
+        "follows an archived elite cohort and publishes a replayable prepared comparison",
+        async () => {
+          const { benchmarkSourceSchema, pointKey } = await import(
+            "./model.js"
+          );
+          const { followTop10k, followOneMissingTop10k, selectFollowup } =
+            await import("./followTop10k.js");
+          const { replayBenchmark } = await import("./replay.js");
+          const elite = Array.from({ length: 10000 }, (_, i) => {
+            const m = manager(10000 + i, 1);
+            m.facts[0]!.rank = i + 1;
+            return m;
+          });
+          const sourceFor = (gw: number, managers: typeof elite) =>
+            benchmarkSourceSchema.parse({
+              format: 1,
+              checkSquadScores: true,
+              season: "2026-27",
+              gw,
+              population: 1000000,
+              managers,
+              points: [],
+            });
+          const save = async (gw: number, managers: typeof elite) => {
+            const source = sourceFor(gw, managers);
+            const sourceRevision = createHash("sha256")
+              .update(JSON.stringify(source))
+              .digest("hex");
+            const result = calculateBenchmark({
+              ...source,
+              sourceRevision,
+              generatedAt: new Date().toISOString(),
+              finalized: true,
+              points: new Map(
+                source.points.map((p) => [
+                  pointKey(p.footballer_id, p.round),
+                  p.points,
+                ]),
+              ),
+            });
+            return publishBenchmark(result, source);
+          };
+          await save(1, [...elite, manager(2, 2), manager(3, 3)]);
+          await save(3, [manager(1, 1), manager(2, 2), manager(3, 3)]);
+          followupFailureEntry = selectFollowup(sourceFor(1, elite)).at(
+            -1,
+          )!.entry;
+          await assert.rejects(followTop10k(2, 3, async () => {}));
+          const afterFailure = await loadBenchmarks(1, 3);
+          assert.notEqual(
+            afterFailure.snapshots.get(3)?.ranges[1]?.cohorts.top10k
+              .avg_total_points,
+            24,
+          );
+          followupFailureEntry = 0;
+          const beforeResume = followupRequests;
+          assert.equal(await followOneMissingTop10k(async () => {}), true);
+          const id = (
+            await admin.query<{ benchmark_id: string }>(
+              "SELECT benchmark_id FROM analytics_publications WHERE season='2026-27' AND gw=3",
+            )
+          ).rows[0]!.benchmark_id;
+          assert.equal(followupRequests - beforeResume, 2);
+          const published = await admin.query<{
+            payload: unknown;
+            source_payload: Buffer;
+          }>(
+            "SELECT payload,source_payload FROM analytics_benchmarks WHERE id=$1",
+            [id],
+          );
+          const replayed = await replayBenchmark(
+            published.rows[0]!.payload,
+            published.rows[0]!.source_payload,
+          );
+          assert.deepEqual(replayed, published.rows[0]!.payload);
+          assert.equal(replayed.ranges[1]?.cohorts.top10k.avg_total_points, 24);
+          assert.equal(replayed.ranges[1]?.cohorts.top10k.sample_size, 300);
+          await withBenchmarks(await loadBenchmarks(1, 3), async () => {
+            assert.equal(
+              (await readComparison(2, 3)).top10k.avg_total_points,
+              24,
+            );
+          });
         },
       );
       await t.test(

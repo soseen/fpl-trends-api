@@ -1,4 +1,5 @@
 import { samplePages } from "../analytics/sampling.js";
+import { followOneMissingTop10k } from "../analytics/followTop10k.js";
 import axios from "axios";
 import { enqueue, seasonState } from "../analytics/store.js";
 import "dotenv/config";
@@ -1101,6 +1102,25 @@ export const populateManagers = async (
         rangeBuckets: "latest",
         exposureGw: currentGw,
       });
+    }
+
+    // Follow-up collection runs only during idle, finalized-sample passes and
+    // uses the same collector lock. It never runs on an HTTP or manager job.
+    if (
+      stats.processed === 0 &&
+      !governor.shouldAbort &&
+      !isLiveCurrentGw &&
+      (await readIntCursor(SAMPLE_GW_FINALIZED_KEY, 0)) === 1 &&
+      readEnvBool("MANAGER_TOP10K_FOLLOWUP", true)
+    ) {
+      try {
+        await followOneMissingTop10k();
+      } catch (error) {
+        console.warn(
+          "[populateManagers] Top 10k follow-up deferred:",
+          (error as Error).message,
+        );
+      }
     }
 
     if (

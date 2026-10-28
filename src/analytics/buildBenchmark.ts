@@ -72,7 +72,7 @@ export const buildBenchmark = async (
       ),
     });
     snapshot.curve = benchmarkSchema.shape.curve.parse(archived.curve);
-    return publishBenchmark(snapshot, source, job);
+    return publishBenchmark(snapshot, source, job, archived.id);
   }
   // A sampler upgrade replaces provenance incrementally. Keep a usable
   // generation while the finalized-GW replacement draw is still incomplete;
@@ -85,6 +85,38 @@ export const buildBenchmark = async (
       AND (SELECT value::int FROM app_metadata WHERE key='manager_sample_gw')=${gw}
       AND (SELECT value FROM app_metadata WHERE key='manager_sample_gw_finalized')='2'`;
   if (collecting) return collecting.id;
+  // Carry completed follow-up cohorts forward when the latest GW sample is
+  // refreshed. Their immutable inputs are archived with each generation.
+  const [prior] = await prisma.$queryRaw<
+    Array<{
+      id: string;
+      source_payload: Uint8Array | null;
+      source_revision: string;
+    }>
+  >`
+    SELECT b.id,b.source_payload,b.source_revision FROM analytics_publications p
+    JOIN analytics_benchmarks b ON b.id=p.benchmark_id
+    WHERE p.season=${season} AND p.gw=${gw} AND (b.payload->>'finalized')::boolean`;
+  let followedTop10k: ReturnType<
+    typeof benchmarkSourceSchema.parse
+  >["followedTop10k"];
+  if (prior?.source_payload) {
+    const previous = benchmarkSourceSchema.parse(
+      JSON.parse(
+        (
+          await promisify(gunzip)(prior.source_payload, {
+            maxOutputLength: 512 * 1024 ** 2,
+          })
+        ).toString("utf8"),
+      ) as unknown,
+    );
+    if (
+      createHash("sha256").update(JSON.stringify(previous)).digest("hex") !==
+      prior.source_revision
+    )
+      throw new Error("Previous benchmark source checksum mismatch");
+    followedTop10k = previous.followedTop10k;
+  }
   const { snapshot, source } = await prisma.$transaction(
     async (tx) => {
       await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '60s'");
@@ -303,6 +335,9 @@ export const buildBenchmark = async (
         gw,
         population: event.population,
         managers: eligible,
+        ...(event.finished && event.data_checked && followedTop10k
+          ? { followedTop10k }
+          : {}),
         points: players,
       });
       managers.clear();
@@ -323,6 +358,7 @@ export const buildBenchmark = async (
         generatedAt: new Date().toISOString(),
         sourceRevision,
         managers: source.managers,
+        followedTop10k: source.followedTop10k,
         points: new Map(
           source.points.map((p) => [
             pointKey(p.footballer_id, p.round),
@@ -394,5 +430,5 @@ export const buildBenchmark = async (
     previous[0].finalized === snapshot.finalized
   )
     return previous[0].id;
-  return publishBenchmark(snapshot, source, job);
+  return publishBenchmark(snapshot, source, job, prior?.id);
 };

@@ -105,6 +105,8 @@ export const publishBenchmark = async (
   candidate: Benchmark,
   source?: unknown,
   job?: Job,
+  expectedPublicationId?: string,
+  expectedAnchor?: { gw: number; id: string },
 ): Promise<string> => {
   const value = benchmarkSchema.parse(candidate),
     id = randomUUID();
@@ -117,6 +119,22 @@ export const publishBenchmark = async (
   )
     throw new Error("Incomplete benchmark range coverage");
   await prisma.$transaction(async (tx) => {
+    if (expectedAnchor) {
+      const anchor = await tx.$queryRaw<Array<{ benchmark_id: string }>>`
+        SELECT benchmark_id FROM analytics_publications
+        WHERE season=${value.season} AND gw=${expectedAnchor.gw} FOR SHARE`;
+      if (anchor[0]?.benchmark_id !== expectedAnchor.id)
+        throw new Error(
+          "Anchor benchmark changed during follow-up collection; retry",
+        );
+    }
+    if (expectedPublicationId) {
+      const current = await tx.$queryRaw<Array<{ benchmark_id: string }>>`
+        SELECT benchmark_id FROM analytics_publications
+        WHERE season=${value.season} AND gw=${value.gw} FOR UPDATE`;
+      if (current[0]?.benchmark_id !== expectedPublicationId)
+        throw new Error("Benchmark changed during follow-up collection; retry");
+    }
     if (job) {
       const lease = await tx.$queryRaw<
         Array<{ id: string }>

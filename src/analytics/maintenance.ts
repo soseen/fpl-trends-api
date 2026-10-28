@@ -4,6 +4,12 @@ import { pruneWorkingFacts } from "./retention.js";
 // Only evict derived generations/caches here. Historical source facts require
 // an explicitly verified archive before any storage-reclamation operation.
 export const maintainAnalytics = async (): Promise<void> => {
+  await prisma.$executeRaw`WITH stale AS (
+    SELECT season,entry_id,kind FROM analytics_manager_sources
+    WHERE kind LIKE 'top10k-followup-v1:%' AND fetched_at < now()-interval '7 days'
+    LIMIT 500
+  ) DELETE FROM analytics_manager_sources s USING stale
+    WHERE s.season=stale.season AND s.entry_id=stale.entry_id AND s.kind=stale.kind`;
   // Arbitrary user IDs do not necessarily have a sampled manager_summary row.
   // Retire their refetchable caches too, while protecting active results/jobs.
   await prisma.$executeRaw`WITH stale AS (
