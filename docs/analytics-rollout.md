@@ -6,6 +6,22 @@ the same release window: the former seven manager routes are replaced by
 
 ## Production acceptance record
 
+- Top 10k follow-up deployed 28 October 2026 with calculation version 2 and
+  migration `20261028150000_benchmark_followup_input`. All GW1–8 publications
+  were rebuilt; readiness returned HTTP 200. A fixed sample of 300 GW3 Top 10k
+  managers populated GW4–8, GW4–7 and GW4–6. GW4–8 replay matched exactly,
+  and the production browser displayed its populated column without a table
+  caption or runtime exceptions. Ten sequential prepared HTTPS reads from the
+  deployment workstation had 50 ms median and 52 ms maximum (reported as p95
+  of this small sample); this is not a cold-job or load-test guarantee.
+- A routine current-GW rebuild reached the PM2 worker's memory restart limit
+  during rollout. The source-preservation path now reads a small materialized
+  follow-up payload, idle finalized passes skip redundant rebuilds, and the
+  collector waits for queued work and memory capacity. The scheduled ingest
+  path subsequently completed a follow-up with the redundant rebuild skipped.
+  Sparse historical anchors and incomplete future anchor archives still cannot
+  be treated as a verified census and may continue to yield dashes.
+
 - Architecture cutover: API `313d582`, SPA `eb89422`; both PM2 processes are
   running in fork mode and saved. Both additive migrations are applied.
 - All seven GW publications have compressed replay input and reproduce their
