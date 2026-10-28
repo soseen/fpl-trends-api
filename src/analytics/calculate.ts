@@ -163,6 +163,7 @@ export const calculateFollowedTop10k = (
   const observed = rows.filter((row) => row.manager.transfersComplete);
   const eligible = observed.filter((row) => values.get(row.manager) != null);
   const transferMean =
+    observed.length >= 297 &&
     sum(observed, (row) => row.weight) >=
       sum(rows, (row) => row.weight) * 0.5 &&
     effectiveSampleSize(eligible) >= 50
@@ -454,13 +455,13 @@ function* calculateSteps(
     }
     const transferValue = (m: SampleManager) =>
       transferWindows.get(m)?.[start] ?? null;
-    const transfer = (rows: readonly Weighted[]) => {
+    const transfer = (rows: readonly Weighted[], minimumComplete = 0) => {
       const observed = rows.filter((r) => r.manager.transfersComplete);
       const eligible = observed.filter(
         (r) => transferValue(r.manager) !== null,
       );
-      return sum(observed, (r) => r.weight) >=
-        sum(rows, (r) => r.weight) * 0.5 &&
+      return observed.length >= minimumComplete &&
+        sum(observed, (r) => r.weight) >= sum(rows, (r) => r.weight) * 0.5 &&
         effectiveSampleSize(eligible) >= minimum
         ? mean(rows, transferValue, 0)
         : null;
@@ -481,7 +482,7 @@ function* calculateSteps(
       transferMeans: {
         average: transfer(all),
         top100k: transfer(top100k),
-        top10k: transfer(top10k),
+        top10k: transfer(top10k, followed.has(start) ? 297 : 0),
       },
       transferCoverage: {
         average: transferCoverage(all),

@@ -2,7 +2,11 @@ import assert from "node:assert/strict";
 import { it } from "node:test";
 import { calculateBenchmark, calculateFollowedTop10k } from "./calculate.js";
 import { selectFollowup } from "./followTop10k.js";
-import { benchmarkSourceSchema, type SampleManager } from "./model.js";
+import {
+  benchmarkSourceSchema,
+  hasCompleteTransferWindow,
+  type SampleManager,
+} from "./model.js";
 import { manager } from "./testing/fixtures.js";
 
 void it("selects a reproducible follow-up from a complete prior cohort", () => {
@@ -81,6 +85,17 @@ void it("uses the followed prior cohort for all range metrics and rejects incomp
     replacement.transferCoverage,
     result.ranges[1]?.transferCoverage.top10k,
   );
+  for (const m of followed.slice(0, 4)) m.transfersComplete = false;
+  assert.equal(
+    calculateFollowedTop10k(followed, 2, 3, input.points).transferMean,
+    null,
+  );
+  assert.equal(calculateBenchmark(input).ranges[1]?.transferMeans.top10k, null);
+  assert.equal(
+    calculateBenchmark(input).ranges[1]?.cohorts.top10k.avg_total_points,
+    20,
+  );
+  for (const m of followed.slice(0, 4)) m.transfersComplete = true;
   input.followedTop10k[0]!.managers = followed.slice(0, 297);
   assert.equal(
     calculateBenchmark(input).ranges[1]?.cohorts.top10k.sample_size,
@@ -91,4 +106,19 @@ void it("uses the followed prior cohort for all range metrics and rejects incomp
   input.followedTop10k[0]!.managers = followed;
   followed[0]!.facts = followed[0]!.facts.filter((f) => f.gw !== 3);
   assert.throws(() => calculateBenchmark(input), /Invalid followed Top 10k/);
+});
+
+void it("reconciles transfers only inside the selected range and excludes chip transfers", () => {
+  const m = manager(1, 1);
+  m.facts[0]!.transfers = 1;
+  m.facts[1]!.transfers = 1;
+  m.facts[2]!.chip = "wildcard";
+  m.transfers = [
+    { gw: 2, in: 2, out: 1 },
+    { gw: 3, in: 3, out: 4 },
+  ];
+  assert.equal(hasCompleteTransferWindow(m, 2, 3), true);
+  assert.equal(hasCompleteTransferWindow(m, 1, 3), false);
+  m.facts[1]!.transfers = 2;
+  assert.equal(hasCompleteTransferWindow(m, 2, 3), false);
 });

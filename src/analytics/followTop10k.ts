@@ -14,6 +14,7 @@ import {
   benchmarkSchema,
   benchmarkSourceSchema,
   sampleManagerSchema,
+  hasCompleteTransferWindow,
   pointKey,
   type SampleManager,
 } from "./model.js";
@@ -174,19 +175,6 @@ export const followTop10k = async (
       const moves = transfers
         .filter((t) => t.event <= end)
         .map((t) => ({ gw: t.event, in: t.element_in, out: t.element_out }));
-      const ordinary = facts.filter(
-        (f) => f.chip !== "wildcard" && f.chip !== "freehit",
-      );
-      const expected = ordinary.reduce((sum, f) => sum + f.transfers, 0);
-      const chipGws = new Set(
-        facts
-          .filter((f) => f.chip === "wildcard" || f.chip === "freehit")
-          .map((f) => f.gw),
-      );
-      if (moves.filter((t) => !chipGws.has(t.gw)).length !== expected)
-        throw new Error(
-          `Entry ${original.entry}: transfer history is incomplete`,
-        );
       saved = {
         entry: original.entry,
         stratum: 1,
@@ -212,7 +200,15 @@ export const followTop10k = async (
     )
       throw new Error(`Entry ${original.entry}: incomplete history`);
     facts[at]!.rank = anchorFact.rank;
-    managers.push({ ...saved, facts });
+    managers.push({
+      ...saved,
+      facts,
+      transfersComplete: hasCompleteTransferWindow(
+        { facts, transfers: saved.transfers },
+        start,
+        end,
+      ),
+    });
   }
   if (managers.length < 297)
     throw new Error(

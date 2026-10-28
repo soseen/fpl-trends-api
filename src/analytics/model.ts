@@ -236,6 +236,25 @@ export const validSquad = (picks: readonly SquadPick[]): boolean =>
 // One definition on BOTH sides of the comparison: raw IN-minus-OUT points
 // from the transfer GW through range end. This descriptive benchmark excludes
 // chip transfers and does not infer counterfactual lineups or captaincy.
+export const hasCompleteTransferWindow = (
+  manager: Pick<SampleManager, "transfers" | "facts">,
+  start: number,
+  end: number,
+): boolean =>
+  manager.facts
+    .filter(
+      (f) =>
+        f.gw >= start &&
+        f.gw <= end &&
+        f.chip !== "wildcard" &&
+        f.chip !== "freehit",
+    )
+    .every(
+      (f) =>
+        f.transfers !== null &&
+        manager.transfers.filter((t) => t.gw === f.gw).length === f.transfers,
+    );
+
 export const rawTransferAverage = (
   manager: Pick<SampleManager, "transfers" | "facts" | "transfersComplete">,
   points: PlayerPoints,

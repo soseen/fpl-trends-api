@@ -145,7 +145,9 @@ ties at the cutoff and historical source provenance remain limitations.
 The selection is fixed before looking at subsequent results. At least 297 of
 the 300 selected entries must be available; only FPL 404s count as permanent
 nonresponse. Other upstream errors defer the job. History must cover the range
-and ordinary transfers must reconcile. Successful source fetches are cached for
+and ordinary transfers are reconciled within the selected range. Score and
+chip estimates remain available if some transfer logs are incomplete, but the
+transfer value requires at least 297 reconciled logs. Successful fetches are cached for
 seven days so interrupted work can resume. The selected IDs and observations
 are saved in the immutable compressed benchmark replay input.
 Each benchmark also stores a small materialized copy of the follow-up input,
