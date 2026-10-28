@@ -69,6 +69,15 @@ void test(
     await admin.query(
       await fs.readFile(
         new URL(
+          "../../prisma/migrations/20261028150000_benchmark_followup_input/migration.sql",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    );
+    await admin.query(
+      await fs.readFile(
+        new URL(
           "../../prisma/migrations/20261022141000_analytics_source_replay/migration.sql",
           import.meta.url,
         ),
@@ -934,9 +943,14 @@ void test(
           const published = await admin.query<{
             payload: unknown;
             source_payload: Buffer;
+            followup_payload: unknown;
           }>(
-            "SELECT payload,source_payload FROM analytics_benchmarks WHERE id=$1",
+            "SELECT payload,source_payload,followup_payload FROM analytics_benchmarks WHERE id=$1",
             [id],
+          );
+          assert.equal(
+            Array.isArray(published.rows[0]!.followup_payload),
+            true,
           );
           const replayed = await replayBenchmark(
             published.rows[0]!.payload,
@@ -945,6 +959,13 @@ void test(
           assert.deepEqual(replayed, published.rows[0]!.payload);
           assert.equal(replayed.ranges[1]?.cohorts.top10k.avg_total_points, 24);
           assert.equal(replayed.ranges[1]?.cohorts.top10k.sample_size, 300);
+          await withBenchmarks(await loadBenchmarks(1, 3), async () => {
+            assert.equal(
+              (await readComparison(2, 3)).top10k.avg_total_points,
+              24,
+            );
+          });
+          await buildBenchmark("2026-27", 3);
           await withBenchmarks(await loadBenchmarks(1, 3), async () => {
             assert.equal(
               (await readComparison(2, 3)).top10k.avg_total_points,

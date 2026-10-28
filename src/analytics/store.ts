@@ -6,6 +6,7 @@ import { promisify } from "node:util";
 import { prisma } from "../database/client.js";
 import {
   benchmarkSchema,
+  benchmarkSourceSchema,
   CALCULATION_VERSION,
   type Benchmark,
 } from "./model.js";
@@ -112,6 +113,11 @@ export const publishBenchmark = async (
     id = randomUUID();
   const compressed =
     source === undefined ? null : await promisify(gzip)(JSON.stringify(source));
+  const followed =
+    source && typeof source === "object" && "followedTop10k" in source
+      ? benchmarkSourceSchema.shape.followedTop10k.parse(source.followedTop10k)
+      : undefined;
+  const followupPayload = followed ? JSON.stringify(followed) : null;
   if (
     value.ranges.length !== value.gw ||
     new Set(value.ranges.map((r) => r.startGw)).size !== value.gw ||
@@ -146,7 +152,7 @@ export const publishBenchmark = async (
           false,
         );
     }
-    await tx.$executeRaw`INSERT INTO analytics_benchmarks(id,season,gw,calculation_version,source_revision,payload,source_payload) VALUES (${id}::uuid,${value.season},${value.gw},${CALCULATION_VERSION},${value.sourceRevision},${JSON.stringify(value)}::jsonb,${compressed})`;
+    await tx.$executeRaw`INSERT INTO analytics_benchmarks(id,season,gw,calculation_version,source_revision,payload,source_payload,followup_payload) VALUES (${id}::uuid,${value.season},${value.gw},${CALCULATION_VERSION},${value.sourceRevision},${JSON.stringify(value)}::jsonb,${compressed},${followupPayload}::jsonb)`;
     await tx.$executeRaw`INSERT INTO analytics_publications(season,gw,benchmark_id) VALUES (${value.season},${value.gw},${id}::uuid) ON CONFLICT(season,gw) DO UPDATE SET benchmark_id=excluded.benchmark_id,published_at=now()`;
   });
   return id;

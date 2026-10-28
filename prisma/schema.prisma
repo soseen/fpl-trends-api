@@ -683,6 +683,7 @@ model analytics_benchmarks {
   calculation_version Int
   source_revision     String
   source_payload      Bytes?
+  followup_payload    Json?
   payload             Json
   created_at          DateTime @default(now()) @db.Timestamptz
   publications        analytics_publications[]

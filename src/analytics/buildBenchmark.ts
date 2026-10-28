@@ -90,33 +90,18 @@ export const buildBenchmark = async (
   const [prior] = await prisma.$queryRaw<
     Array<{
       id: string;
-      source_payload: Uint8Array | null;
-      source_revision: string;
+      followup_payload: unknown;
     }>
   >`
-    SELECT b.id,b.source_payload,b.source_revision FROM analytics_publications p
+    SELECT b.id,b.followup_payload FROM analytics_publications p
     JOIN analytics_benchmarks b ON b.id=p.benchmark_id
     WHERE p.season=${season} AND p.gw=${gw} AND (b.payload->>'finalized')::boolean`;
-  let followedTop10k: ReturnType<
-    typeof benchmarkSourceSchema.parse
-  >["followedTop10k"];
-  if (prior?.source_payload) {
-    const previous = benchmarkSourceSchema.parse(
-      JSON.parse(
-        (
-          await promisify(gunzip)(prior.source_payload, {
-            maxOutputLength: 512 * 1024 ** 2,
-          })
-        ).toString("utf8"),
-      ) as unknown,
-    );
-    if (
-      createHash("sha256").update(JSON.stringify(previous)).digest("hex") !==
-      prior.source_revision
-    )
-      throw new Error("Previous benchmark source checksum mismatch");
-    followedTop10k = previous.followedTop10k;
-  }
+  const followedTop10k =
+    prior?.followup_payload == null
+      ? undefined
+      : benchmarkSourceSchema.shape.followedTop10k.parse(
+          prior.followup_payload,
+        );
   const { snapshot, source } = await prisma.$transaction(
     async (tx) => {
       await tx.$executeRawUnsafe("SET LOCAL statement_timeout = '60s'");

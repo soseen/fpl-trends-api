@@ -148,6 +148,8 @@ nonresponse. Other upstream errors defer the job. History must cover the range
 and ordinary transfers must reconcile. Successful source fetches are cached for
 seven days so interrupted work can resume. The selected IDs and observations
 are saved in the immutable compressed benchmark replay input.
+Each benchmark also stores a small materialized copy of the follow-up input,
+so refreshing the current GW does not decompress its complete replay archive.
 
 One missing range is prepared per idle collector pass, prioritizing the latest
 finalized end GW. `MANAGER_TOP10K_FOLLOWUP=false` disables automatic collection.
